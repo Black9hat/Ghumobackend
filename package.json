@@ -1,0 +1,54 @@
+{
+  "name": "go-india",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "seed": "node src/seed/seedRates.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sonalika127/Go_India.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/sonalika127/Go_India/issues"
+  },
+  "homepage": "https://github.com/sonalika127/Go_India#readme",
+  "dependencies": {
+    "@google-cloud/vision": "^5.3.4",
+    "axios": "^1.12.2",
+    "bcryptjs": "^3.0.3",
+    "body-parser": "^2.2.0",
+    "cloudinary": "^1.41.3",
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "express-async-handler": "^1.2.0",
+    "firebase": "^11.9.0",
+    "firebase-admin": "^13.4.0",
+    "haversine-distance": "^1.2.4",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.15.1",
+    "morgan": "^1.10.0",
+    "multer": "^2.0.2",
+    "multer-storage-cloudinary": "^4.0.0",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^7.0.9",
+    "razorpay": "^2.9.6",
+    "sharp": "^0.34.5",
+    "socket.io": "^4.8.1",
+    "streamifier": "^0.1.1",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  },
+  "description": "��#\u0000 \u0000M\u0000y\u0000 \u0000N\u0000e\u0000w\u0000 \u0000B\u0000a\u0000c\u0000k\u0000e\u0000n\u0000d\u0000\r\u0000 \u0000"
+}
