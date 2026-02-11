@@ -72,8 +72,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// Middleware
-app.use(cors());
+// ============================================================================
+// ✅ CORS CONFIGURATION - PROPERLY CONFIGURED FOR PREFLIGHT REQUESTS
+// ============================================================================
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://localhost:5174',
+    'https://go-india-11-production.up.railway.app'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range']
+}));
+
 app.use(morgan('dev'));
 app.use(express.json());
 app.use(
@@ -275,6 +289,12 @@ httpServer.listen(PORT, () => {
   console.log('');
   console.log('='.repeat(70));
   console.log(`🚀 Go India server running on port ${PORT}`);
+  console.log('');
+  console.log('✅ CORS enabled for:');
+  console.log('   - http://localhost:5173');
+  console.log('   - http://localhost:3000');
+  console.log('   - http://localhost:5174');
+  console.log('   - https://go-india-11-production.up.railway.app');
   console.log('');
   console.log('💬 Chat system enabled');
   console.log('   - WebSocket: Active');
