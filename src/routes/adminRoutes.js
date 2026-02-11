@@ -67,6 +67,22 @@ import {
 
 const router = express.Router();
 
+// ✅ HELPER: Get base URL for Railway deployment
+const getBaseUrl = (req) => {
+  // Priority 1: Railway environment variable
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  }
+  
+  // Priority 2: BACKEND_URL from .env
+  if (process.env.BACKEND_URL) {
+    return process.env.BACKEND_URL;
+  }
+  
+  // Priority 3: Fallback to request headers (development)
+  return `${req.protocol}://${req.get("host")}`;
+};
+
 /* ================================
    📁 MULTER CONFIG FOR CUSTOMER BANNERS
 ================================ */
@@ -196,7 +212,14 @@ router.post(
       }
 
       const filePath = req.file.path.replace(/\\/g, "/");
-      const url = `${req.protocol}://${req.get("host")}/${filePath}`;
+      
+      // ✅ FIX: Use absolute URL for Railway deployment
+      const baseUrl = getBaseUrl(req);
+      const url = `${baseUrl}/${filePath}`;
+
+      console.log(`✅ Driver banner uploaded: ${url}`);
+      console.log(`   Base URL: ${baseUrl}`);
+      console.log(`   File path: ${filePath}`);
 
       return res.status(200).json({
         success: true,
@@ -256,9 +279,20 @@ router.post(
       }
 
       const filePath = req.file.path.replace(/\\/g, "/");
-      const imageUrl = `/${filePath}`;
+      
+      // ✅ FIX: Construct ABSOLUTE URL for Railway deployment
+      const baseUrl = getBaseUrl(req);
+      const imageUrl = `${baseUrl}/${filePath}`;
 
-      console.log(`✅ Customer banner image uploaded: ${imageUrl}`);
+      console.log('');
+      console.log('============================================================');
+      console.log('✅ CUSTOMER BANNER IMAGE UPLOADED');
+      console.log('============================================================');
+      console.log(`   Base URL: ${baseUrl}`);
+      console.log(`   File path: ${filePath}`);
+      console.log(`   Full URL: ${imageUrl}`);
+      console.log('============================================================');
+      console.log('');
 
       return res.status(200).json({
         success: true,
@@ -303,6 +337,7 @@ router.post("/customer-banners", verifyAdminToken, async (req, res) => {
     });
 
     console.log(`✅ Customer banner created: ${banner._id} for date ${bannerDate}`);
+    console.log(`   Image URL: ${imageUrl}`);
 
     res.status(201).json({
       success: true,
@@ -463,11 +498,15 @@ router.delete("/customer-banners/:bannerId", verifyAdminToken, async (req, res) 
     }
 
     // Optionally delete the image file from server
-    if (banner.imageUrl && banner.imageUrl.startsWith("/uploads")) {
-      const imagePath = banner.imageUrl.replace(/^\//, "");
-      if (fs.existsSync(imagePath)) {
-        fs.unlinkSync(imagePath);
-        console.log(`🗑️ Deleted image file: ${imagePath}`);
+    if (banner.imageUrl && banner.imageUrl.includes("/uploads")) {
+      // Extract file path from URL
+      const urlParts = banner.imageUrl.split('/uploads/');
+      if (urlParts.length > 1) {
+        const imagePath = `uploads/${urlParts[1]}`;
+        if (fs.existsSync(imagePath)) {
+          fs.unlinkSync(imagePath);
+          console.log(`🗑️ Deleted image file: ${imagePath}`);
+        }
       }
     }
 
