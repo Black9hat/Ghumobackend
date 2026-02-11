@@ -4,14 +4,23 @@ import admin from 'firebase-admin';
 import User from '../models/User.js';
 
 /**
- * Get full image URL
+ * ✅ Get full absolute image URL for Railway deployment
  */
 const getFullImageUrl = (url) => {
   if (!url) return null;
-  if (url.startsWith("http")) return url;
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
   
-  const baseUrl = process.env.BACKEND_URL || "https://your-api.com";
-  return `${baseUrl}${url.startsWith("/") ? "" : "/"}${url}`;
+  // Railway uses RAILWAY_PUBLIC_DOMAIN or you can use BACKEND_URL
+  const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN 
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : process.env.BACKEND_URL || "https://api.example.com";
+  
+  // Ensure proper URL construction
+  const cleanUrl = url.startsWith("/") ? url : `/${url}`;
+  const fullUrl = `${baseUrl}${cleanUrl}`;
+  
+  console.log(`🖼️ Image URL: ${url} → ${fullUrl}`);
+  return fullUrl;
 };
 
 /**
@@ -19,6 +28,7 @@ const getFullImageUrl = (url) => {
  */
 export const sendToDriver = async (fcmToken, dataPayload = {}) => {
   if (!fcmToken) {
+    console.error('❌ No FCM token provided');
     return { success: false, error: 'No FCM token' };
   }
 
@@ -55,7 +65,7 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
         dropLat: String(drop.lat || 0),
         dropLng: String(drop.lng || 0),
         
-        // ✅ Image URL if provided
+        // ✅ Image URL if provided (MUST be full URL)
         imageUrl: fullImageUrl || '',
       },
 
@@ -66,6 +76,11 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
       apns: {
         headers: {
           'apns-priority': '10',
+        },
+        payload: {
+          aps: {
+            'content-available': 1,
+          }
         }
       },
     };
@@ -87,7 +102,13 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
     return { success: true, messageId: response };
 
   } catch (error) {
-    console.error(`❌ FCM SEND FAILED: ${error.message}`);
+    console.error('═'.repeat(70));
+    console.error(`❌ FCM SEND FAILED`);
+    console.error('═'.repeat(70));
+    console.error(`   Error: ${error.message}`);
+    console.error(`   Code: ${error.code}`);
+    console.error(`   Token: ${fcmToken.substring(0, 20)}...`);
+    console.error('═'.repeat(70));
     
     // Handle invalid tokens
     if (error.code === 'messaging/registration-token-not-registered' ||
@@ -115,51 +136,69 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
 };
 
 /**
- * ✅ Send notification to customer WITH IMAGE SUPPORT
+ * ✅ Send notification to customer WITH FULL IMAGE SUPPORT
  */
 export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
-  if (!fcmToken) return { success: false, error: 'No FCM token' };
+  if (!fcmToken) {
+    console.error('❌ No FCM token provided');
+    return { success: false, error: 'No FCM token' };
+  }
 
   try {
-    // ✅ Get full image URL if provided
+    // ✅ Get full absolute image URL
     const fullImageUrl = getFullImageUrl(data.imageUrl);
 
-    console.log(`📤 Sending FCM to Customer:`);
+    console.log('');
+    console.log('═'.repeat(70));
+    console.log('📤 SENDING FCM TO CUSTOMER');
+    console.log('═'.repeat(70));
     console.log(`   Title: ${title}`);
     console.log(`   Body: ${body}`);
-    console.log(`   Image: ${fullImageUrl || 'none'}`);
+    console.log(`   Image URL: ${fullImageUrl || 'none'}`);
+    console.log(`   Token: ${fcmToken.substring(0, 20)}...`);
+    console.log('═'.repeat(70));
+    console.log('');
 
     const message = {
       token: fcmToken,
       
-      // ✅ NOTIFICATION with image
+      // ✅ NOTIFICATION payload with image
       notification: { 
         title, 
         body,
-        ...(fullImageUrl && { imageUrl: fullImageUrl }),  // ✅ Add image
+        // ⚠️ imageUrl at root notification level (FCM spec)
+        ...(fullImageUrl && { imageUrl: fullImageUrl }),
       },
       
-      // ✅ DATA with image
+      // ✅ DATA payload - all values must be strings
       data: { 
-        type: data.type || 'customer',
-        imageUrl: fullImageUrl || '',  // ✅ Include image in data
+        type: String(data.type || 'customer'),
+        imageUrl: String(fullImageUrl || ''),
+        tripId: String(data.tripId || ''),
+        timestamp: new Date().toISOString(),
+        // Include any other data as strings
         ...Object.fromEntries(
-          Object.entries(data).map(([k, v]) => [k, String(v)])
+          Object.entries(data)
+            .filter(([k]) => k !== 'imageUrl' && k !== 'type' && k !== 'tripId')
+            .map(([k, v]) => [k, String(v)])
         ),
       },
       
-      // ✅ ANDROID config with image
+      // ✅ ANDROID specific config
       android: { 
         priority: 'high',
         notification: {
-          channelId: 'high_importance_channel',
+          channelId: 'high_importance_channel', // MUST match Flutter app
           priority: 'high',
-          sound: 'default',
-          ...(fullImageUrl && { imageUrl: fullImageUrl }),  // ✅ Android image
+          defaultSound: true,
+          defaultVibrateTimings: true,
+          defaultLightSettings: true,
+          // ⚠️ Android image at this level
+          ...(fullImageUrl && { imageUrl: fullImageUrl }),
         }
       },
       
-      // ✅ iOS config with image
+      // ✅ iOS specific config
       apns: {
         headers: {
           'apns-priority': '10',
@@ -167,29 +206,62 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
         },
         payload: {
           aps: {
-            alert: { title, body },
+            alert: { 
+              title, 
+              body 
+            },
             sound: 'default',
             badge: 1,
-            'mutable-content': 1,  // ✅ Required for iOS images
+            'mutable-content': 1,  // Required for rich notifications
+            'content-available': 1,
           }
         },
+        // ⚠️ iOS image in fcm_options
         fcm_options: {
-          ...(fullImageUrl && { image: fullImageUrl }),  // ✅ iOS image
+          ...(fullImageUrl && { image: fullImageUrl }),
         },
       },
     };
 
+    console.log('📦 Final FCM Message:');
+    console.log(JSON.stringify(message, null, 2));
+
     const response = await admin.messaging().send(message);
-    console.log(`✅ Customer FCM Success: ${response}`);
+    
+    console.log('');
+    console.log('═'.repeat(70));
+    console.log('✅ CUSTOMER FCM SENT SUCCESSFULLY');
+    console.log('═'.repeat(70));
+    console.log(`   Message ID: ${response}`);
+    console.log('═'.repeat(70));
+    console.log('');
+    
     return { success: true, messageId: response };
     
   } catch (error) {
-    console.error('❌ Customer FCM Error:', error.message);
+    console.error('');
+    console.error('═'.repeat(70));
+    console.error('❌ CUSTOMER FCM FAILED');
+    console.error('═'.repeat(70));
+    console.error(`   Error: ${error.message}`);
+    console.error(`   Code: ${error.code}`);
+    console.error(`   Token: ${fcmToken.substring(0, 20)}...`);
     
-    // Remove invalid token
+    if (error.stack) {
+      console.error(`   Stack: ${error.stack.split('\n')[0]}`);
+    }
+    console.error('═'.repeat(70));
+    console.error('');
+    
+    // Remove invalid token from database
     if (error.code === 'messaging/registration-token-not-registered' ||
         error.code === 'messaging/invalid-registration-token') {
-      await User.updateOne({ fcmToken }, { $unset: { fcmToken: "" } });
+      try {
+        await User.updateOne({ fcmToken }, { $unset: { fcmToken: "" } });
+        console.log('✅ Invalid token removed from database');
+      } catch (dbError) {
+        console.error(`⚠️ Could not remove invalid token: ${dbError.message}`);
+      }
     }
     
     return { success: false, error: error.message };
