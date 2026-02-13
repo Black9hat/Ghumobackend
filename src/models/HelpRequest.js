@@ -51,13 +51,35 @@ const helpRequestSchema = new mongoose.Schema(
     // Track request metadata
     category: {
       type: String,
-      enum: ['technical', 'billing', 'general', 'complaint', 'feedback'],
+      enum: ['technical', 'billing', 'general', 'complaint', 'feedback', 'account-deletion'],
       default: 'general',
     },
     source: {
       type: String,
       enum: ['app', 'web', 'email', 'phone'],
       default: 'app',
+    },
+    // Account deletion specific fields
+    deletionType: {
+      type: String,
+      enum: ['immediate', 'scheduled', 'with-export'],
+      // Only required if category is 'account-deletion'
+    },
+    scheduledDeletionDate: {
+      type: Date,
+      // Only used if deletionType is 'scheduled'
+    },
+    dataExportRequested: {
+      type: Boolean,
+      default: false,
+    },
+    dataExportCompleted: {
+      type: Boolean,
+      default: false,
+    },
+    deletionReason: {
+      type: String,
+      trim: true,
     },
   },
   {
@@ -69,12 +91,19 @@ const helpRequestSchema = new mongoose.Schema(
 helpRequestSchema.index({ customerId: 1, status: 1 });
 helpRequestSchema.index({ status: 1, priority: 1 });
 helpRequestSchema.index({ createdAt: -1 });
+helpRequestSchema.index({ category: 1, status: 1 }); // For filtering account deletion requests
 
 // Automatically set resolvedAt when status changes to 'resolved'
 helpRequestSchema.pre('save', function (next) {
   if (this.isModified('status') && this.status === 'resolved' && !this.resolvedAt) {
     this.resolvedAt = new Date();
   }
+  
+  // Auto-set priority to 'urgent' for account deletion requests
+  if (this.isNew && this.category === 'account-deletion' && !this.priority) {
+    this.priority = 'urgent';
+  }
+  
   next();
 });
 
