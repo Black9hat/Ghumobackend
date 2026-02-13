@@ -15,6 +15,7 @@ import path from 'path';
 import adminIncentiveRoutes from './routes/adminIncentiveRoutes.js';
 import driverRideHistoryRoutes from './routes/driverRideHistory.js';
 import customerBannerRoutes from "./routes/customerBannerRoutes.js";
+import privacyRoutes from './routes/privacyRoutes.js';
 
 // Routes
 import userRoutes from './routes/userRoutes.js';
@@ -71,6 +72,7 @@ app.use((req, res, next) => {
   req.io = io;
   next();
 });
+app.use('/api', privacyRoutes);
 
 // ============================================================================
 // ✅ CORS CONFIGURATION - PROPERLY CONFIGURED FOR PREFLIGHT REQUESTS
