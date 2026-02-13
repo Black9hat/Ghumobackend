@@ -48,7 +48,7 @@ router.get('/settings', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// SUBMIT HELP REQUEST (UPDATED WITH BETTER VALIDATION)
+// SUBMIT HELP REQUEST (UPDATED WITH ACCOUNT DELETION SUPPORT)
 // ════════════════════════════════════════════════════════════════════════════
 
 // POST /api/help/request - Submit a help request
@@ -62,14 +62,19 @@ router.post('/request', async (req, res) => {
       priority = 'medium',
       customerName,
       customerPhone,
+      // Account deletion specific fields
+      deletionType,
+      scheduledDeletionDate,
+      deletionReason,
+      dataExportRequested = false,
     } = req.body;
 
     console.log('📥 Received help request:', {
       customerId,
       subject,
-      description,
       category,
       priority,
+      deletionType,
     });
 
     // ✅ TRY TO GET CUSTOMER ID FROM DIFFERENT SOURCES
@@ -106,7 +111,7 @@ router.post('/request', async (req, res) => {
     }
 
     // ✅ VALIDATE ENUM VALUES
-    const validCategories = ['technical', 'billing', 'general', 'complaint', 'feedback'];
+    const validCategories = ['technical', 'billing', 'general', 'complaint', 'feedback', 'account-deletion'];
     if (!validCategories.includes(category)) {
       console.log(`⚠️ Invalid category "${category}", defaulting to "general"`);
       category = 'general';
@@ -116,6 +121,41 @@ router.post('/request', async (req, res) => {
     if (!validPriorities.includes(priority)) {
       console.log(`⚠️ Invalid priority "${priority}", defaulting to "medium"`);
       priority = 'medium';
+    }
+
+    // ✅ VALIDATE ACCOUNT DELETION SPECIFIC FIELDS
+    if (category === 'account-deletion') {
+      // Auto-set priority to urgent for account deletion
+      priority = 'urgent';
+
+      const validDeletionTypes = ['immediate', 'scheduled', 'with-export'];
+      if (!deletionType || !validDeletionTypes.includes(deletionType)) {
+        console.log('❌ Invalid deletion type for account deletion request');
+        return res.status(400).json({
+          success: false,
+          error: 'Valid deletion type is required for account deletion requests (immediate, scheduled, or with-export)',
+        });
+      }
+
+      // Validate scheduled deletion date if type is 'scheduled'
+      if (deletionType === 'scheduled') {
+        if (!scheduledDeletionDate) {
+          return res.status(400).json({
+            success: false,
+            error: 'Scheduled deletion date is required for scheduled deletion requests',
+          });
+        }
+
+        const schedDate = new Date(scheduledDeletionDate);
+        const today = new Date();
+        
+        if (schedDate <= today) {
+          return res.status(400).json({
+            success: false,
+            error: 'Scheduled deletion date must be in the future',
+          });
+        }
+      }
     }
 
     // Optional: Fetch customer details to enrich the request
@@ -131,7 +171,7 @@ router.post('/request', async (req, res) => {
     // }
 
     // ✅ CREATE HELP REQUEST
-    const helpRequest = await HelpRequest.create({
+    const requestData = {
       customerId,
       customerName: customerName || null,
       customerPhone: customerPhone || null,
@@ -141,17 +181,41 @@ router.post('/request', async (req, res) => {
       priority,
       status: 'pending',
       source: 'app',
-    });
+    };
+
+    // Add account deletion specific fields if applicable
+    if (category === 'account-deletion') {
+      requestData.deletionType = deletionType;
+      requestData.dataExportRequested = dataExportRequested || deletionType === 'with-export';
+      requestData.dataExportCompleted = false;
+      
+      if (deletionType === 'scheduled' && scheduledDeletionDate) {
+        requestData.scheduledDeletionDate = new Date(scheduledDeletionDate);
+      }
+      
+      if (deletionReason) {
+        requestData.deletionReason = deletionReason.trim();
+      }
+    }
+
+    const helpRequest = await HelpRequest.create(requestData);
 
     console.log('✅ Help request created:', helpRequest._id);
 
     // TODO: Send notification to admin
     // await notifyAdminNewRequest(helpRequest);
+    
+    // For account deletion requests, send special notification
+    // if (category === 'account-deletion') {
+    //   await notifyAdminUrgentDeletion(helpRequest);
+    // }
 
     res.status(201).json({
       success: true,
       request: helpRequest,
-      message: 'Your support request has been submitted successfully! We will get back to you within 24 hours.',
+      message: category === 'account-deletion' 
+        ? 'Your account deletion request has been submitted. Our team will review it and contact you within 24 hours.'
+        : 'Your support request has been submitted successfully! We will get back to you within 24 hours.',
     });
   } catch (error) {
     console.error('❌ Error creating help request:', error);
@@ -188,7 +252,7 @@ router.post('/request', async (req, res) => {
 router.get('/requests/:customerId', requireAuth, async (req, res) => {
   try {
     const { customerId } = req.params;
-    const { status, limit = 20 } = req.query;
+    const { status, category, limit = 20 } = req.query;
 
     console.log('📥 Fetching requests for customer:', customerId);
 
@@ -196,6 +260,9 @@ router.get('/requests/:customerId', requireAuth, async (req, res) => {
     const filter = { customerId };
     if (status && status !== 'all') {
       filter.status = status;
+    }
+    if (category && category !== 'all') {
+      filter.category = category;
     }
 
     const requests = await HelpRequest.find(filter)
@@ -277,6 +344,69 @@ router.get('/request/:id', requireAuth, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch request',
+    });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// CANCEL DELETION REQUEST (NEW)
+// ════════════════════════════════════════════════════════════════════════════
+
+// PUT /api/help/request/:id/cancel-deletion - Cancel account deletion request
+router.put('/request/:id/cancel-deletion', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const request = await HelpRequest.findById(id);
+
+    if (!request) {
+      return res.status(404).json({
+        success: false,
+        error: 'Request not found',
+      });
+    }
+
+    // Verify it's an account deletion request
+    if (request.category !== 'account-deletion') {
+      return res.status(400).json({
+        success: false,
+        error: 'This is not an account deletion request',
+      });
+    }
+
+    // Verify request belongs to customer
+    // if (request.customerId.toString() !== req.user?.id?.toString()) {
+    //   return res.status(403).json({
+    //     success: false,
+    //     error: 'Unauthorized access',
+    //   });
+    // }
+
+    // Check if already resolved/closed
+    if (request.status === 'resolved' || request.status === 'closed') {
+      return res.status(400).json({
+        success: false,
+        error: 'This request has already been processed and cannot be cancelled',
+      });
+    }
+
+    // Update status to closed
+    request.status = 'closed';
+    request.response = (request.response || '') + '\n\nCANCELLED BY CUSTOMER';
+    await request.save();
+
+    console.log(`✅ Account deletion request ${id} cancelled by customer`);
+
+    res.json({
+      success: true,
+      request,
+      message: 'Your account deletion request has been cancelled successfully',
+    });
+  } catch (error) {
+    console.error('❌ Error cancelling deletion request:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to cancel deletion request',
     });
   }
 });
