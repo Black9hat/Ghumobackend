@@ -5,7 +5,7 @@ import Notification from "../models/Notification.js";
 import { sendToDriver, sendToCustomer } from "../utils/fcmSender.js";
 
 /**
- * 🔔 Save notification in DB (COMMON)
+ * 📢 Save notification in DB (COMMON)
  */
 const createNotification = async ({
   userId,
@@ -318,7 +318,91 @@ const getUserNotifications = async (req, res) => {
 };
 
 /**
- * 👁 Mark notification as read
+ * 🎁 NEW: Get latest 5 offers for a specific role
+ */
+const getOffers = async (req, res) => {
+  try {
+    const { role } = req.query;
+
+    // Validate role parameter
+    if (!role || !["customer", "driver"].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid role parameter (customer or driver) is required",
+      });
+    }
+
+    console.log(`🎁 Fetching offers for role: ${role}`);
+
+    // Fetch latest 5 promotion notifications for the specified role
+    const offers = await Notification.find({
+      type: "promotion",
+      role: role,
+    })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean();
+
+    console.log(`✅ Found ${offers.length} offers for ${role}`);
+
+    res.status(200).json({
+      success: true,
+      offers,
+      count: offers.length,
+    });
+  } catch (err) {
+    console.error("❌ getOffers error:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: err.message 
+    });
+  }
+};
+
+/**
+ * 🗑️ NEW: Delete a specific offer (admin only)
+ */
+const deleteOffer = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "Offer ID is required",
+      });
+    }
+
+    console.log(`🗑️ Deleting offer: ${id}`);
+
+    // Delete the notification (offer)
+    const deletedOffer = await Notification.findByIdAndDelete(id);
+
+    if (!deletedOffer) {
+      return res.status(404).json({
+        success: false,
+        message: "Offer not found",
+      });
+    }
+
+    console.log(`✅ Offer deleted successfully: ${id}`);
+
+    res.status(200).json({
+      success: true,
+      message: "Offer deleted successfully",
+      deletedOffer,
+    });
+  } catch (err) {
+    console.error("❌ deleteOffer error:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: err.message 
+    });
+  }
+};
+
+/**
+ * 👍 Mark notification as read
  */
 const markAsRead = async (req, res) => {
   try {
@@ -346,7 +430,7 @@ const markAsRead = async (req, res) => {
 };
 
 /**
- * 👁👁 Mark all notifications as read
+ * 👍👍 Mark all notifications as read
  */
 const markAllAsRead = async (req, res) => {
   try {
@@ -368,7 +452,7 @@ const markAllAsRead = async (req, res) => {
 };
 
 /**
- * 🗑 Delete notification
+ * 🗑️ Delete notification
  */
 const deleteNotification = async (req, res) => {
   try {
@@ -398,7 +482,7 @@ const deleteNotification = async (req, res) => {
 };
 
 /**
- * 🗑🗑 Clear all notifications
+ * 🗑️🗑️ Clear all notifications
  */
 const clearAllNotifications = async (req, res) => {
   try {
@@ -417,7 +501,7 @@ const clearAllNotifications = async (req, res) => {
 };
 
 /**
- * 🔁 Reassignment notification
+ * 🔄 Reassignment notification
  */
 const sendReassignmentNotification = async (driverId, tripId) => {
   try {
@@ -454,6 +538,8 @@ export {
   sendBroadcastNotification,
   sendIndividualNotification,
   getUserNotifications,
+  getOffers,          // ✅ NEW: Get offers
+  deleteOffer,        // ✅ NEW: Delete offer
   markAsRead,
   markAllAsRead,
   deleteNotification,
