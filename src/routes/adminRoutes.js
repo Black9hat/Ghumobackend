@@ -65,6 +65,12 @@ import {
   testImageAccess,
 } from "../controllers/adminController.js";
 
+// ✅ NEW: Import offers functions
+import {
+  getOffers,
+  deleteOffer,
+} from "../controllers/notificationController.js";
+
 const router = express.Router();
 
 // ✅ HELPER: Get base URL for Railway deployment
@@ -261,6 +267,18 @@ router.delete("/notifications/user/clear-all", protect, async (req, res) => {
 });
 
 /* ================================
+   🎁 OFFERS MANAGEMENT (NEW)
+================================ */
+
+// Get latest 5 offers for a specific role
+// Usage: GET /api/admin/offers?role=customer or /api/admin/offers?role=driver
+router.get("/offers", getOffers);
+
+// Delete a specific offer (admin only)
+// Usage: DELETE /api/admin/offers/:id
+router.delete("/offers/:id", verifyAdminToken, deleteOffer);
+
+/* ================================
    🛍️ CUSTOMER BANNERS (ADMIN)
 ================================ */
 
@@ -269,41 +287,30 @@ router.post(
   "/upload-image",
   verifyAdminToken,
   uploadCustomerBanner.single("image"),
-  (req, res) => {
+  async (req, res) => {
     try {
       if (!req.file) {
         return res.status(400).json({
           success: false,
-          message: "No image file provided",
+          message: "No image file uploaded",
         });
       }
 
       const filePath = req.file.path.replace(/\\/g, "/");
-      
-      // ✅ FIX: Construct ABSOLUTE URL for Railway deployment
       const baseUrl = getBaseUrl(req);
       const imageUrl = `${baseUrl}/${filePath}`;
 
-      console.log('');
-      console.log('============================================================');
-      console.log('✅ CUSTOMER BANNER IMAGE UPLOADED');
-      console.log('============================================================');
-      console.log(`   Base URL: ${baseUrl}`);
-      console.log(`   File path: ${filePath}`);
-      console.log(`   Full URL: ${imageUrl}`);
-      console.log('============================================================');
-      console.log('');
+      console.log(`✅ Customer image uploaded: ${imageUrl}`);
 
-      return res.status(200).json({
+      res.status(200).json({
         success: true,
         message: "Image uploaded successfully",
         imageUrl,
-        url: imageUrl,
         path: filePath,
       });
     } catch (err) {
-      console.error("❌ Image upload error:", err);
-      return res.status(500).json({
+      console.error("❌ Error uploading image:", err);
+      res.status(500).json({
         success: false,
         message: err.message || "Failed to upload image",
       });
