@@ -61,7 +61,6 @@ const sendTripNotification = async (to, type, tripId) => {
         body = "You have been reassigned to a trip.";
       }
 
-      // ✅ SAVE TO DB
       await createNotification({
         userId: driver._id,
         role: "driver",
@@ -71,7 +70,6 @@ const sendTripNotification = async (to, type, tripId) => {
         data: { tripId: tripId.toString() },
       });
 
-      // ✅ SEND FCM
       if (driver.fcmToken) {
         await sendToDriver(driver.fcmToken, {
           notificationType: "TRIP_REQUEST",
@@ -109,7 +107,6 @@ const sendTripNotification = async (to, type, tripId) => {
         body = "Your trip has been completed. Thank you for riding with us!";
       }
 
-      // ✅ SAVE TO DB
       await createNotification({
         userId: customer._id,
         role: "customer",
@@ -119,7 +116,6 @@ const sendTripNotification = async (to, type, tripId) => {
         data: { tripId: tripId.toString() },
       });
 
-      // ✅ SEND FCM
       if (customer.fcmToken) {
         await sendToCustomer(customer.fcmToken, title, body, {
           tripId: trip._id.toString(),
@@ -137,7 +133,7 @@ const sendTripNotification = async (to, type, tripId) => {
  */
 const sendBroadcastNotification = async (req, res) => {
   try {
-    const { title, body, role, imageUrl, ctaText, ctaRoute } = req.body;
+    const { title, body, role, imageUrl, ctaText, ctaRoute, type = "general" } = req.body;
 
     if (!title || !body) {
       return res.status(400).json({
@@ -152,7 +148,6 @@ const sendBroadcastNotification = async (req, res) => {
     } else if (role === "customer") {
       query = { isDriver: { $ne: true } };
     }
-    // If role is undefined or "all", query is empty (all users)
 
     const users = await User.find(query).select("_id fcmToken isDriver name");
 
@@ -162,13 +157,13 @@ const sendBroadcastNotification = async (req, res) => {
     for (const user of users) {
       const userRole = user.isDriver ? "driver" : "customer";
 
-      // ✅ SAVE TO DB
+      // ✅ SAVE TO DB - Each user gets their own notification
       await createNotification({
         userId: user._id,
         role: userRole,
         title,
         body,
-        type: "general",
+        type: type, // ✅ Use type from request (can be "promotion" for offers)
         imageUrl,
         ctaText,
         ctaRoute,
@@ -186,7 +181,7 @@ const sendBroadcastNotification = async (req, res) => {
             });
           } else {
             await sendToCustomer(user.fcmToken, title, body, {
-              type: "general",
+              type: type,
               imageUrl: imageUrl || "",
             });
           }
@@ -220,7 +215,7 @@ const sendBroadcastNotification = async (req, res) => {
  */
 const sendIndividualNotification = async (req, res) => {
   try {
-    const { title, body, userId, imageUrl, ctaText, ctaRoute } = req.body;
+    const { title, body, userId, imageUrl, ctaText, ctaRoute, type = "general" } = req.body;
 
     if (!title || !body || !userId) {
       return res.status(400).json({
@@ -239,19 +234,17 @@ const sendIndividualNotification = async (req, res) => {
 
     const userRole = user.isDriver ? "driver" : "customer";
 
-    // ✅ SAVE TO DB
     await createNotification({
       userId: user._id,
       role: userRole,
       title,
       body,
-      type: "general",
+      type: type, // ✅ Use type from request
       imageUrl,
       ctaText,
       ctaRoute,
     });
 
-    // ✅ SEND FCM
     let fcmResult = { success: false };
     if (user.fcmToken) {
       if (user.isDriver) {
@@ -262,7 +255,7 @@ const sendIndividualNotification = async (req, res) => {
         });
       } else {
         fcmResult = await sendToCustomer(user.fcmToken, title, body, {
-          type: "general",
+          type: type,
         });
       }
     }
@@ -318,32 +311,27 @@ const getUserNotifications = async (req, res) => {
 };
 
 /**
- * 🎁 NEW: Get latest 5 offers for a specific role
+ * 🎁 NEW: Get latest 5 offers for the logged-in user
+ * Returns user's own promotion notifications (newest first, max 5)
  */
 const getOffers = async (req, res) => {
   try {
-    const { role } = req.query;
+    const userId = req.user._id;
+    const userRole = req.user.isDriver ? "driver" : "customer";
 
-    // Validate role parameter
-    if (!role || !["customer", "driver"].includes(role)) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid role parameter (customer or driver) is required",
-      });
-    }
+    console.log(`🎁 Fetching offers for user: ${userId} (${userRole})`);
 
-    console.log(`🎁 Fetching offers for role: ${role}`);
-
-    // Fetch latest 5 promotion notifications for the specified role
+    // ✅ Fetch user's own promotion notifications
     const offers = await Notification.find({
-      type: "promotion",
-      role: role,
+      userId: userId,        // ✅ User's own notifications
+      role: userRole,        // ✅ Matching role
+      type: "promotion",     // ✅ Only promotions
     })
-      .sort({ createdAt: -1 })
-      .limit(5)
+      .sort({ createdAt: -1 }) // ✅ Newest first
+      .limit(5)                // ✅ Max 5
       .lean();
 
-    console.log(`✅ Found ${offers.length} offers for ${role}`);
+    console.log(`✅ Found ${offers.length} offers for user ${userId}`);
 
     res.status(200).json({
       success: true,
@@ -360,7 +348,8 @@ const getOffers = async (req, res) => {
 };
 
 /**
- * 🗑️ NEW: Delete a specific offer (admin only)
+ * 🗑️ NEW: Admin delete all instances of an offer
+ * Deletes all notification entries with matching title/body/imageUrl
  */
 const deleteOffer = async (req, res) => {
   try {
@@ -375,22 +364,31 @@ const deleteOffer = async (req, res) => {
 
     console.log(`🗑️ Deleting offer: ${id}`);
 
-    // Delete the notification (offer)
-    const deletedOffer = await Notification.findByIdAndDelete(id);
+    // Find the offer to get its details
+    const offer = await Notification.findById(id);
 
-    if (!deletedOffer) {
+    if (!offer) {
       return res.status(404).json({
         success: false,
         message: "Offer not found",
       });
     }
 
-    console.log(`✅ Offer deleted successfully: ${id}`);
+    // ✅ Delete ALL notifications with same title, body, and imageUrl
+    // This removes the offer for all users
+    const deleteResult = await Notification.deleteMany({
+      title: offer.title,
+      body: offer.body,
+      imageUrl: offer.imageUrl,
+      type: "promotion",
+    });
+
+    console.log(`✅ Deleted ${deleteResult.deletedCount} offer instances`);
 
     res.status(200).json({
       success: true,
-      message: "Offer deleted successfully",
-      deletedOffer,
+      message: `Offer deleted successfully (${deleteResult.deletedCount} instances removed)`,
+      deletedCount: deleteResult.deletedCount,
     });
   } catch (err) {
     console.error("❌ deleteOffer error:", err);
@@ -508,7 +506,6 @@ const sendReassignmentNotification = async (driverId, tripId) => {
     const driver = await User.findById(driverId);
     if (!driver) return;
 
-    // ✅ SAVE
     await createNotification({
       userId: driver._id,
       role: "driver",
@@ -518,7 +515,6 @@ const sendReassignmentNotification = async (driverId, tripId) => {
       data: { tripId: tripId.toString() },
     });
 
-    // ✅ FCM
     if (driver.fcmToken) {
       await sendToDriver(driver.fcmToken, {
         notificationType: "TRIP_REASSIGNED",
@@ -538,8 +534,8 @@ export {
   sendBroadcastNotification,
   sendIndividualNotification,
   getUserNotifications,
-  getOffers,          // ✅ NEW: Get offers
-  deleteOffer,        // ✅ NEW: Delete offer
+  getOffers,          // ✅ NEW: Get user's offers
+  deleteOffer,        // ✅ NEW: Delete offer for all users
   markAsRead,
   markAllAsRead,
   deleteNotification,
