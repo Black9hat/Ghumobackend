@@ -270,12 +270,12 @@ router.delete("/notifications/user/clear-all", protect, async (req, res) => {
    🎁 OFFERS MANAGEMENT (NEW)
 ================================ */
 
-// Get latest 5 offers for a specific role
-// Usage: GET /api/admin/offers?role=customer or /api/admin/offers?role=driver
-router.get("/offers", getOffers);
+// ✅ Get user's offers (requires user authentication via protect middleware)
+// Returns the logged-in user's own promotion notifications
+router.get("/offers", protect, getOffers);
 
-// Delete a specific offer (admin only)
-// Usage: DELETE /api/admin/offers/:id
+// ✅ Delete offer for ALL users (admin only)
+// Deletes all notification instances with matching content
 router.delete("/offers/:id", verifyAdminToken, deleteOffer);
 
 /* ================================
