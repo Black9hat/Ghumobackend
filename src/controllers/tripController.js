@@ -1713,6 +1713,54 @@ const getActiveRide = async (req, res) => {
   }
 };
 
+// ========== DRIVER LOCATION BY TRIP ID ==========
+// Flutter polls GET /api/trip/:tripId/driver-location as socket fallback
+
+const getDriverLocationByTripId = async (req, res) => {
+  try {
+    const { tripId } = req.params;
+
+    const trip = await Trip.findById(tripId)
+      .select('assignedDriver customerId status')
+      .lean();
+
+    if (!trip) {
+      return res.status(404).json({ success: false, message: 'Trip not found' });
+    }
+
+    if (!trip.assignedDriver) {
+      return res.status(200).json({ success: false, message: 'No driver assigned' });
+    }
+
+    const driver = await User.findById(trip.assignedDriver)
+      .select('location lastBearing locationSequence lastLocationUpdate')
+      .lean();
+
+    if (!driver?.location?.coordinates) {
+      return res.status(200).json({ success: false, message: 'Driver location unavailable' });
+    }
+
+    const [lng, lat] = driver.location.coordinates;
+
+    return res.status(200).json({
+      success: true,
+      location: { lat, lng, latitude: lat, longitude: lng },
+      driverLocation: {
+        lat, lng, latitude: lat, longitude: lng,
+        bearing: driver.lastBearing ?? null,
+        heading: driver.lastBearing ?? null,
+        sequence: driver.locationSequence ?? null,
+        lastUpdate: driver.lastLocationUpdate ?? null
+      },
+      driverId: driver._id.toString(),
+      tripId: tripId.toString()
+    });
+  } catch (err) {
+    console.error('❌ getDriverLocationByTripId error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // ========== SUPPORT ==========
 
 export const requestTripSupport = async (req, res) => {
@@ -1759,4 +1807,5 @@ export {
   getTripByIdWithPayment,
   getActiveRide,
   awardCoinsToCustomer,
+  getDriverLocationByTripId,   // ✅ NEW: Flutter polls /api/trip/:tripId/driver-location
 };
