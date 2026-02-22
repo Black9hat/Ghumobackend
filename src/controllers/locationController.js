@@ -44,9 +44,141 @@ const updateDriverLocation = async (req, res) => {
       coordinates, 
       latitude, 
       longitude, 
-      sequence,      // ✅ NEW: Sequence number from client
-      timestamp      // ✅ NEW: Client timestamp
+      sequence,
+      timestamp,
+      bearing,   // ✅ NEW: bearing/heading from driver device
+      heading,   // ✅ alias
+      speed      // ✅ optional speed
     } = req.body;
+
+    console.log('');
+    console.log('📍 DRIVER LOCATION UPDATE REQUEST (HTTP)');
+    console.log(`   Driver ID: ${driverId}`);
+    console.log(`   Trip ID: ${tripId || 'N/A'}`);
+    console.log(`   Latitude: ${latitude}`);
+    console.log(`   Longitude: ${longitude}`);
+    console.log(`   Sequence: ${sequence || 'N/A'}`);
+
+    const user = await resolveUserByIdOrPhone(driverId);
+    if (!user) {
+      console.log(`❌ Driver not found: ${driverId}`);
+      return res.status(404).json({ success: false, message: 'Driver not found.' });
+    }
+
+    const coords = buildCoordinates(coordinates, latitude, longitude);
+    if (!coords) {
+      console.log('❌ Invalid coordinates');
+      return res.status(400).json({ success: false, message: 'Coordinates required.' });
+    }
+
+    // ── Calculate bearing from previous position if not provided ─────────────
+    let calculatedBearing = bearing ?? heading ?? null;
+    if (calculatedBearing == null && user.location?.coordinates) {
+      const [prevLng, prevLat] = user.location.coordinates;
+      const newLat = coords[1], newLng = coords[0];
+      const distMoved = Math.sqrt(Math.pow(newLat - prevLat, 2) + Math.pow(newLng - prevLng, 2));
+      if (distMoved > 0.0001) {
+        const dLon = (newLng - prevLng) * Math.PI / 180;
+        const lat1 = prevLat * Math.PI / 180;
+        const lat2 = newLat * Math.PI / 180;
+        const y = Math.sin(dLon) * Math.cos(lat2);
+        const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+        calculatedBearing = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+      } else {
+        calculatedBearing = user.lastBearing ?? null;
+      }
+    }
+
+    console.log(`   Coordinates: [${coords[1]}, ${coords[0]}]`);
+    console.log(`   Bearing: ${calculatedBearing?.toFixed(0) ?? 'N/A'}°`);
+
+    const updateQuery = { _id: user._id };
+
+    if (timestamp) {
+      const clientTime = new Date(timestamp);
+      updateQuery.$or = [
+        { lastLocationUpdate: { $lt: clientTime } },
+        { lastLocationUpdate: { $exists: false } }
+      ];
+    }
+
+    const updateSet = {
+      location: { type: 'Point', coordinates: coords },
+      updatedAt: new Date()
+    };
+    if (typeof sequence === 'number') updateSet.locationSequence = sequence;
+    if (timestamp) updateSet.lastLocationUpdate = new Date(timestamp);
+    if (calculatedBearing !== null) updateSet.lastBearing = calculatedBearing;
+
+    const result = await User.findOneAndUpdate(
+      updateQuery,
+      { $set: updateSet },
+      { new: true, select: 'locationSequence lastLocationUpdate location socketId lastBearing' }
+    );
+
+    if (!result && typeof sequence === 'number') {
+      console.log(`⚠️ IGNORED: Out-of-order location update for driver ${driverId}`);
+      return res.status(200).json({ 
+        success: true, 
+        message: 'Ignored (older sequence)',
+        ignored: true,
+        currentSequence: user.locationSequence,
+        receivedSequence: sequence
+      });
+    }
+
+    if (!result) {
+      console.log(`❌ Failed to update driver location`);
+      return res.status(500).json({ success: false, message: 'Failed to update location.' });
+    }
+
+    console.log(`✅ Driver location updated successfully`);
+
+    // ✅ EMIT VIA SOCKET to customer with bearing
+    if (tripId) {
+      const trip = await Trip.findById(tripId).lean();
+      if (trip && trip.customerId) {
+        const customer = await User.findById(trip.customerId).select('socketId').lean();
+        if (customer?.socketId) {
+          const dropLat = trip.drop.coordinates[1];
+          const dropLng = trip.drop.coordinates[0];
+          const distance = calculateDistance(coords[1], coords[0], dropLat, dropLng);
+          const distanceInMeters = distance * 1000;
+
+          const payload = {
+            tripId,
+            driverId: user._id.toString(),
+            latitude: coords[1],
+            longitude: coords[0],
+            bearing: calculatedBearing,         // 🚀 Flutter needs this
+            heading: calculatedBearing,
+            speed: speed ?? null,
+            distanceToDestination: Math.round(distanceInMeters),
+            sequence: result.locationSequence ?? sequence,
+            timestamp: result.lastLocationUpdate ?? new Date()
+          };
+
+          io.to(customer.socketId).emit('driver:locationUpdate', payload);
+          console.log(`📡 HTTP → Emitted location to customer socket: ${customer.socketId}`);
+        } else {
+          console.log(`⚠️ Customer socket not found for trip ${tripId}`);
+        }
+      }
+    }
+
+    console.log('');
+
+    return res.status(200).json({ 
+      success: true, 
+      message: 'Driver location updated.',
+      sequence: result.locationSequence,
+      timestamp: result.lastLocationUpdate
+    });
+  } catch (err) {
+    console.error(`❌ Error in updateDriverLocation: ${err.stack}`);
+    return res.status(500).json({ success: false, message: 'Failed to update driver location.' });
+  }
+};
 
     console.log('');
     console.log('📍 DRIVER LOCATION UPDATE REQUEST (HTTP)');
@@ -418,9 +550,136 @@ const getCustomerLocation = async (req, res) => {
   }
 };
 
+/**
+ * ✅ NEW: Get driver location by TRIP ID
+ * Flutter polls this at /api/trip/:tripId/driver-location
+ * This is the API fallback when socket isn't firing
+ */
+const getDriverLocationByTripId = async (req, res) => {
+  try {
+    const { tripId } = req.params;
+
+    if (!tripId) {
+      return res.status(400).json({ success: false, message: 'tripId required' });
+    }
+
+    const trip = await Trip.findById(tripId)
+      .select('assignedDriver customerId status')
+      .lean();
+
+    if (!trip) {
+      return res.status(404).json({ success: false, message: 'Trip not found' });
+    }
+
+    if (!trip.assignedDriver) {
+      return res.status(200).json({ success: false, message: 'No driver assigned yet' });
+    }
+
+    const driver = await User.findById(trip.assignedDriver)
+      .select('location lastBearing locationSequence lastLocationUpdate name')
+      .lean();
+
+    if (!driver || !driver.location?.coordinates) {
+      return res.status(200).json({ success: false, message: 'Driver location not available' });
+    }
+
+    const [lng, lat] = driver.location.coordinates;
+
+    return res.status(200).json({
+      success: true,
+      driverLocation: {          // Flutter checks for this field
+        lat,
+        lng,
+        latitude: lat,
+        longitude: lng,
+        bearing: driver.lastBearing ?? null,
+        heading: driver.lastBearing ?? null,
+        sequence: driver.locationSequence ?? null,
+        lastUpdate: driver.lastLocationUpdate ?? null
+      },
+      location: {                // alternate field name
+        lat,
+        lng,
+        latitude: lat,
+        longitude: lng
+      },
+      tripId: tripId.toString(),
+      driverId: driver._id.toString(),
+      driverName: driver.name
+    });
+  } catch (err) {
+    console.error(`❌ Error in getDriverLocationByTripId: ${err.stack}`);
+    return res.status(500).json({ success: false, message: 'Failed to fetch driver location.' });
+  }
+};
+
+/**
+ * ✅ NEW: Google Directions proxy endpoint
+ * Flutter calls /api/directions?origin=lat,lng&destination=lat,lng&mode=driving
+ * Proxies to Google Directions API and returns polyline
+ */
+const getDirections = async (req, res) => {
+  try {
+    const { origin, destination, mode = 'driving' } = req.query;
+
+    if (!origin || !destination) {
+      return res.status(400).json({ success: false, message: 'origin and destination required' });
+    }
+
+    const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
+
+    if (!GOOGLE_API_KEY) {
+      console.error('❌ GOOGLE_API_KEY missing');
+      return res.status(500).json({ success: false, message: 'Maps API not configured' });
+    }
+
+    const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&mode=${mode}&key=${GOOGLE_API_KEY}`;
+
+    console.log(`🗺️ Directions: ${origin} → ${destination} (${mode})`);
+
+    // Use built-in fetch (Node 18+) or fall back to http module
+    let data;
+    try {
+      const response = await fetch(url);
+      data = await response.json();
+    } catch (fetchErr) {
+      // Fallback: use https module
+      const https = await import('https');
+      data = await new Promise((resolve, reject) => {
+        https.default.get(url, (resp) => {
+          let body = '';
+          resp.on('data', chunk => body += chunk);
+          resp.on('end', () => {
+            try { resolve(JSON.parse(body)); }
+            catch (e) { reject(e); }
+          });
+        }).on('error', reject);
+      });
+    }
+
+    console.log(`🗺️ Google response status: ${data.status}`);
+
+    if (data.status !== 'OK') {
+      return res.status(200).json({
+        status: data.status,
+        error_message: data.error_message,
+        routes: []
+      });
+    }
+
+    // Return exactly what Flutter expects (same shape as Google Directions API)
+    return res.status(200).json(data);
+  } catch (err) {
+    console.error(`❌ Error in getDirections: ${err.stack}`);
+    return res.status(500).json({ success: false, message: 'Directions fetch failed' });
+  }
+};
+
 export {
   updateDriverLocation,
   updateCustomerLocation,
   getDriverLocation,
   getCustomerLocation,
+  getDriverLocationByTripId,  // ✅ NEW: For Flutter's /api/trip/:id/driver-location poll
+  getDirections,              // ✅ NEW: For Flutter's /api/directions polyline
 };
