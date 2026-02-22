@@ -1398,68 +1398,39 @@ export const initSocket = (ioInstance) => {
     // =========================================================================
     // DRIVER LOCATION UPDATE
     // =========================================================================
-    socket.on('driver:location', async ({ tripId, driverId, latitude, longitude, sequence, timestamp, bearing, heading, speed }) => {
+    socket.on('driver:location', async ({ tripId, driverId, latitude, longitude, sequence, timestamp }) => {
       try {
-        // ✅ Accept 0 as valid coordinate (fix: !latitude was blocking equator coords)
-        if (!tripId || !driverId || latitude == null || longitude == null) return;
+        if (!tripId || !driverId || !latitude || !longitude) return;
 
-        // ── Step 1: Calculate bearing from previous position if not provided ──
-        let calculatedBearing = bearing ?? heading ?? null;
-
-        if (calculatedBearing == null) {
-          // Get previous location from DB to calculate direction of travel
-          const prevDriver = await User.findById(driverId)
-            .select('location lastBearing')
-            .lean();
-
-          if (prevDriver?.location?.coordinates) {
-            const [prevLng, prevLat] = prevDriver.location.coordinates;
-            const distMoved = Math.sqrt(
-              Math.pow(latitude - prevLat, 2) + Math.pow(longitude - prevLng, 2)
-            );
-            // Only calculate bearing if driver actually moved (avoid noise)
-            if (distMoved > 0.0001) {
-              const dLon = (longitude - prevLng) * Math.PI / 180;
-              const lat1 = prevLat * Math.PI / 180;
-              const lat2 = latitude * Math.PI / 180;
-              const y = Math.sin(dLon) * Math.cos(lat2);
-              const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
-              calculatedBearing = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
-            } else {
-              calculatedBearing = prevDriver.lastBearing ?? null;
-            }
+        const updateData = {
+          $set: {
+            location: { type: 'Point', coordinates: [longitude, latitude] },
+            lastLocationUpdate: new Date(),
+            lastHeartbeat: new Date()
           }
+        };
+
+        if (typeof sequence === 'number') {
+          updateData.$set.locationSequence = sequence;
         }
 
-        // ── Step 2: Save location + bearing to DB ────────────────────────────
-        const updateSet = {
-          location: { type: 'Point', coordinates: [longitude, latitude] },
-          lastLocationUpdate: new Date(),
-          lastHeartbeat: new Date()
-        };
-        if (typeof sequence === 'number') updateSet.locationSequence = sequence;
-        if (calculatedBearing !== null) updateSet.lastBearing = calculatedBearing;
+        await User.findByIdAndUpdate(driverId, updateData);
 
-        await User.findByIdAndUpdate(driverId, { $set: updateSet });
-
-        // ── Step 3: Get trip and calculate distance ──────────────────────────
-        const trip = await Trip.findById(tripId).select('customerId drop status').lean();
+        const trip = await Trip.findById(tripId).lean();
         if (!trip) return;
 
         const dropLat = trip.drop.coordinates[1];
         const dropLng = trip.drop.coordinates[0];
-        const distanceKm = calculateDistance(latitude, longitude, dropLat, dropLng);
-        const distanceInMeters = distanceKm * 1000;
+        const distance = calculateDistance(latitude, longitude, dropLat, dropLng);
+        const distanceInMeters = distance * 1000;
 
         if (distanceInMeters <= 500 && trip.status === 'ride_started') {
           await User.findByIdAndUpdate(driverId, { $set: { canReceiveNewRequests: true } });
         }
 
-        // ── Step 4: Find customer socket — Map first, DB fallback ────────────
-        const customerIdStr = trip.customerId.toString();
+        // ✅ FIX 5a: Try connectedCustomers map first, then fall back to DB socketId
+        // This fixes the case where customer reconnected but didn't re-call customer:register
         let customerSocketId = null;
-
-        // Try in-memory map first (fast path)
         for (const [socketId, custId] of connectedCustomers.entries()) {
           if (custId === customerIdStr) {
             customerSocketId = socketId;
@@ -1467,33 +1438,27 @@ export const initSocket = (ioInstance) => {
           }
         }
 
-        // 🔥 CRITICAL FIX: Fall back to DB socketId if map is stale
-        // This happens when customer reconnects — map doesn't always update
         if (!customerSocketId) {
-          const customerDoc = await User.findById(trip.customerId).select('socketId').lean();
-          if (customerDoc?.socketId) {
-            customerSocketId = customerDoc.socketId;
-            console.log(`📡 Using DB socketId for customer ${customerIdStr}: ${customerSocketId}`);
+          // Fallback: look up current socketId from DB
+          const customer = await User.findById(customerIdStr).select('socketId').lean();
+          if (customer?.socketId) {
+            customerSocketId = customer.socketId;
           }
         }
 
-        // ── Step 5: Emit to customer ─────────────────────────────────────────
         if (customerSocketId) {
           io.to(customerSocketId).emit('driver:locationUpdate', {
             tripId: tripId.toString(),
             driverId,
             latitude,
             longitude,
-            bearing: calculatedBearing,         // 🚀 Flutter needs this for smooth rotation
-            heading: calculatedBearing,          // alias for compatibility
-            speed: speed ?? null,
             distanceToDestination: Math.round(distanceInMeters),
-            sequence: sequence ?? Date.now(),    // Always send a sequence number
-            timestamp: timestamp ?? new Date().toISOString()
+            sequence: typeof sequence === 'number' ? sequence : Date.now(), // ✅ FIX 5b: Always include sequence
+            timestamp: new Date().toISOString()
           });
-          console.log(`📡 Location → customer | lat:${latitude.toFixed(5)} lng:${longitude.toFixed(5)} bearing:${calculatedBearing?.toFixed(0) ?? 'N/A'}°`);
+          console.log(`📡 Emitted driver:locationUpdate to customer ${customerIdStr}`);
         } else {
-          console.warn(`⚠️ No customer socket for trip ${tripId} (customer: ${customerIdStr})`);
+          console.warn(`⚠️ No socket found for customer ${customerIdStr} — location update dropped`);
         }
       } catch (e) {
         console.error('❌ driver:location error:', e);
