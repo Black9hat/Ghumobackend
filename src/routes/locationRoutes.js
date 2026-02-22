@@ -6,9 +6,18 @@ import {
   updateCustomerLocation,
   getDriverLocation,
   getCustomerLocation,
+  getDirections,             // ✅ NEW: Polyline proxy for Flutter
 } from '../controllers/locationController.js';
 
 const router = express.Router();
+
+/**
+ * @route   GET /api/location/directions
+ * @desc    Proxy Google Directions API for Flutter polyline drawing
+ *          Flutter calls: GET /api/directions?origin=lat,lng&destination=lat,lng&mode=driving
+ *          ⚠️  Register this ALSO at app-level as /api/directions (see note below)
+ */
+router.get('/directions', getDirections);
 
 /**
  * @route   POST /api/location/update/driver
@@ -35,3 +44,11 @@ router.get('/driver/:id', getDriverLocation);
 router.get('/customer/:id', getCustomerLocation); // ✅ Only this one!
 
 export default router;
+// ⚠️  IMPORTANT: Flutter calls /api/directions (not /api/location/directions)
+// If locationRoutes is mounted at /api/location, add this to your app.js/server.js:
+//
+//   import { getDirections } from './controllers/locationController.js';
+//   app.get('/api/directions', getDirections);
+//
+// OR mount locationRoutes at /api as well:
+//   app.use('/api', locationRoutes);  (in addition to existing mount)
