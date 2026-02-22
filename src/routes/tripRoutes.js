@@ -22,6 +22,7 @@ import {
   getDriverActiveTrip,
   completeRideWithVerification,
   confirmCashCollection,
+  getDriverLocationByTripId,   // ✅ NEW
 } from '../controllers/tripController.js';
 const router = express.Router();
 
@@ -134,7 +135,6 @@ router.post("/support/request", requestTripSupport);
  * @desc    Create a short city ride
  */
 router.post('/short', createShortTrip);
-router.get('/:tripId', getTripByIdWithPayment);
 /**
  * @route   POST /api/trip/parcel
  * @desc    Create a parcel delivery ride
@@ -144,7 +144,6 @@ router.get('/driver/active/:driverId', getDriverActiveTrip);
 
 /**
  * @route   POST /api/trip/long
- * @desc    Create a long intercity ride
  */
 router.post('/long', createLongTrip);
 
@@ -199,9 +198,14 @@ router.post('/complete-ride', completeRideWithVerification);
  */
 router.post('/confirm-cash', confirmCashCollection);
 
-// ========================================
-// 🐛 DEBUG ENDPOINTS
-// ========================================
+/**
+ * ✅ NEW: GET /api/trip/:tripId/driver-location
+ * Flutter polls this every 3s as fallback when socket is slow/disconnected
+ * MUST be placed before /:tripId to avoid route collision
+ */
+router.get('/:tripId/driver-location', getDriverLocationByTripId);
+
+router.get('/:tripId', getTripByIdWithPayment);
 
 /**
  * @route   GET /api/trip/debug/driver/:driverId/status
