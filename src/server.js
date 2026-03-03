@@ -82,6 +82,8 @@ app.use(cors({
     'http://localhost:5173',
     'http://localhost:3000',
     'http://localhost:5174',
+    "https://ghumobackend.onrender.com",
+
     'https://adminfrontend-n30d.onrender.com'  // ✅ ADD THIS
   ],
   credentials: true,
