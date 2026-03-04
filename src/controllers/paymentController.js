@@ -80,16 +80,33 @@ export const createDirectPaymentOrder = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { tripId, customerId, driverId, amount } = req.body;
+    const { tripId, driverId, amount } = req.body;
+
+    // Accept customerId from body OR from authenticated Firebase user
+    const customerId = req.body.customerId ||
+      req.user?.mongoId?.toString() ||
+      req.user?._id?.toString() ||
+      req.user?.id?.toString() ||
+      null;
+
+    console.log('📦 direct/create:', { tripId, customerId, driverId, amount,
+      userPhone: req.user?.phone, userMongoId: req.user?.mongoId });
 
     // ─────────────────────────────────────────────────────────────────
     // Validation
     // ─────────────────────────────────────────────────────────────────
     if (!tripId || !customerId || !driverId || !amount) {
       await session.abortTransaction();
+      const missing = [];
+      if (!tripId)     missing.push('tripId');
+      if (!customerId) missing.push('customerId');
+      if (!driverId)   missing.push('driverId');
+      if (!amount)     missing.push('amount');
+      console.error('❌ direct/create missing:', missing, '| body:', req.body, '| user:', req.user);
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields: tripId, customerId, driverId, amount'
+        message: 'Missing required fields: ' + missing.join(', '),
+        received: { tripId, customerId, driverId, amount }
       });
     }
 
@@ -482,14 +499,31 @@ export const initiateCashPayment = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { tripId, customerId, driverId, amount } = req.body;
+    const { tripId, driverId, amount } = req.body;
+
+    // Accept customerId from body OR from authenticated Firebase user
+    const customerId = req.body.customerId ||
+      req.user?.mongoId?.toString() ||
+      req.user?._id?.toString() ||
+      req.user?.id?.toString() ||
+      null;
+
+    console.log('📦 cash/initiate:', { tripId, customerId, driverId, amount,
+      userPhone: req.user?.phone });
 
     // Validation
     if (!tripId || !customerId || !driverId || !amount) {
       await session.abortTransaction();
+      const missing = [];
+      if (!tripId)     missing.push('tripId');
+      if (!customerId) missing.push('customerId');
+      if (!driverId)   missing.push('driverId');
+      if (!amount)     missing.push('amount');
+      console.error('❌ cash/initiate missing:', missing, '| body:', req.body, '| user:', req.user);
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields'
+        message: 'Missing required fields: ' + missing.join(', '),
+        received: { tripId, customerId, driverId, amount }
       });
     }
 
