@@ -1031,6 +1031,12 @@ const acceptTrip = async (req, res) => {
         tripId: tripData._id.toString(), 
         rideCode,
         trip: {
+          _id: tripData._id.toString(),
+          tripId: tripData._id.toString(),
+          customerId: tripData.customerId.toString(),   // ✅ ADDED
+          driverId: tripData.assignedDriver.toString(), // ✅ ADDED
+          fare: tripData.fare || 0,
+          finalFare: tripData.finalFare || tripData.fare || 0,
           pickup: {
             lat: tripData.pickup.coordinates[1],
             lng: tripData.pickup.coordinates[0],
@@ -1041,7 +1047,6 @@ const acceptTrip = async (req, res) => {
             lng: tripData.drop.coordinates[0],
             address: tripData.drop.address || "Drop Location",
           },
-          fare: tripData.fare || 0
         },
         driver: driverData
       });
@@ -1056,6 +1061,13 @@ const acceptTrip = async (req, res) => {
         tripId: tripData._id, 
         otp: rideCode,
         trip: {
+          _id: tripData._id.toString(),
+          tripId: tripData._id.toString(),
+          customerId: tripData.customerId.toString(),   // ✅ ADDED
+          driverId: tripData.assignedDriver.toString(), // ✅ ADDED
+          fare: tripData.fare || 0,
+          finalFare: tripData.finalFare || tripData.fare || 0,
+          type: tripData.type,
           pickup: {
             lat: tripData.pickup.coordinates[1],
             lng: tripData.pickup.coordinates[0],
@@ -1066,8 +1078,6 @@ const acceptTrip = async (req, res) => {
             lng: tripData.drop.coordinates[0],
             address: tripData.drop.address || "Drop Location",
           },
-          fare: tripData.fare || 0,
-          type: tripData.type
         },
         customer: customerData,
         status: tripData.status,
