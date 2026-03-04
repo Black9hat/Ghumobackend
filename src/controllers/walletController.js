@@ -757,7 +757,7 @@ export const handleRazorpayWebhook = async (req, res) => {
 
     const expectedSignature = crypto
       .createHmac('sha256', webhookSecret)
-      .update(JSON.stringify(webhookBody))
+      .update(webhookBody)
       .digest('hex');
 
     if (expectedSignature !== webhookSignature) {
@@ -765,10 +765,12 @@ export const handleRazorpayWebhook = async (req, res) => {
       return res.status(400).json({ success: false });
     }
 
-    console.log(`✅ Webhook signature verified: ${webhookBody.event}`);
+    console.log(`✅ Webhook signature verified`);
 
-    const event = webhookBody.event;
-    const payload = webhookBody.payload;
+    // Parse raw body after signature verification
+    const parsedBody = JSON.parse(webhookBody.toString());
+    const event = parsedBody.event;
+    const payload = parsedBody.payload;
 
     // ─────────────────────────────────────────────────────────────────
     // 📥 Process webhook events
