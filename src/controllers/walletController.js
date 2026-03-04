@@ -887,3 +887,6 @@ export default {
   confirmCashReceipt,
   handleRazorpayWebhook
 };
+
+// Alias so tripController.js import works without changes
+export const processCashCollection = processCashPayment;
