@@ -888,5 +888,370 @@ export default {
   handleRazorpayWebhook
 };
 
-// Alias so tripController.js import works without changes
+// ═══════════════════════════════════════════════════════════════════════════
+// ALIASES - backward compatibility for any routes/controllers using old names
+// ═══════════════════════════════════════════════════════════════════════════
 export const processCashCollection = processCashPayment;
+export const createRazorpayOrder = createDirectPaymentOrder;
+export const verifyRazorpayPayment = verifyDirectPayment;
+export const processCashPaymentHandler = processCashPayment;
+export const confirmCashPayment = confirmCashReceipt;
+export const razorpayWebhook = handleRazorpayWebhook;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET WALLET BY DRIVER ID
+// GET /api/wallet/:driverId
+// ═══════════════════════════════════════════════════════════════════════════
+export const getWalletByDriverId = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+
+    if (!driverId) {
+      return res.status(400).json({ success: false, message: 'driverId required' });
+    }
+
+    const wallet = await Wallet.findOne({ driverId }).lean();
+
+    if (!wallet) {
+      return res.json({
+        success: true,
+        wallet: {
+          driverId,
+          availableBalance: 0,
+          totalEarnings: 0,
+          totalCommission: 0,
+          pendingAmount: 0,
+          transactions: []
+        }
+      });
+    }
+
+    res.json({ success: true, wallet });
+  } catch (error) {
+    console.error('❌ getWalletByDriverId error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch wallet' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET TODAY'S EARNINGS
+// GET /api/wallet/today/:driverId
+// ═══════════════════════════════════════════════════════════════════════════
+export const getTodayEarnings = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const wallet = await Wallet.findOne({ driverId }).lean();
+
+    if (!wallet) {
+      return res.json({
+        success: true,
+        todayEarnings: 0,
+        todayTrips: 0,
+        todayCommission: 0
+      });
+    }
+
+    const todayTransactions = (wallet.transactions || []).filter(
+      t => t.type === 'credit' && new Date(t.createdAt) >= startOfDay
+    );
+
+    const todayEarnings = todayTransactions.reduce((sum, t) => sum + (t.amount || 0), 0);
+    const todayCommission = Math.round(todayEarnings * 0.20 * 100) / 100;
+
+    res.json({
+      success: true,
+      todayEarnings: Math.round(todayEarnings * 100) / 100,
+      todayTrips: todayTransactions.length,
+      todayCommission,
+      availableBalance: wallet.availableBalance || 0
+    });
+  } catch (error) {
+    console.error('❌ getTodayEarnings error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch today earnings' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET PAYMENT PROOFS
+// GET /api/wallet/payment-proof/:driverId
+// ═══════════════════════════════════════════════════════════════════════════
+export const getPaymentProofs = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    const { limit = 20, skip = 0 } = req.query;
+
+    const wallet = await Wallet.findOne({ driverId }).lean();
+
+    if (!wallet) {
+      return res.json({ success: true, proofs: [], total: 0 });
+    }
+
+    const completedTransactions = (wallet.transactions || [])
+      .filter(t => t.status === 'completed' && (t.razorpayPaymentId || t.paymentMethod))
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(Number(skip), Number(skip) + Number(limit));
+
+    res.json({
+      success: true,
+      proofs: completedTransactions,
+      total: wallet.transactions?.filter(t => t.status === 'completed').length || 0
+    });
+  } catch (error) {
+    console.error('❌ getPaymentProofs error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch payment proofs' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET ALL WALLETS (Admin)
+// GET /api/wallet/admin/wallets
+// ═══════════════════════════════════════════════════════════════════════════
+export const getAllWallets = async (req, res) => {
+  try {
+    const { page = 1, limit = 20, sortBy = 'totalEarnings', order = 'desc' } = req.query;
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const sortOrder = order === 'asc' ? 1 : -1;
+    const sortField = ['availableBalance', 'totalEarnings', 'totalCommission', 'pendingAmount'].includes(sortBy)
+      ? sortBy : 'totalEarnings';
+
+    const [wallets, total] = await Promise.all([
+      Wallet.find({})
+        .select('driverId availableBalance totalEarnings totalCommission pendingAmount lastUpdated')
+        .sort({ [sortField]: sortOrder })
+        .skip(skip)
+        .limit(Number(limit))
+        .populate('driverId', 'name phone vehicleType')
+        .lean(),
+      Wallet.countDocuments({})
+    ]);
+
+    res.json({
+      success: true,
+      wallets,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        totalPages: Math.ceil(total / Number(limit))
+      }
+    });
+  } catch (error) {
+    console.error('❌ getAllWallets error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch wallets' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET WALLET DETAILS (Admin - single driver)
+// GET /api/wallet/admin/wallets/:driverId
+// ═══════════════════════════════════════════════════════════════════════════
+export const getWalletDetails = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+
+    const wallet = await Wallet.findOne({ driverId })
+      .populate('driverId', 'name phone vehicleType vehicleNumber isOnline')
+      .lean();
+
+    if (!wallet) {
+      return res.status(404).json({ success: false, message: 'Wallet not found for this driver' });
+    }
+
+    // Summary stats
+    const totalTransactions = wallet.transactions?.length || 0;
+    const completedTransactions = wallet.transactions?.filter(t => t.status === 'completed').length || 0;
+
+    res.json({
+      success: true,
+      wallet: {
+        ...wallet,
+        summary: {
+          totalTransactions,
+          completedTransactions,
+          netEarnings: (wallet.totalEarnings || 0) - (wallet.totalCommission || 0)
+        }
+      }
+    });
+  } catch (error) {
+    console.error('❌ getWalletDetails error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch wallet details' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET WALLET TRANSACTIONS (Admin - paginated)
+// GET /api/wallet/admin/wallets/:driverId/transactions
+// ═══════════════════════════════════════════════════════════════════════════
+export const getWalletTransactions = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    const { page = 1, limit = 50, type, status } = req.query;
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const wallet = await Wallet.findOne({ driverId }).lean();
+
+    if (!wallet) {
+      return res.json({ success: true, transactions: [], total: 0 });
+    }
+
+    let transactions = wallet.transactions || [];
+
+    // Filters
+    if (type) transactions = transactions.filter(t => t.type === type);
+    if (status) transactions = transactions.filter(t => t.status === status);
+
+    // Sort newest first
+    transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    const total = transactions.length;
+    const paginated = transactions.slice(skip, skip + Number(limit));
+
+    res.json({
+      success: true,
+      transactions: paginated,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        totalPages: Math.ceil(total / Number(limit))
+      }
+    });
+  } catch (error) {
+    console.error('❌ getWalletTransactions error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROCESS MANUAL PAYOUT (Admin)
+// POST /api/wallet/admin/wallets/:driverId/payout
+// ═══════════════════════════════════════════════════════════════════════════
+export const processManualPayout = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { driverId } = req.params;
+    const { amount, description, adminId } = req.body;
+
+    if (!amount || amount <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Valid amount required' });
+    }
+
+    const wallet = await Wallet.findOne({ driverId }).session(session);
+
+    if (!wallet) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: 'Wallet not found' });
+    }
+
+    if (wallet.availableBalance < amount) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient balance. Available: ₹${wallet.availableBalance}`
+      });
+    }
+
+    wallet.transactions.push({
+      type: 'debit',
+      amount,
+      description: description || `Manual payout by admin`,
+      paymentMethod: 'unknown',
+      status: 'completed',
+      createdAt: new Date()
+    });
+
+    wallet.availableBalance -= amount;
+    await wallet.save({ session });
+    await session.commitTransaction();
+
+    console.log(`✅ Manual payout: ₹${amount} from driver ${driverId} by admin ${adminId}`);
+
+    res.json({
+      success: true,
+      message: `₹${amount} payout processed successfully`,
+      newBalance: wallet.availableBalance
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    console.error('❌ processManualPayout error:', error);
+    res.status(500).json({ success: false, message: 'Failed to process payout' });
+  } finally {
+    session.endSession();
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET WALLET STATS SUMMARY (Admin)
+// GET /api/wallet/admin/wallets/stats/summary
+// ═══════════════════════════════════════════════════════════════════════════
+export const getWalletStats = async (req, res) => {
+  try {
+    const stats = await Wallet.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalDrivers: { $sum: 1 },
+          totalAvailableBalance: { $sum: '$availableBalance' },
+          totalEarnings: { $sum: '$totalEarnings' },
+          totalCommission: { $sum: '$totalCommission' },
+          totalPending: { $sum: '$pendingAmount' },
+          avgBalance: { $avg: '$availableBalance' }
+        }
+      }
+    ]);
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    // Today's totals from transaction subdocs
+    const todayStats = await Wallet.aggregate([
+      { $unwind: '$transactions' },
+      {
+        $match: {
+          'transactions.createdAt': { $gte: startOfDay },
+          'transactions.type': 'credit',
+          'transactions.status': 'completed'
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          todayTotalEarnings: { $sum: '$transactions.amount' },
+          todayTransactions: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const summary = stats[0] || {
+      totalDrivers: 0,
+      totalAvailableBalance: 0,
+      totalEarnings: 0,
+      totalCommission: 0,
+      totalPending: 0,
+      avgBalance: 0
+    };
+
+    const today = todayStats[0] || { todayTotalEarnings: 0, todayTransactions: 0 };
+
+    res.json({
+      success: true,
+      stats: {
+        ...summary,
+        todayTotalEarnings: Math.round((today.todayTotalEarnings || 0) * 100) / 100,
+        todayTransactions: today.todayTransactions || 0,
+        generatedAt: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('❌ getWalletStats error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch wallet stats' });
+  }
+};
