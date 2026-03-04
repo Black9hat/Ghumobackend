@@ -117,11 +117,13 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
     return {
       success: true,
       fareBreakdown: { tripFare: fareAmount, commission, commissionPercentage, driverEarning },
-      wallet: {
-        totalEarnings: currentEarnings + driverEarning,
-        totalCommission: currentCommission + commission,
-        pendingAmount: currentPending + driverEarning
-      }
+    // ✅ NEW wallet block in the res.json() response
+wallet: {
+  totalEarnings: Number((walletData.amount || fareAmount).toFixed(2)),
+  totalCommission: Number((walletData.commission || 0).toFixed(2)),
+  pendingAmount: Number((walletData.pendingAmount || 0).toFixed(2)),
+  availableBalance: Number((walletData.walletBalance || 0).toFixed(2))
+},
     };
   } catch (error) {
     console.error('❌ Wallet error:', error);
@@ -1489,9 +1491,13 @@ const confirmCashCollection = async (req, res) => {
     console.log('');
 
     // ✅ Extract wallet data from the response
-    const walletData = walletResult.data?.wallet || {};
-    const fareBreakdown = walletResult.data?.fareBreakdown || {};
-
+   const walletData = walletResult.data || {};
+const fareBreakdown = {
+  tripFare: fareAmount,
+  commission: walletData.commission || 0,
+  commissionPercentage: 20,
+  driverEarning: walletData.driverAmount || walletData.netAmount || (fareAmount - (walletData.commission || 0))
+};
     // ✅ Return complete response with fareBreakdown and wallet
     res.status(200).json({
       success: true,
@@ -1503,12 +1509,13 @@ const confirmCashCollection = async (req, res) => {
         commissionPercentage: fareBreakdown.commissionPercentage || 15,
         driverEarning: Number((fareBreakdown.driverEarning || 0).toFixed(2))
       },
-      wallet: {
-        totalEarnings: Number((walletData.totalEarnings || 0).toFixed(2)),
-        totalCommission: Number((walletData.totalCommission || 0).toFixed(2)),
-        pendingAmount: Number((walletData.pendingAmount || 0).toFixed(2)),
-        availableBalance: Number((walletData.availableBalance || 0).toFixed(2))
-      },
+   // ✅ NEW wallet block in the res.json() response
+wallet: {
+  totalEarnings: Number((walletData.amount || fareAmount).toFixed(2)),
+  totalCommission: Number((walletData.commission || 0).toFixed(2)),
+  pendingAmount: Number((walletData.pendingAmount || 0).toFixed(2)),
+  availableBalance: Number((walletData.walletBalance || 0).toFixed(2))
+},
       coinReward: coinReward?.awarded ? {
         coinsAwarded: coinReward.coinsAwarded,
         totalCoins: coinReward.totalCoins,
