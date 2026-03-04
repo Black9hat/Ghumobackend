@@ -4,7 +4,7 @@ import Trip from '../models/Trip.js';
 import User from '../models/User.js';
 import mongoose from 'mongoose';
 import { startTripRetry, stopTripRetry } from '../utils/tripRetryBroadcaster.js';
-import { processCashCollection } from './walletController.js';
+import { confirmCashReceipt as processCashCollection } from './paymentController.js';
 import { io } from '../socket/socketHandler.js';
 import { broadcastToDrivers } from '../utils/tripBroadcaster.js';
 import { TRIP_LIMITS } from '../config/tripConfig.js';
@@ -1391,27 +1391,35 @@ const confirmCashCollection = async (req, res) => {
       body: {
         tripId,
         driverId,
-        fare: fareAmount
-      }
+        amount: fareAmount,           // ✅ paymentController expects 'amount' not 'fare'
+        customerId: trip.customerId?.toString() || null  // ✅ required by paymentController
+      },
+      io: req.io,                     // ✅ pass socket.io for real-time notifications
+      ip: req.ip
     };
 
     let walletResult;
     try {
       walletResult = await new Promise((resolve, reject) => {
         const mockRes = {
+          // Handle res.status(N).json()
           status: (code) => ({
             json: (data) => {
-              if (code === 200 && data.success) {
+              if (code >= 200 && code < 300 && data.success) {
                 resolve({ success: true, data });
               } else {
-                resolve({ 
-                  success: false, 
-                  message: data.message || 'Wallet processing failed',
-                  data 
-                });
+                resolve({ success: false, message: data.message || 'Payment processing failed', data });
               }
             }
           }),
+          // Handle direct res.json() - paymentController uses this for success responses
+          json: (data) => {
+            if (data.success) {
+              resolve({ success: true, data });
+            } else {
+              resolve({ success: false, message: data.message || 'Payment processing failed', data });
+            }
+          },
           headersSent: false
         };
 

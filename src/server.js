@@ -16,6 +16,7 @@ import adminIncentiveRoutes from './routes/adminIncentiveRoutes.js';
 import driverRideHistoryRoutes from './routes/driverRideHistory.js';
 import customerBannerRoutes from "./routes/customerBannerRoutes.js";
 import privacyRoutes from './routes/privacyRoutes.js';
+import paymentRoutes from './routes/paymentRoutes.js';  // ← NEW
 
 // Routes
 import userRoutes from './routes/userRoutes.js';
@@ -118,6 +119,7 @@ app.use('/api/driver/incentives', driverIncentiveRoutes);
 // Static file serving for uploaded images
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 app.use("/api/customer/banners", customerBannerRoutes);
+app.use('/api/payment', paymentRoutes);
 
 app.use('/api/user', userRoutes);
 app.use('/api/auth', authRoutes);

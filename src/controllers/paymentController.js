@@ -1016,7 +1016,23 @@ async function processWebhookPaymentFailed(payment, io) {
     console.error('❌ Failed webhook processing error:', error);
   }
 }
+export const confirmCashReceipt = async (req, res) => {
+  try {
+    const { tripId, driverId, amount, paymentMethod = 'cash' } = req.body;
 
+    if (!tripId || !driverId || !amount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: tripId, driverId, amount'
+      });
+    }
+
+    // ... your existing confirmCashReceipt logic ...
+  } catch (err) {
+    console.error('❌ confirmCashReceipt error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
 // ═══════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
