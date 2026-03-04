@@ -22,8 +22,7 @@ import {
   getDriverActiveTrip,
   completeRideWithVerification,
   confirmCashCollection,
-  getDriverLocationByTripId,
-  processCashCollection,   // ✅ NEW
+  getDriverLocationByTripId,   // ✅ NEW
 } from '../controllers/tripController.js';
 const router = express.Router();
 
@@ -197,38 +196,7 @@ router.post('/complete-ride', completeRideWithVerification);
  * @route   POST /api/trip/confirm-cash
  * @desc    Driver confirms cash collection
  */
-router.post('/confirm-cash', verifyToken, async (req, res) => {
-  try {
-    const { tripId, driverId, amount, paymentMethod } = req.body;
-
-    // Validate with clear field-level errors
-    const missing = [];
-    if (!tripId)  missing.push('tripId');
-    if (!driverId) missing.push('driverId');
-    if (!amount)  missing.push('amount');
-
-    if (missing.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Missing required fields: ${missing.join(', ')}`,
-        received: req.body   // helps frontend debug
-      });
-    }
-
-    // Normalize body before forwarding to wallet controller
-    req.body = {
-      tripId,
-      driverId,
-      amount: Number(amount),
-      paymentMethod: paymentMethod || 'cash'
-    };
-
-    return processCashCollection(req, res);
-  } catch (err) {
-    console.error('❌ confirm-cash error:', err);
-    return res.status(500).json({ success: false, message: err.message });
-  }
-});
+router.post('/confirm-cash', confirmCashCollection);
 
 /**
  * ✅ NEW: GET /api/trip/:tripId/driver-location
