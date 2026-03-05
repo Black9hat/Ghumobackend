@@ -80,7 +80,7 @@ export const createDirectPaymentOrder = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { tripId, driverId, amount } = req.body;
+    const { tripId, amount } = req.body;
 
     // Accept customerId from body OR from authenticated Firebase user
     const customerId = req.body.customerId ||
@@ -89,8 +89,24 @@ export const createDirectPaymentOrder = async (req, res) => {
       req.user?.id?.toString() ||
       null;
 
+    // Accept driverId from body, OR look it up from the trip
+    let driverId = req.body.driverId || null;
+
+    // If driverId is missing/empty, fetch it from the trip record
+    if (!driverId && tripId) {
+      try {
+        const tripForDriver = await Trip.findById(tripId).select('assignedDriver').lean();
+        if (tripForDriver?.assignedDriver) {
+          driverId = tripForDriver.assignedDriver.toString();
+          console.log('✅ Resolved driverId from trip:', driverId);
+        }
+      } catch (e) {
+        console.warn('⚠️ Could not resolve driverId from trip:', e.message);
+      }
+    }
+
     console.log('📦 direct/create:', { tripId, customerId, driverId, amount,
-      userPhone: req.user?.phone, userMongoId: req.user?.mongoId });
+      userPhone: req.user?.phone });
 
     // ─────────────────────────────────────────────────────────────────
     // Validation
@@ -102,7 +118,7 @@ export const createDirectPaymentOrder = async (req, res) => {
       if (!customerId) missing.push('customerId');
       if (!driverId)   missing.push('driverId');
       if (!amount)     missing.push('amount');
-      console.error('❌ direct/create missing:', missing, '| body:', req.body, '| user:', req.user);
+      console.error('❌ direct/create missing:', missing, '| body:', req.body);
       return res.status(400).json({
         success: false,
         message: 'Missing required fields: ' + missing.join(', '),
@@ -499,7 +515,7 @@ export const initiateCashPayment = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { tripId, driverId, amount } = req.body;
+    const { tripId, amount } = req.body;
 
     // Accept customerId from body OR from authenticated Firebase user
     const customerId = req.body.customerId ||
@@ -507,6 +523,21 @@ export const initiateCashPayment = async (req, res) => {
       req.user?._id?.toString() ||
       req.user?.id?.toString() ||
       null;
+
+    // Accept driverId from body, OR look it up from the trip
+    let driverId = req.body.driverId || null;
+
+    if (!driverId && tripId) {
+      try {
+        const tripForDriver = await Trip.findById(tripId).select('assignedDriver').lean();
+        if (tripForDriver?.assignedDriver) {
+          driverId = tripForDriver.assignedDriver.toString();
+          console.log('✅ Resolved driverId from trip:', driverId);
+        }
+      } catch (e) {
+        console.warn('⚠️ Could not resolve driverId from trip:', e.message);
+      }
+    }
 
     console.log('📦 cash/initiate:', { tripId, customerId, driverId, amount,
       userPhone: req.user?.phone });
@@ -519,7 +550,7 @@ export const initiateCashPayment = async (req, res) => {
       if (!customerId) missing.push('customerId');
       if (!driverId)   missing.push('driverId');
       if (!amount)     missing.push('amount');
-      console.error('❌ cash/initiate missing:', missing, '| body:', req.body, '| user:', req.user);
+      console.error('❌ cash/initiate missing:', missing, '| body:', req.body);
       return res.status(400).json({
         success: false,
         message: 'Missing required fields: ' + missing.join(', '),

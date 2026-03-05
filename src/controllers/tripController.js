@@ -996,7 +996,8 @@ const acceptTrip = async (req, res) => {
       
       // ✅ FIXED: Complete driver data with location
       driverData = {
-        _id: driver._id,
+        _id: driver._id.toString(),   // ✅ always plain string
+        id: driver._id.toString(),    // ✅ alias for Flutter fallback
         name: driver.name,
         phone: driver.phone,
         photoUrl: driver.photoUrl || null,
