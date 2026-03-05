@@ -912,7 +912,8 @@ export const createCommissionOrder = async (req, res) => {
       orderId: razorpayOrder.id,
       amount: numericAmount,
       currency: 'INR',
-      driverId
+      driverId,
+      razorpayKeyId: process.env.RAZORPAY_KEY_ID  // ✅ send key to Flutter
     });
   } catch (error) {
     console.error('❌ createCommissionOrder error:', error);
@@ -955,7 +956,8 @@ export const verifyCommissionPayment = async (req, res) => {
       return res.status(400).json({ success: false, message: `Payment not captured. Status: ${payment?.status}` });
     }
 
-    const paidAmount = payment.amount / 100; // convert paise to rupees
+    const paidAmount = payment.amount / 100;
+    const paymentMethod = payment.method || 'upi';
 
     let wallet = await Wallet.findOne({ driverId }).session(session);
     if (!wallet) {
@@ -974,7 +976,7 @@ export const verifyCommissionPayment = async (req, res) => {
       description: `Commission paid via Razorpay (${paymentId})`,
       razorpayPaymentId: paymentId,
       razorpayOrderId: orderId,
-      paymentMethod: payment.method || 'upi',
+      paymentMethod,
       status: 'completed',
       createdAt: new Date()
     });
