@@ -1,6 +1,7 @@
 // src/controllers/tripController.js
 
 import Trip from '../models/Trip.js';
+import Wallet from '../models/Wallet.js';
 import User from '../models/User.js';
 import mongoose from 'mongoose';
 import { startTripRetry, stopTripRetry } from '../utils/tripRetryBroadcaster.js';
@@ -1334,220 +1335,184 @@ const completeRideWithVerification = async (req, res) => {
 };
 
 // ============================================================
-// ✅ WORKING VERSION: confirmCashCollection 
-// This is the version that was working in your old code
-// Replace the entire confirmCashCollection function with this
+// ✅ confirmCashCollection - Direct wallet update (no mock chain)
 // ============================================================
-
 const confirmCashCollection = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { tripId, driverId, fare } = req.body;
 
     console.log('');
     console.log('💰 ═══════════════════════════════════════════════════════════════');
-    console.log('💰 CONFIRM CASH COLLECTION REQUEST');
-    console.log(`   Trip ID: ${tripId}`);
-    console.log(`   Driver ID: ${driverId}`);
+    console.log('💰 CONFIRM CASH COLLECTION');
+    console.log(`   Trip: ${tripId} | Driver: ${driverId} | Fare: ₹${fare}`);
     console.log('💰 ═══════════════════════════════════════════════════════════════');
 
     if (!tripId || !driverId) {
-      return res.status(400).json({
-        success: false,
-        message: 'tripId and driverId are required'
-      });
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'tripId and driverId are required' });
     }
 
-    const trip = await Trip.findById(tripId).lean();
+    // ── 1. Load & validate trip ──────────────────────────────────────
+    const trip = await Trip.findById(tripId).session(session);
     if (!trip) {
-      console.log('❌ Trip not found');
+      await session.abortTransaction();
       return res.status(404).json({ success: false, message: 'Trip not found' });
     }
 
     if (trip.assignedDriver?.toString() !== driverId) {
-      console.log('❌ Driver not authorized');
+      await session.abortTransaction();
       return res.status(403).json({ success: false, message: 'Not authorized' });
     }
 
     if (trip.status !== 'completed') {
-      console.log(`❌ Trip not completed yet: ${trip.status}`);
-      return res.status(400).json({
-        success: false,
-        message: 'Trip must be completed before collecting cash'
-      });
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Trip must be completed before collecting cash' });
     }
 
     if (trip.paymentCollected === true) {
-      console.log('⚠️ Cash already collected!');
-      return res.status(400).json({
-        success: false,
-        message: 'Cash already collected for this trip'
-      });
+      await session.abortTransaction();
+      return res.json({ success: true, message: 'Cash already collected', alreadyProcessed: true });
     }
 
-    const fareAmount = fare || trip.finalFare || trip.fare || 0;
-    
+    // ── 2. Calculate fare & commission ───────────────────────────────
+    const COMMISSION_RATE = 0.20;
+    const fareAmount = Number(fare) || trip.finalFare || trip.fare || 0;
     if (fareAmount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid fare amount'
-      });
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid fare amount' });
     }
 
-    // ============================================================
-    // STEP 1: Process wallet transaction (using walletController)
-    // ============================================================
-    console.log('📦 STEP 1: Processing wallet transaction...');
-    
-    const mockReq = {
-      body: {
-        tripId,
+    const commission    = Math.round(fareAmount * COMMISSION_RATE * 100) / 100;
+    const driverEarning = Math.round((fareAmount - commission) * 100) / 100;
+
+    console.log(`   Fare: ₹${fareAmount} | Commission: ₹${commission} | Driver: ₹${driverEarning}`);
+
+    // ── 3. Update wallet directly ────────────────────────────────────
+    let wallet = await Wallet.findOne({ driverId }).session(session);
+    if (!wallet) {
+      wallet = new Wallet({
         driverId,
-        amount: fareAmount,           // ✅ paymentController expects 'amount' not 'fare'
-        customerId: trip.customerId?.toString() || null  // ✅ required by paymentController
-      },
-      io: req.io,                     // ✅ pass socket.io for real-time notifications
-      ip: req.ip
-    };
-
-    let walletResult;
-    try {
-      walletResult = await new Promise((resolve, reject) => {
-        const mockRes = {
-          // Handle res.status(N).json()
-          status: (code) => ({
-            json: (data) => {
-              if (code >= 200 && code < 300 && data.success) {
-                resolve({ success: true, data });
-              } else {
-                resolve({ success: false, message: data.message || 'Payment processing failed', data });
-              }
-            }
-          }),
-          // Handle direct res.json() - paymentController uses this for success responses
-          json: (data) => {
-            if (data.success) {
-              resolve({ success: true, data });
-            } else {
-              resolve({ success: false, message: data.message || 'Payment processing failed', data });
-            }
-          },
-          headersSent: false
-        };
-
-        processCashCollection(mockReq, mockRes).catch(reject);
-      });
-    } catch (walletError) {
-      console.error('❌ Wallet processing error:', walletError);
-      return res.status(500).json({
-        success: false,
-        message: 'Wallet processing failed: ' + walletError.message
+        availableBalance: 0,
+        totalEarnings: 0,
+        totalCommission: 0,
+        pendingAmount: 0,
+        transactions: []
       });
     }
 
-    if (!walletResult.success) {
-      console.error('❌ Wallet processing failed:', walletResult.message);
-      return res.status(500).json({
-        success: false,
-        message: 'Wallet processing failed: ' + walletResult.message
-      });
-    }
+    // Record credit transaction (full cash collected)
+    wallet.transactions.push({
+      tripId,
+      type: 'credit',
+      amount: fareAmount,
+      description: 'Cash collected from customer',
+      paymentMethod: 'cash',
+      status: 'completed',
+      createdAt: new Date()
+    });
 
-    console.log('✅ STEP 1 COMPLETE: Wallet transaction successful');
+    // Record commission transaction (owed to platform)
+    wallet.transactions.push({
+      tripId,
+      type: 'commission',
+      amount: commission,
+      description: `Platform commission (${COMMISSION_RATE * 100}%)`,
+      paymentMethod: 'cash',
+      status: 'completed',
+      createdAt: new Date()
+    });
 
-    // ============================================================
-    // STEP 2: Award coins to customer
-    // ============================================================
-    console.log('');
-    console.log('📦 STEP 2: Awarding coins to customer...');
-    
-    let coinReward = null;
-    
-    try {
-      // Calculate distance for coin award
-      let distance = null;
-      if (trip.pickup?.coordinates && trip.drop?.coordinates) {
-        distance = calculateDistanceFromCoords(
-          trip.pickup.coordinates[1], 
-          trip.pickup.coordinates[0],
-          trip.drop.coordinates[1], 
-          trip.drop.coordinates[0]
-        );
-        console.log(`   📏 Calculated distance: ${distance.toFixed(2)} km`);
+    // Update totals
+    wallet.totalEarnings    += fareAmount;
+    wallet.totalCommission  += commission;
+
+    // Cash flow: driver physically has the cash, owes commission to platform
+    // Commission is DEBT — add to pendingAmount directly
+    wallet.pendingAmount = Math.round((wallet.pendingAmount + commission) * 100) / 100;
+
+    // availableBalance tracks online earnings minus withdrawals (not cash)
+    // Keep it unchanged for cash trips — pendingAmount is the debt tracker
+
+    await wallet.save({ session });
+
+    console.log(`   Wallet saved: pendingAmount=₹${wallet.pendingAmount}, totalCommission=₹${wallet.totalCommission}`);
+
+    // ── 4. Mark trip as payment collected ───────────────────────────
+    trip.paymentCollected  = true;
+    trip.paymentStatus     = 'completed';
+    trip.paymentMethod     = 'cash';
+    trip.paidAmount        = fareAmount;
+    trip.paymentCompletedAt = new Date();
+    await trip.save({ session });
+
+    await session.commitTransaction();
+
+    // ── 5. Emit socket to customer ───────────────────────────────────
+    if (req.io) {
+      const customerId = trip.customerId?.toString();
+      if (customerId) {
+        req.io.to(`customer_${customerId}`).emit('trip:cash_collected', {
+          tripId,
+          message: 'Driver confirmed cash received. Thank you!',
+          timestamp: new Date().toISOString()
+        });
       }
-
-      // Award coins
-      coinReward = await awardCoinsToCustomer(
-        trip.customerId,
+      req.io.to(`driver_${driverId}`).emit('payment:confirmed', {
         tripId,
-        distance
-      );
-
-      if (coinReward.success && coinReward.awarded) {
-        console.log(`✅ STEP 2 COMPLETE: Coins awarded: ${coinReward.coinsAwarded}`);
-        console.log(`   New balance: ${coinReward.totalCoins}`);
-      } else {
-        console.log('ℹ️ STEP 2 COMPLETE: Coins not awarded:', coinReward.reason || 'unknown');
-      }
-    } catch (coinError) {
-      // Don't fail the payment if coin award fails
-      console.error('⚠️ Coin award failed (non-critical):', coinError.message);
-    }
-
-    console.log('');
-    console.log('✅ ═══════════════════════════════════════════════════════════════');
-    console.log('✅ CASH COLLECTION COMPLETE');
-    console.log('✅ ═══════════════════════════════════════════════════════════════');
-    console.log('');
-
-    // ✅ Emit trip:cash_collected to customer so their screen dismisses
-    if (trip.customerId && req.io) {
-      req.io.to(`customer_${trip.customerId.toString()}`).emit('trip:cash_collected', {
-        tripId,
-        message: 'Driver confirmed cash received. Thank you!',
+        amount: fareAmount,
+        driverAmount: driverEarning,
+        commission,
+        pendingAmount: wallet.pendingAmount,
+        method: 'cash',
         timestamp: new Date().toISOString()
       });
-      console.log(`✅ Emitted trip:cash_collected to customer ${trip.customerId}`);
     }
 
-    // ✅ Extract wallet data - paymentController returns flat shape
-    const walletData = walletResult.data || {};
-    const earnedAmount = walletData.driverAmount ?? walletData.netAmount ?? (fareAmount - (walletData.commission || fareAmount * 0.20));
-    const commissionAmount = walletData.commission ?? (fareAmount * 0.20);
+    console.log('✅ Cash collection complete');
 
-    // ✅ Return complete response with fareBreakdown and wallet
-    res.status(200).json({
+    // ── 6. Award coins to customer (non-critical) ────────────────────
+    let coinReward = null;
+    try {
+      if (trip.customerId) {
+        coinReward = await awardCoinsToCustomer(trip.customerId, tripId, null);
+      }
+    } catch (coinErr) {
+      console.warn('⚠️ Coin award failed (non-critical):', coinErr.message);
+    }
+
+    return res.status(200).json({
       success: true,
       message: 'Cash collected successfully',
       amount: fareAmount,
       fareBreakdown: {
-        tripFare: Number(fareAmount.toFixed(2)),
-        commission: Number(commissionAmount.toFixed(2)),
-        commissionPercentage: 20,
-        driverEarning: Number(earnedAmount.toFixed(2))
+        tripFare: fareAmount,
+        commission,
+        commissionPercentage: COMMISSION_RATE * 100,
+        driverEarning
       },
       wallet: {
-        totalEarnings: Number((walletData.amount || fareAmount).toFixed(2)),
-        totalCommission: Number(commissionAmount.toFixed(2)),
-        pendingAmount: Number((walletData.pendingAmount || 0).toFixed(2)),
-        availableBalance: Number((walletData.walletBalance || 0).toFixed(2))
+        totalEarnings:    wallet.totalEarnings,
+        totalCommission:  wallet.totalCommission,
+        pendingAmount:    wallet.pendingAmount,
+        availableBalance: wallet.availableBalance
       },
       coinReward: coinReward?.awarded ? {
         coinsAwarded: coinReward.coinsAwarded,
-        totalCoins: coinReward.totalCoins,
-        tier: coinReward.tier
+        totalCoins: coinReward.totalCoins
       } : null
     });
 
   } catch (err) {
+    await session.abortTransaction();
     console.error('🔥 confirmCashCollection error:', err);
-    
     if (!res.headersSent) {
-      res.status(500).json({ 
-        success: false, 
-        message: 'Failed to confirm cash collection',
-        error: process.env.NODE_ENV === 'development' ? err.message : undefined
-      });
+      res.status(500).json({ success: false, message: 'Failed to confirm cash collection' });
     }
+  } finally {
+    session.endSession();
   }
 };
 
