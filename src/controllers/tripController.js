@@ -1499,6 +1499,16 @@ const confirmCashCollection = async (req, res) => {
     console.log('✅ ═══════════════════════════════════════════════════════════════');
     console.log('');
 
+    // ✅ Emit trip:cash_collected to customer so their screen dismisses
+    if (trip.customerId && req.io) {
+      req.io.to(`customer_${trip.customerId.toString()}`).emit('trip:cash_collected', {
+        tripId,
+        message: 'Driver confirmed cash received. Thank you!',
+        timestamp: new Date().toISOString()
+      });
+      console.log(`✅ Emitted trip:cash_collected to customer ${trip.customerId}`);
+    }
+
     // ✅ Extract wallet data - paymentController returns flat shape
     const walletData = walletResult.data || {};
     const earnedAmount = walletData.driverAmount ?? walletData.netAmount ?? (fareAmount - (walletData.commission || fareAmount * 0.20));
