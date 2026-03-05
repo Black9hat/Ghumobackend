@@ -17,6 +17,7 @@ import driverRideHistoryRoutes from './routes/driverRideHistory.js';
 import customerBannerRoutes from "./routes/customerBannerRoutes.js";
 import privacyRoutes from './routes/privacyRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';  // ← NEW
+import webhookRoutes from './routes/webhookRoutes.js';  // ← Razorpay webhook
 
 // Routes
 import userRoutes from './routes/userRoutes.js';
@@ -94,6 +95,10 @@ allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 
 }));
 
 app.use(morgan('dev'));
+
+// ⚠️ WEBHOOK MUST BE BEFORE express.json() — needs raw body for signature verification
+app.use('/api/webhook', webhookRoutes);
+
 app.use(express.json());
 app.use(
   '/uploads',

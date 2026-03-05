@@ -951,9 +951,10 @@ export const verifyCommissionPayment = async (req, res) => {
 
     // Fetch payment from Razorpay to get amount
     const payment = await razorpay.payments.fetch(paymentId);
-    if (!payment || payment.status !== 'captured') {
+    // ✅ Accept both 'captured' and 'authorized' — live payments may be authorized first
+    if (!payment || !['captured', 'authorized'].includes(payment.status)) {
       await session.abortTransaction();
-      return res.status(400).json({ success: false, message: `Payment not captured. Status: ${payment?.status}` });
+      return res.status(400).json({ success: false, message: `Payment not completed. Status: ${payment?.status}` });
     }
 
     const paidAmount = payment.amount / 100;
@@ -963,6 +964,21 @@ export const verifyCommissionPayment = async (req, res) => {
     if (!wallet) {
       await session.abortTransaction();
       return res.status(404).json({ success: false, message: 'Wallet not found' });
+    }
+
+    // ✅ Prevent double processing — check if this paymentId was already recorded
+    const alreadyProcessed = wallet.transactions.some(
+      t => t.razorpayPaymentId === paymentId
+    );
+    if (alreadyProcessed) {
+      await session.abortTransaction();
+      return res.json({
+        success: true,
+        message: 'Commission already processed',
+        alreadyProcessed: true,
+        pendingAmount: wallet.pendingAmount,
+        availableBalance: wallet.availableBalance
+      });
     }
 
     // Reduce pendingAmount by what was paid
@@ -985,6 +1001,17 @@ export const verifyCommissionPayment = async (req, res) => {
     await session.commitTransaction();
 
     console.log(`✅ Commission verified: ₹${paidAmount} | driver: ${driverId} | pending now: ₹${wallet.pendingAmount}`);
+
+    // ✅ Emit socket so wallet page updates in realtime
+    if (req.io) {
+      req.io.to(`driver_${driverId}`).emit('commission:paid', {
+        paidAmount,
+        pendingAmount: wallet.pendingAmount,
+        availableBalance: wallet.availableBalance,
+        paymentId,
+        timestamp: new Date().toISOString()
+      });
+    }
 
     return res.json({
       success: true,

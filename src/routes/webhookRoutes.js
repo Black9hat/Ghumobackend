@@ -1,34 +1,32 @@
-// routes/webhookRoutes.js - RAZORPAY WEBHOOK ROUTES
+// routes/webhookRoutes.js
+// Mounted in server.js as: app.use('/api/webhook', webhookRoutes)
+// MUST be mounted BEFORE express.json() — needs raw body for Razorpay signature
+
 import express from 'express';
 import { handleRazorpayWebhook, testWebhook } from '../controllers/webhookController.js';
 
 const router = express.Router();
 
-// ✅ Razorpay webhook endpoint
-// IMPORTANT: This endpoint should NOT use bodyParser.json()
-// It needs raw body for signature verification
-router.post('/razorpay', express.raw({ type: 'application/json' }), (req, res, next) => {
-  // Convert raw buffer back to JSON for processing
-  if (req.body instanceof Buffer) {
-    req.body = JSON.parse(req.body.toString());
-  }
-  next();
-}, handleRazorpayWebhook);
+// POST /api/webhook/razorpay  ← exact URL to set in Razorpay dashboard
+router.post(
+  '/razorpay',
+  express.raw({ type: 'application/json' }),
+  (req, res, next) => {
+    // Convert raw buffer to parsed object for handler
+    if (Buffer.isBuffer(req.body)) {
+      try {
+        req.rawBody = req.body; // keep raw for signature check
+        req.body = JSON.parse(req.body.toString());
+      } catch (e) {
+        return res.status(400).json({ success: false, message: 'Invalid JSON body' });
+      }
+    }
+    next();
+  },
+  handleRazorpayWebhook
+);
 
-// ✅ Test webhook endpoint (for development)
+// POST /api/webhook/test  ← dev testing only
 router.post('/test', testWebhook);
 
 export default router;
-
-/* 
-HOW TO ADD TO MAIN SERVER FILE (server.js or app.js):
-
-import webhookRoutes from './routes/webhookRoutes.js';
-
-// Add BEFORE general bodyParser middleware
-app.use('/api/webhook', webhookRoutes);
-
-// Then add your general middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-*/

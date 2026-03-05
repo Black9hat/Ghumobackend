@@ -1,241 +1,150 @@
-// webhookController.js - RAZORPAY WEBHOOK HANDLER (OPTIONAL BUT RECOMMENDED)
+// controllers/webhookController.js
 import crypto from 'crypto';
 import Wallet from '../models/Wallet.js';
 import User from '../models/User.js';
-import { io } from '../socket/socketHandler.js';
 
-/**
- * 🔐 WEBHOOK SIGNATURE VERIFICATION
- * This adds an extra layer of security by handling server-to-server notifications
- */
-const verifyWebhookSignature = (webhookBody, webhookSignature, webhookSecret) => {
-  const expectedSignature = crypto
-    .createHmac('sha256', webhookSecret)
-    .update(JSON.stringify(webhookBody))
-    .digest('hex');
-  
-  return expectedSignature === webhookSignature;
-};
-
-/**
- * 🎯 RAZORPAY WEBHOOK HANDLER
- * POST /api/webhook/razorpay
- * 
- * This endpoint receives server-to-server notifications from Razorpay
- * for additional payment verification and reconciliation
- */
 const handleRazorpayWebhook = async (req, res) => {
   try {
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
     const webhookSignature = req.headers['x-razorpay-signature'];
-    const webhookBody = req.body;
 
-    // Step 1: Verify webhook signature
     if (!webhookSecret) {
-      console.error('⚠️  Razorpay webhook secret not configured');
-      return res.status(500).json({ 
-        success: false, 
-        message: 'Webhook not configured' 
-      });
+      console.error('⚠️ RAZORPAY_WEBHOOK_SECRET not set in .env');
+      return res.status(500).json({ success: false, message: 'Webhook not configured' });
     }
 
     if (!webhookSignature) {
-      console.error('❌ Missing webhook signature');
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Missing signature' 
-      });
+      console.error('❌ Missing x-razorpay-signature header');
+      return res.status(400).json({ success: false, message: 'Missing signature' });
     }
 
-    const isValid = verifyWebhookSignature(
-      webhookBody, 
-      webhookSignature, 
-      webhookSecret
-    );
+    // ✅ CRITICAL: Razorpay signs the RAW body string — must use rawBody not re-stringified JSON
+    const rawBody = req.rawBody || req.body;
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString() : JSON.stringify(rawBody);
 
-    if (!isValid) {
-      console.error('❌ Invalid webhook signature - possible fraud attempt');
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Invalid signature' 
-      });
+    const expectedSignature = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(bodyString)
+      .digest('hex');
+
+    if (expectedSignature !== webhookSignature) {
+      console.error('❌ Invalid webhook signature');
+      return res.status(400).json({ success: false, message: 'Invalid signature' });
     }
 
     console.log('✅ Webhook signature verified');
 
-    // Step 2: Process webhook event
-    const event = webhookBody.event;
-    const payload = webhookBody.payload;
+    const webhookBody = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { event, payload } = webhookBody;
 
-    console.log('📥 Webhook event received:', event);
+    console.log('📥 Webhook event:', event);
 
     switch (event) {
       case 'payment.captured':
-        await handlePaymentCaptured(payload.payment.entity);
+        await handlePaymentCaptured(payload.payment.entity, req.io);
         break;
-
       case 'payment.failed':
-        await handlePaymentFailed(payload.payment.entity);
+        await handlePaymentFailed(payload.payment.entity, req.io);
         break;
-
       case 'order.paid':
-        await handleOrderPaid(payload.order.entity, payload.payment.entity);
+        await handleOrderPaid(payload.order.entity, payload.payment?.entity, req.io);
         break;
-
       default:
-        console.log('ℹ️  Unhandled webhook event:', event);
+        console.log('ℹ️ Unhandled webhook event:', event);
     }
 
-    // Always return 200 OK to acknowledge receipt
-    res.status(200).json({ success: true, received: true });
+    // Always return 200 — Razorpay will retry if you return anything else
+    return res.status(200).json({ success: true, received: true });
 
   } catch (err) {
-    console.error('🔥 Webhook handler error:', err);
-    // Still return 200 to prevent Razorpay from retrying
-    res.status(200).json({ success: false, error: err.message });
+    console.error('🔥 Webhook error:', err);
+    return res.status(200).json({ success: false, error: err.message });
   }
 };
 
-/**
- * Handle payment.captured event
- */
-const handlePaymentCaptured = async (payment) => {
+const handlePaymentCaptured = async (payment, io) => {
   try {
-    console.log('💳 Payment captured:', payment.id);
-    console.log('   Amount:', payment.amount / 100, 'INR');
-    console.log('   Status:', payment.status);
-    console.log('   Method:', payment.method);
+    console.log(`💳 Payment captured: ${payment.id} | ₹${payment.amount / 100}`);
 
-    // Extract driver ID from order notes
     const driverId = payment.notes?.driverId;
-    
     if (!driverId) {
-      console.log('⚠️  No driver ID in payment notes');
+      console.log('ℹ️ No driverId in payment notes — skipping');
       return;
     }
 
-    // Check if payment already processed
+    // Check if already processed
     const wallet = await Wallet.findOne({
       driverId,
-      'transactions.razorpayPaymentId': payment.id
+      'transactions.razorpayPaymentId': payment.id,
+      'transactions.status': 'completed'
     });
 
     if (wallet) {
-      const existingTxn = wallet.transactions.find(
-        t => t.razorpayPaymentId === payment.id && t.status === 'completed'
-      );
-      
-      if (existingTxn) {
-        console.log('ℹ️  Payment already processed via API');
-        return;
-      }
+      console.log('ℹ️ Payment already processed — no action needed');
+    } else {
+      console.log(`ℹ️ Webhook for driver ${driverId} — payment verify API should handle this`);
     }
 
-    console.log('ℹ️  Webhook confirms payment, already processed via verify API');
-    
-    // Optionally: Send notification to driver
-    const driver = await User.findById(driverId).select('socketId').lean();
-    if (driver?.socketId) {
-      io.to(driver.socketId).emit('payment:confirmed', {
+    // ✅ Notify driver via socket
+    if (io) {
+      io.to(`driver_${driverId}`).emit('payment:confirmed', {
         paymentId: payment.id,
         amount: payment.amount / 100,
-        message: 'Payment confirmed by payment gateway'
+        message: 'Payment confirmed by Razorpay',
+        timestamp: new Date().toISOString()
       });
     }
-
   } catch (err) {
-    console.error('Error handling payment captured:', err);
+    console.error('❌ handlePaymentCaptured error:', err);
   }
 };
 
-/**
- * Handle payment.failed event
- */
-const handlePaymentFailed = async (payment) => {
+const handlePaymentFailed = async (payment, io) => {
   try {
-    console.log('❌ Payment failed:', payment.id);
-    console.log('   Error:', payment.error_description);
+    console.log(`❌ Payment failed: ${payment.id} | ${payment.error_description}`);
 
     const driverId = payment.notes?.driverId;
-    
     if (!driverId) return;
 
-    // Update transaction status to failed
+    // Mark any pending transaction as failed
     await Wallet.findOneAndUpdate(
-      { 
-        driverId,
-        'transactions.razorpayOrderId': payment.order_id 
-      },
-      {
-        $set: {
-          'transactions.$.status': 'failed',
-          'transactions.$.description': `Payment failed: ${payment.error_description}`
-        }
-      }
+      { driverId, 'transactions.razorpayOrderId': payment.order_id },
+      { $set: { 'transactions.$.status': 'failed' } }
     );
 
     // Notify driver
-    const driver = await User.findById(driverId).select('socketId').lean();
-    if (driver?.socketId) {
-      io.to(driver.socketId).emit('payment:failed', {
+    if (io) {
+      io.to(`driver_${driverId}`).emit('payment:failed', {
         paymentId: payment.id,
-        orderId: payment.order_id,
         error: payment.error_description,
-        message: 'Payment failed. Please try again.'
+        message: 'Payment failed. Please try again.',
+        timestamp: new Date().toISOString()
       });
     }
-
-    console.log('📢 Driver notified of failed payment');
-
   } catch (err) {
-    console.error('Error handling payment failed:', err);
+    console.error('❌ handlePaymentFailed error:', err);
   }
 };
 
-/**
- * Handle order.paid event
- */
-const handleOrderPaid = async (order, payment) => {
+const handleOrderPaid = async (order, payment, io) => {
   try {
-    console.log('✅ Order paid:', order.id);
-    console.log('   Amount:', order.amount / 100, 'INR');
-    console.log('   Payment:', payment.id);
-
-    // This is a confirmation that order is fully paid
-    // Usually already handled by payment.captured, but good for reconciliation
-    
+    console.log(`✅ Order paid: ${order.id} | ₹${order.amount / 100}`);
     const driverId = order.notes?.driverId;
-    if (driverId) {
-      console.log('📊 Order payment confirmed for driver:', driverId);
+    if (driverId && io) {
+      io.to(`driver_${driverId}`).emit('commission:paid', {
+        orderId: order.id,
+        amount: order.amount / 100,
+        timestamp: new Date().toISOString()
+      });
     }
-
   } catch (err) {
-    console.error('Error handling order paid:', err);
+    console.error('❌ handleOrderPaid error:', err);
   }
 };
 
-/**
- * Test webhook endpoint (for development)
- * POST /api/webhook/test
- */
 const testWebhook = async (req, res) => {
-  try {
-    console.log('🧪 Test webhook called');
-    console.log('Headers:', req.headers);
-    console.log('Body:', req.body);
-
-    res.status(200).json({
-      success: true,
-      message: 'Test webhook received',
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    console.error('Test webhook error:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
+  console.log('🧪 Test webhook:', req.body);
+  res.status(200).json({ success: true, message: 'Test webhook received', timestamp: new Date().toISOString() });
 };
 
-export {
-  handleRazorpayWebhook,
-  testWebhook
-};
+export { handleRazorpayWebhook, testWebhook };
