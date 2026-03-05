@@ -7,6 +7,8 @@ import {
   getTodayEarnings,
   createRazorpayOrder,
   verifyRazorpayPayment,
+  createCommissionOrder,
+  verifyCommissionPayment,
   getPaymentProofs,
   getAllWallets,
   getWalletDetails,
@@ -69,6 +71,8 @@ router.get('/payment-proof/:driverId', authenticateUser, getPaymentProofs);
 router.post('/collect-cash', authenticateUser, processCashCollection);
 router.post('/create-order', authenticateUser, createRazorpayOrder);
 router.post('/verify-payment', authenticateUser, verifyRazorpayPayment);
+router.post('/create-commission-order', authenticateUser, createCommissionOrder);
+router.post('/verify-commission', authenticateUser, verifyCommissionPayment);
 
 // ⚠️ THIS MUST BE LAST - catches everything as /:driverId
 router.get('/:driverId', authenticateUser, getWalletByDriverId);

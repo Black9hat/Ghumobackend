@@ -871,6 +871,135 @@ export const getWalletStats = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // NAMED ALIASES (for backward compatibility)
 // ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// CREATE COMMISSION PAYMENT ORDER (Driver pays pending commission)
+// POST /api/wallet/create-commission-order
+// Only needs driverId + amount — no tripId/customerId required
+// ═══════════════════════════════════════════════════════════════════
+export const createCommissionOrder = async (req, res) => {
+  try {
+    const { driverId, amount } = req.body;
+
+    if (!driverId || !amount) {
+      return res.status(400).json({ success: false, message: 'Missing required fields: driverId, amount' });
+    }
+
+    const numericAmount = Number(amount);
+    if (isNaN(numericAmount) || numericAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'amount must be a positive number' });
+    }
+
+    if (!razorpay) {
+      return res.status(500).json({ success: false, message: 'Razorpay not configured' });
+    }
+
+    const receipt = `comm_${driverId.toString().slice(-8)}_${Date.now().toString().slice(-6)}`;
+
+    const razorpayOrder = await razorpay.orders.create({
+      amount: Math.round(numericAmount * 100), // paise
+      currency: 'INR',
+      receipt,
+      notes: {
+        driverId: driverId.toString(),
+        type: 'commission_payment'
+      }
+    });
+
+    console.log(`✅ Commission order created: ${razorpayOrder.id} | driver: ${driverId} | ₹${numericAmount}`);
+
+    return res.json({
+      success: true,
+      orderId: razorpayOrder.id,
+      amount: numericAmount,
+      currency: 'INR',
+      driverId
+    });
+  } catch (error) {
+    console.error('❌ createCommissionOrder error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to create commission order', error: error.message });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// VERIFY COMMISSION PAYMENT
+// POST /api/wallet/verify-commission
+// After Razorpay success, clears pendingAmount from wallet
+// ═══════════════════════════════════════════════════════════════════
+export const verifyCommissionPayment = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const { driverId, paymentId, orderId, signature } = req.body;
+
+    if (!driverId || !paymentId || !orderId || !signature) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    // Verify Razorpay signature
+    const body = `${orderId}|${paymentId}`;
+    const expectedSig = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(body)
+      .digest('hex');
+
+    if (expectedSig !== signature) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid payment signature' });
+    }
+
+    // Fetch payment from Razorpay to get amount
+    const payment = await razorpay.payments.fetch(paymentId);
+    if (!payment || payment.status !== 'captured') {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: `Payment not captured. Status: ${payment?.status}` });
+    }
+
+    const paidAmount = payment.amount / 100; // convert paise to rupees
+
+    let wallet = await Wallet.findOne({ driverId }).session(session);
+    if (!wallet) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: 'Wallet not found' });
+    }
+
+    // Reduce pendingAmount by what was paid
+    const deducted = Math.min(wallet.pendingAmount, paidAmount);
+    wallet.pendingAmount = Math.max(0, wallet.pendingAmount - deducted);
+
+    // Record the commission payment transaction
+    wallet.transactions.push({
+      type: 'debit',
+      amount: paidAmount,
+      description: `Commission paid via Razorpay (${paymentId})`,
+      razorpayPaymentId: paymentId,
+      razorpayOrderId: orderId,
+      paymentMethod: payment.method || 'upi',
+      status: 'completed',
+      createdAt: new Date()
+    });
+
+    await wallet.save({ session });
+    await session.commitTransaction();
+
+    console.log(`✅ Commission verified: ₹${paidAmount} | driver: ${driverId} | pending now: ₹${wallet.pendingAmount}`);
+
+    return res.json({
+      success: true,
+      message: 'Commission payment verified',
+      paidAmount,
+      pendingAmount: wallet.pendingAmount,
+      availableBalance: wallet.availableBalance
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    console.error('❌ verifyCommissionPayment error:', error);
+    return res.status(500).json({ success: false, message: 'Verification failed', error: error.message });
+  } finally {
+    session.endSession();
+  }
+};
+
 export const createRazorpayOrder     = createDirectPaymentOrder;
 export const verifyRazorpayPayment   = verifyDirectPayment;
 export const processCashPaymentHandler = initiateCashPayment;
