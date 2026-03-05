@@ -191,7 +191,7 @@ export const createDirectPaymentOrder = async (req, res) => {
     const razorpayOrder = await razorpay.orders.create({
       amount: Math.round(amount * 100), // Paisa
       currency: 'INR',
-      receipt: `trip_${tripId}_${Date.now()}`,
+      receipt: `T${tripId.toString().slice(-8)}_${Date.now().toString().slice(-8)}`, // max 40 chars
       notes: {
         tripId: tripId.toString(),
         customerId: customerId.toString(),
