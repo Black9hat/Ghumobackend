@@ -102,7 +102,19 @@ const walletSchema = new mongoose.Schema(
 // Indexes
 walletSchema.index({ driverId: 1 });
 walletSchema.index({ 'transactions.tripId': 1 });
-walletSchema.index({ 'transactions.razorpayPaymentId': 1 });
+// ✅ UNIQUE sparse index — DB-level guarantee: same paymentId can never be written twice
+// sparse + partialFilter excludes transactions without razorpayPaymentId (cash trips etc.)
+walletSchema.index(
+  { driverId: 1, 'transactions.razorpayPaymentId': 1 },
+  {
+    unique: true,
+    sparse: true,
+    partialFilterExpression: {
+      'transactions.razorpayPaymentId': { $exists: true, $type: 'string' }
+    },
+    name: 'unique_razorpay_payment_per_driver'
+  }
+);
 walletSchema.index({ 'transactions.createdAt': -1 });
 walletSchema.index({ 'transactions.status': 1 });
 walletSchema.index({ 'transactions.type': 1 });

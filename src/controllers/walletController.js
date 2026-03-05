@@ -928,64 +928,97 @@ export const createCommissionOrder = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 export const verifyCommissionPayment = async (req, res) => {
   const session = await mongoose.startSession();
-  session.startTransaction();
   try {
     const { driverId, paymentId, orderId, signature } = req.body;
 
     if (!driverId || !paymentId || !orderId || !signature) {
-      await session.abortTransaction();
       return res.status(400).json({ success: false, message: 'Missing required fields' });
     }
 
-    // Verify Razorpay signature
-    const body = `${orderId}|${paymentId}`;
+    // ✅ Step 1: Verify Razorpay signature FIRST — before any DB work
     const expectedSig = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(body)
+      .update(`${orderId}|${paymentId}`)
       .digest('hex');
 
     if (expectedSig !== signature) {
-      await session.abortTransaction();
       return res.status(400).json({ success: false, message: 'Invalid payment signature' });
     }
 
-    // Fetch payment from Razorpay to get amount
-    const payment = await razorpay.payments.fetch(paymentId);
-    // ✅ Accept both 'captured' and 'authorized' — live payments may be authorized first
+    // ✅ Step 2: Check idempotency BEFORE fetching from Razorpay
+    // If webhook already wrote this paymentId, return early with current wallet state
+    const existingCheck = await Wallet.findOne({
+      driverId,
+      'transactions.razorpayPaymentId': paymentId,
+      'transactions.status': 'completed'
+    }).select('pendingAmount availableBalance').lean();
+
+    if (existingCheck) {
+      console.log(`ℹ️ verifyCommission: ${paymentId} already processed — returning current state`);
+      return res.json({
+        success: true,
+        message: 'Commission already processed',
+        alreadyProcessed: true,
+        paidAmount: 0,
+        pendingAmount: existingCheck.pendingAmount,
+        availableBalance: existingCheck.availableBalance
+      });
+    }
+
+    // ✅ Step 3: Fetch from Razorpay with timeout — prevents session leak if Razorpay is slow
+    let payment;
+    try {
+      const fetchWithTimeout = Promise.race([
+        razorpay.payments.fetch(paymentId),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Razorpay fetch timeout after 10s')), 10000)
+        )
+      ]);
+      payment = await fetchWithTimeout;
+    } catch (fetchErr) {
+      console.error('❌ Razorpay fetch error:', fetchErr.message);
+      return res.status(502).json({ success: false, message: 'Could not verify payment with Razorpay. Try again.' });
+    }
+
     if (!payment || !['captured', 'authorized'].includes(payment.status)) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: `Payment not completed. Status: ${payment?.status}` });
+      return res.status(400).json({
+        success: false,
+        message: `Payment not completed. Status: ${payment?.status ?? 'unknown'}`
+      });
     }
 
     const paidAmount = payment.amount / 100;
     const paymentMethod = payment.method || 'upi';
 
-    let wallet = await Wallet.findOne({ driverId }).session(session);
+    // ✅ Step 4: Atomic transaction — prevents race with webhook
+    session.startTransaction();
+
+    const wallet = await Wallet.findOne({ driverId }).session(session);
     if (!wallet) {
       await session.abortTransaction();
       return res.status(404).json({ success: false, message: 'Wallet not found' });
     }
 
-    // ✅ Prevent double processing — check if this paymentId was already recorded
-    const alreadyProcessed = wallet.transactions.some(
-      t => t.razorpayPaymentId === paymentId
+    // ✅ Re-check inside transaction (double-checked locking)
+    const doubleCheck = wallet.transactions.some(
+      t => t.razorpayPaymentId === paymentId && t.status === 'completed'
     );
-    if (alreadyProcessed) {
+    if (doubleCheck) {
       await session.abortTransaction();
       return res.json({
         success: true,
         message: 'Commission already processed',
         alreadyProcessed: true,
+        paidAmount: 0,
         pendingAmount: wallet.pendingAmount,
         availableBalance: wallet.availableBalance
       });
     }
 
-    // Reduce pendingAmount by what was paid
+    // ✅ Deduct pendingAmount
     const deducted = Math.min(wallet.pendingAmount, paidAmount);
     wallet.pendingAmount = Math.max(0, wallet.pendingAmount - deducted);
 
-    // Record the commission payment transaction
     wallet.transactions.push({
       type: 'debit',
       amount: paidAmount,
@@ -1000,9 +1033,9 @@ export const verifyCommissionPayment = async (req, res) => {
     await wallet.save({ session });
     await session.commitTransaction();
 
-    console.log(`✅ Commission verified: ₹${paidAmount} | driver: ${driverId} | pending now: ₹${wallet.pendingAmount}`);
+    console.log(`✅ Commission verified: ₹${paidAmount} | driver: ${driverId} | pending: ₹${wallet.pendingAmount}`);
 
-    // ✅ Emit socket so wallet page updates in realtime
+    // ✅ Emit socket
     if (req.io) {
       req.io.to(`driver_${driverId}`).emit('commission:paid', {
         paidAmount,
@@ -1020,10 +1053,11 @@ export const verifyCommissionPayment = async (req, res) => {
       pendingAmount: wallet.pendingAmount,
       availableBalance: wallet.availableBalance
     });
+
   } catch (error) {
-    await session.abortTransaction();
+    if (session.inTransaction()) await session.abortTransaction();
     console.error('❌ verifyCommissionPayment error:', error);
-    return res.status(500).json({ success: false, message: 'Verification failed', error: error.message });
+    return res.status(500).json({ success: false, message: 'Verification failed' });
   } finally {
     session.endSession();
   }
