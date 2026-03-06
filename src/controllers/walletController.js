@@ -1,3 +1,5 @@
+// controllers/walletController.js - PRODUCTION PAYMENT SYSTEM
+
 import Wallet from '../models/Wallet.js';
 import Trip from '../models/Trip.js';
 import PaymentTransaction from '../models/PaymentTransaction.js';

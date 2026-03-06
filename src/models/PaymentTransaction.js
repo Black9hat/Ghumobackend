@@ -1,4 +1,3 @@
-
 // models/PaymentTransaction.js
 
 import mongoose from 'mongoose';

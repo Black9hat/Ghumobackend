@@ -1,6 +1,7 @@
 // routes/walletRoutes.js
 import express from 'express';
 import { authenticateUser } from '../middlewares/auth.js';
+import { verifyAdminToken } from '../middlewares/adminAuth.js';
 import {
   getWalletByDriverId,
   processCashCollection,
@@ -22,23 +23,7 @@ const router = express.Router();
 // ═══════════════════════════════════════════════════════════════════
 // ADMIN MIDDLEWARE - checks x-admin-token header or admin role
 // ═══════════════════════════════════════════════════════════════════
-const verifyAdmin = (req, res, next) => {
-  // Method 1: x-admin-token header (admin panel)
-  const adminToken = req.headers['x-admin-token'];
-  if (adminToken && process.env.ADMIN_TOKEN && adminToken === process.env.ADMIN_TOKEN) {
-    console.log('✅ Admin access via x-admin-token');
-    return next();
-  }
-
-  // Method 2: Firebase user with admin role in DB
-  if (req.user && req.user.role === 'admin') {
-    console.log('✅ Admin access via role');
-    return next();
-  }
-
-  console.log('❌ Admin access denied');
-  return res.status(403).json({ success: false, message: 'Admin access required' });
-};
+// ✅ Admin routes use verifyAdminToken (JWT) — same as adminRoutes.js
 
 // ═══════════════════════════════════════════════════════════════════
 // ⚠️ CRITICAL: ADMIN ROUTES MUST COME BEFORE /:driverId ROUTES
@@ -59,11 +44,11 @@ router.get('/admin/test', (req, res) => {
 });
 
 // ── ADMIN ROUTES (DEFINED FIRST!) ─────────────────────────────────
-router.get('/admin/wallets/stats/summary', authenticateUser, verifyAdmin, getWalletStats);
-router.get('/admin/wallets/:driverId/transactions', authenticateUser, verifyAdmin, getWalletTransactions);
-router.post('/admin/wallets/:driverId/payout', authenticateUser, verifyAdmin, processManualPayout);
-router.get('/admin/wallets/:driverId', authenticateUser, verifyAdmin, getWalletDetails);
-router.get('/admin/wallets', authenticateUser, verifyAdmin, getAllWallets);
+router.get('/admin/wallets/stats/summary', verifyAdminToken, getWalletStats);
+router.get('/admin/wallets/:driverId/transactions', verifyAdminToken, getWalletTransactions);
+router.post('/admin/wallets/:driverId/payout', verifyAdminToken, processManualPayout);
+router.get('/admin/wallets/:driverId', verifyAdminToken, getWalletDetails);
+router.get('/admin/wallets', verifyAdminToken, getAllWallets);
 
 // ── DRIVER ROUTES (DEFINED AFTER admin routes) ───────────────────
 router.get('/today/:driverId', authenticateUser, getTodayEarnings);
