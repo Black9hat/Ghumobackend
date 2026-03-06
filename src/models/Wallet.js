@@ -9,7 +9,11 @@ const transactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['credit', 'debit', 'commission'],
+      // credit          = trip earning added to wallet
+      // commission      = commission charged (owed to platform)
+      // commission_paid = driver paid platform commission via Razorpay ✅
+      // debit           = manual payout / withdrawal
+      enum: ['credit', 'debit', 'commission', 'commission_paid'],
       required: true
     },
     amount: {
@@ -84,6 +88,12 @@ const walletSchema = new mongoose.Schema(
       min: 0
     },
     pendingAmount: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    // ✅ Total commission actually paid to platform (via Razorpay)
+    paidCommission: {
       type: Number,
       default: 0,
       min: 0

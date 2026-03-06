@@ -85,6 +85,7 @@ async function saveToRideHistory(trip, status = 'Completed', session = null) {
 }
 
 // ✅ Process wallet/commission (session-aware)
+// ⚠️ FIXED: Was incorrectly writing to User model — now writes to Wallet model
 async function processWalletTransaction(driverId, tripId, fareAmount, session) {
   try {
     console.log(`💳 Processing wallet: Driver ${driverId}, Fare ₹${fareAmount}`);
@@ -94,34 +95,77 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
     const commissionSettings = await CommissionSettings.findOne({ type: 'global' });
     const commissionPercentage = commissionSettings?.percentage || 15;
 
-    const commission = (fareAmount * commissionPercentage) / 100;
-    const driverEarning = fareAmount - commission;
+    const commission    = Math.round((fareAmount * commissionPercentage / 100) * 100) / 100;
+    const driverEarning = Math.round((fareAmount - commission) * 100) / 100;
 
-    const driver = await User.findById(driverId).session(session);
-    if (!driver) throw new Error('Driver not found for wallet update');
+    // ✅ FIXED: Write to Wallet model (not User model)
+    let wallet = await Wallet.findOne({ driverId }).session(session);
+    if (!wallet) {
+      wallet = new Wallet({
+        driverId,
+        availableBalance: 0,
+        balance: 0,
+        totalEarnings: 0,
+        totalCommission: 0,
+        pendingAmount: 0,
+        paidCommission: 0,
+        transactions: []
+      });
+    }
 
-    const currentEarnings = driver.totalEarnings || 0;
-    const currentCommission = driver.totalCommissionPaid || 0;
-    const currentPending = driver.pendingAmount || 0;
+    // ✅ Idempotency: don't double-credit same tripId
+    const alreadyCredited = wallet.transactions.some(
+      t => t.tripId?.toString() === tripId?.toString() && t.type === 'credit' && t.status === 'completed'
+    );
+    if (alreadyCredited) {
+      console.log(`ℹ️ Trip ${tripId} already credited — skipping`);
+      return {
+        success: true,
+        alreadyProcessed: true,
+        fareBreakdown: { tripFare: fareAmount, commission, commissionPercentage, driverEarning },
+        wallet: { totalEarnings: wallet.totalEarnings, totalCommission: wallet.totalCommission, pendingAmount: wallet.pendingAmount }
+      };
+    }
 
-    await User.findByIdAndUpdate(driverId, {
-      $set: {
-        totalEarnings: currentEarnings + driverEarning,
-        totalCommissionPaid: currentCommission + commission,
-        pendingAmount: currentPending + driverEarning,
-        lastEarningAt: new Date()
-      }
-    }, { session });
+    // ✅ Credit driver earning
+    wallet.transactions.push({
+      tripId,
+      type: 'credit',
+      amount: driverEarning,
+      description: `Trip fare (₹${fareAmount}) - earning after ${commissionPercentage}% commission`,
+      paymentMethod: 'cash',
+      status: 'completed',
+      createdAt: new Date()
+    });
 
-    console.log(`✅ Wallet updated: Earning ₹${driverEarning.toFixed(2)}, Commission ₹${commission.toFixed(2)}`);
+    // ✅ Record commission as owed (debt to platform)
+    wallet.transactions.push({
+      tripId,
+      type: 'commission',
+      amount: commission,
+      description: `Platform commission (${commissionPercentage}%)`,
+      paymentMethod: 'cash',
+      status: 'completed',
+      createdAt: new Date()
+    });
+
+    wallet.availableBalance  = Math.round((wallet.availableBalance + driverEarning) * 100) / 100;
+    wallet.totalEarnings     = Math.round((wallet.totalEarnings + driverEarning) * 100) / 100;
+    wallet.totalCommission   = Math.round((wallet.totalCommission + commission) * 100) / 100;
+    // pendingAmount = commission owed to platform (not yet paid)
+    wallet.pendingAmount     = Math.round((wallet.pendingAmount + commission) * 100) / 100;
+
+    await wallet.save({ session });
+
+    console.log(`✅ Wallet updated: Earning ₹${driverEarning.toFixed(2)}, Commission ₹${commission.toFixed(2)}, Pending ₹${wallet.pendingAmount}`);
 
     return {
       success: true,
       fareBreakdown: { tripFare: fareAmount, commission, commissionPercentage, driverEarning },
       wallet: {
-        totalEarnings: currentEarnings + driverEarning,
-        totalCommission: currentCommission + commission,
-        pendingAmount: currentPending + driverEarning
+        totalEarnings: wallet.totalEarnings,
+        totalCommission: wallet.totalCommission,
+        pendingAmount: wallet.pendingAmount
       }
     };
   } catch (error) {
