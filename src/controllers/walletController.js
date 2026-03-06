@@ -697,10 +697,10 @@ export const getAllWallets = async (req, res) => {
 
     const [wallets, total] = await Promise.all([
       Wallet.find({})
-        .select('driverId availableBalance totalEarnings totalCommission pendingAmount lastUpdated')
+        .select('driverId availableBalance totalEarnings totalCommission pendingAmount transactions lastUpdated')
         .sort({ [sortField]: sortOrder })
         .skip(skip).limit(Number(limit))
-        .populate('driverId', 'name phone vehicleType')
+        .populate('driverId', 'name phone vehicleType vehicleNumber')
         .lean(),
       Wallet.countDocuments({})
     ]);
