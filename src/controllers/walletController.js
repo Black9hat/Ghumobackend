@@ -1,5 +1,3 @@
-// controllers/walletController.js - PRODUCTION PAYMENT SYSTEM
-
 import Wallet from '../models/Wallet.js';
 import Trip from '../models/Trip.js';
 import PaymentTransaction from '../models/PaymentTransaction.js';
@@ -612,7 +610,7 @@ export const getWalletByDriverId = async (req, res) => {
     if (!wallet) {
       return res.json({
         success: true,
-        wallet: { driverId, availableBalance: 0, totalEarnings: 0, totalCommission: 0, pendingAmount: 0, paidCommission: 0, transactions: [] }
+        wallet: { driverId, availableBalance: 0, totalEarnings: 0, totalCommission: 0, pendingAmount: 0, transactions: [] }
       });
     }
     return res.json({ success: true, wallet });
@@ -734,10 +732,7 @@ export const getWalletDetails = async (req, res) => {
         summary: {
           totalTransactions: wallet.transactions?.length || 0,
           completedTransactions: wallet.transactions?.filter(t => t.status === 'completed').length || 0,
-          netEarnings: (wallet.totalEarnings || 0) - (wallet.totalCommission || 0),
-          paidCommission: wallet.paidCommission || 0,
-          unpaidCommission: (wallet.pendingAmount || 0),   // commission owed but not yet paid
-          commissionPayments: wallet.transactions?.filter(t => t.type === 'commission_paid' && t.status === 'completed').length || 0
+          netEarnings: (wallet.totalEarnings || 0) - (wallet.totalCommission || 0)
         }
       }
     });
@@ -799,15 +794,9 @@ export const processManualPayout = async (req, res) => {
       await session.abortTransaction();
       return res.status(404).json({ success: false, message: 'Wallet not found' });
     }
-
-    // ✅ Only allow payout of availableBalance (not pendingAmount — that is commission debt)
-    const safeAvailable = Math.max(0, (wallet.availableBalance || 0) - (wallet.pendingAmount || 0));
-    if (safeAvailable < amount) {
+    if (wallet.availableBalance < amount) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient balance. Available after pending commission: ₹${safeAvailable.toFixed(2)}`
-      });
+      return res.status(400).json({ success: false, message: `Insufficient balance. Available: ₹${wallet.availableBalance}` });
     }
 
     wallet.transactions.push({
@@ -845,7 +834,6 @@ export const getWalletStats = async (req, res) => {
           totalEarnings: { $sum: '$totalEarnings' },
           totalCommission: { $sum: '$totalCommission' },
           totalPending: { $sum: '$pendingAmount' },
-          totalPaidCommission: { $sum: '$paidCommission' },   // ✅ NEW
           avgBalance: { $avg: '$availableBalance' }
         }
       }]),
@@ -853,29 +841,22 @@ export const getWalletStats = async (req, res) => {
         { $unwind: '$transactions' },
         { $match: {
           'transactions.createdAt': { $gte: (() => { const d = new Date(); d.setHours(0,0,0,0); return d; })() },
-          'transactions.type': { $in: ['credit', 'commission_paid'] },  // ✅ include commission paid today
+          'transactions.type': 'credit',
           'transactions.status': 'completed'
         }},
-        { $group: {
-          _id: '$transactions.type',
-          total: { $sum: '$transactions.amount' },
-          count: { $sum: 1 }
-        }}
+        { $group: { _id: null, todayTotalEarnings: { $sum: '$transactions.amount' }, todayTransactions: { $sum: 1 } } }
       ])
     ]);
 
-    const summary = stats[0] || { totalDrivers: 0, totalAvailableBalance: 0, totalEarnings: 0, totalCommission: 0, totalPending: 0, totalPaidCommission: 0, avgBalance: 0 };
-    // todayStats is now an array with _id = type
-    const todayCredit = todayStats.find(r => r._id === 'credit') || { total: 0, count: 0 };
-    const todayCommPaid = todayStats.find(r => r._id === 'commission_paid') || { total: 0, count: 0 };
+    const summary = stats[0] || { totalDrivers: 0, totalAvailableBalance: 0, totalEarnings: 0, totalCommission: 0, totalPending: 0, avgBalance: 0 };
+    const today = todayStats[0] || { todayTotalEarnings: 0, todayTransactions: 0 };
 
     return res.json({
       success: true,
       stats: {
         ...summary,
-        todayTotalEarnings:    Math.round((todayCredit.total || 0) * 100) / 100,
-        todayTransactions:     todayCredit.count || 0,
-        todayCommissionPaid:   Math.round((todayCommPaid.total || 0) * 100) / 100,
+        todayTotalEarnings: Math.round((today.todayTotalEarnings || 0) * 100) / 100,
+        todayTransactions: today.todayTransactions || 0,
         generatedAt: new Date().toISOString()
       }
     });
@@ -1035,13 +1016,11 @@ export const verifyCommissionPayment = async (req, res) => {
     // ✅ Deduct pendingAmount
     const deducted = Math.min(wallet.pendingAmount, paidAmount);
     wallet.pendingAmount = Math.max(0, wallet.pendingAmount - deducted);
-    // ✅ Track total lifetime commission paid to platform
-    wallet.paidCommission = Math.round(((wallet.paidCommission || 0) + paidAmount) * 100) / 100;
 
     wallet.transactions.push({
-      type: 'commission_paid',        // ✅ distinct type — shows in history as "Commission Paid"
+      type: 'debit',
       amount: paidAmount,
-      description: `Commission paid to platform via Razorpay`,
+      description: `Commission paid via Razorpay (${paymentId})`,
       razorpayPaymentId: paymentId,
       razorpayOrderId: orderId,
       paymentMethod,
