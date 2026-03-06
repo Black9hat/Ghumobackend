@@ -1015,14 +1015,15 @@ export const verifyCommissionPayment = async (req, res) => {
       });
     }
 
-    // ✅ Deduct pendingAmount
+    // ✅ Deduct pendingAmount and track in totalCommission
     const deducted = Math.min(wallet.pendingAmount, paidAmount);
     wallet.pendingAmount = Math.max(0, wallet.pendingAmount - deducted);
+    wallet.totalCommission = (wallet.totalCommission || 0) + paidAmount;
 
     wallet.transactions.push({
-      type: 'debit',
+      type: 'commission',                               // ← 'commission' type so UI shows it distinctly
       amount: paidAmount,
-      description: `Commission paid via Razorpay (${paymentId})`,
+      description: `Commission paid via Razorpay`,
       razorpayPaymentId: paymentId,
       razorpayOrderId: orderId,
       paymentMethod,

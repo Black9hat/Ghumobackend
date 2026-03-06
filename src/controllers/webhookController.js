@@ -140,13 +140,14 @@ const handlePaymentCaptured = async (payment, io) => {
       return;
     }
 
-    // ✅ Deduct pending
+    // ✅ Deduct pending and track in totalCommission
     const deducted = Math.min(wallet.pendingAmount, paidAmount);
     wallet.pendingAmount = Math.max(0, wallet.pendingAmount - deducted);
+    wallet.totalCommission = (wallet.totalCommission || 0) + paidAmount;
     wallet.transactions.push({
-      type: 'debit',
+      type: 'commission',                               // ← matches UI filter
       amount: paidAmount,
-      description: `Commission paid via Razorpay (${paymentId})`,
+      description: `Commission paid via Razorpay`,
       razorpayPaymentId: paymentId,
       razorpayOrderId: payment.order_id,
       paymentMethod: payment.method || 'upi',
