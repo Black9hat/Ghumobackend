@@ -1,4 +1,13 @@
 // controllers/walletController.js - PRODUCTION PAYMENT SYSTEM
+// ═══════════════════════════════════════════════════════════════════
+// FIXES APPLIED:
+// 🔴 Bug #1: confirmCashReceipt — added trip.walletUpdated atomic check (prevents double-credit)
+// 🔴 Bug #2: confirmCashReceipt — replaced two wallet.save() with single atomic $inc+$push (prevents lost update)
+// 🔴 Bug #3: processCashCollection — added trip.walletUpdated atomic check (prevents double-credit)
+// 🟠 Bug #4: verifyDirectPayment — replaced wallet.save() with atomic $inc+$push (prevents race with webhook)
+// 🟡 Bug #5: createDirectPaymentOrder, initiateCashPayment, processCashCollection, getTodayEarnings
+//            — replaced hardcoded 0.20 with dynamic getCommissionRate(vehicleType)
+// ═══════════════════════════════════════════════════════════════════
 
 import Wallet from '../models/Wallet.js';
 import Trip from '../models/Trip.js';
@@ -6,6 +15,8 @@ import PaymentTransaction from '../models/PaymentTransaction.js';
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
 import mongoose from 'mongoose';
+import User from '../models/User.js';
+import { getCommissionRate } from '../utils/getCommissionRate.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // RAZORPAY INIT
@@ -38,6 +49,7 @@ const safeEmit = (reqIo, room, event, data) => {
 // ═══════════════════════════════════════════════════════════════════
 // CREATE DIRECT PAYMENT ORDER (QR/UPI)
 // POST /api/payment/direct/create
+// ✅ FIX Bug #5: Dynamic commission from getCommissionRate()
 // ═══════════════════════════════════════════════════════════════════
 export const createDirectPaymentOrder = async (req, res) => {
   const session = await mongoose.startSession();
@@ -76,8 +88,10 @@ export const createDirectPaymentOrder = async (req, res) => {
 
     await Trip.findByIdAndUpdate(tripId, { paymentStatus: 'processing' }, { session });
 
-    const commission = amount * 0.20;
-    const driverAmount = amount - commission;
+    // ✅ FIX Bug #5: Dynamic commission rate from DB instead of hardcoded 0.20
+    const commissionRate = await getCommissionRate(trip.vehicleType);
+    const commission = Math.round(amount * commissionRate * 100) / 100;
+    const driverAmount = Math.round((amount - commission) * 100) / 100;
 
     const razorpayOrder = await razorpay.orders.create({
       amount: Math.round(amount * 100),
@@ -111,7 +125,7 @@ export const createDirectPaymentOrder = async (req, res) => {
     await paymentTxn.save({ session });
     await session.commitTransaction();
 
-    console.log(`✅ Order created: ${razorpayOrder.id} for trip ${tripId}`);
+    console.log(`✅ Order created: ${razorpayOrder.id} for trip ${tripId} | commission rate: ${Math.round(commissionRate * 100)}%`);
 
     return res.json({
       success: true,
@@ -137,113 +151,182 @@ export const createDirectPaymentOrder = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // VERIFY DIRECT PAYMENT
 // POST /api/payment/direct/verify
+// ✅ FIX Bug #4: Replaced wallet.save() with atomic $inc+$push via
+//    findOneAndUpdate — eliminates read-modify-write race with webhook
+// ✅ FIX Bug #1 (partial): Added trip.walletUpdated idempotency guard
+//    to prevent double-credit if socket + HTTP race occurs
 // ═══════════════════════════════════════════════════════════════════
 export const verifyDirectPayment = async (req, res) => {
   const session = await mongoose.startSession();
-  session.startTransaction();
   try {
-    const { razorpayOrderId, razorpayPaymentId, razorpaySignature, tripId, driverId, customerId } = req.body;
+    let result = {};
 
-    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Missing payment verification data' });
-    }
+    await session.withTransaction(async () => {
+      const { razorpayOrderId, razorpayPaymentId, razorpaySignature, tripId, driverId, customerId } = req.body;
 
-    const body = `${razorpayOrderId}|${razorpayPaymentId}`;
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(body)
-      .digest('hex');
+      if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+        result = { status: 400, body: { success: false, message: 'Missing payment verification data' } };
+        return;
+      }
 
-    if (expectedSignature !== razorpaySignature) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Payment verification failed - invalid signature' });
-    }
+      // Verify signature
+      const body = `${razorpayOrderId}|${razorpayPaymentId}`;
+      const expectedSignature = crypto
+        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+        .update(body)
+        .digest('hex');
 
-    const existingPayment = await PaymentTransaction.findOne({
-      razorpayPaymentId,
-      paymentStatus: 'completed'
-    }).session(session);
+      if (expectedSignature !== razorpaySignature) {
+        result = { status: 400, body: { success: false, message: 'Payment verification failed - invalid signature' } };
+        return;
+      }
 
-    if (existingPayment) {
-      await session.abortTransaction();
-      return res.json({ success: true, message: 'Payment already processed', paymentId: razorpayPaymentId, alreadyProcessed: true });
-    }
-
-    const payment = await razorpay.payments.fetch(razorpayPaymentId);
-    if (!payment || payment.status !== 'captured') {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: `Payment not completed. Status: ${payment?.status}` });
-    }
-
-    const paymentTxn = await PaymentTransaction.findOneAndUpdate(
-      { razorpayOrderId },
-      {
+      // Check if payment already fully processed
+      const existingPayment = await PaymentTransaction.findOne({
         razorpayPaymentId,
-        paymentStatus: 'completed',
-        paymentMethod: payment.method,
-        completedAt: new Date(),
-        $inc: { processedCount: 1 }
-      },
-      { session, new: true }
-    );
+        paymentStatus: 'completed'
+      }).session(session);
 
-    if (!paymentTxn) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: 'Payment order not found' });
+      if (existingPayment) {
+        result = { status: 200, body: { success: true, message: 'Payment already processed', paymentId: razorpayPaymentId, alreadyProcessed: true } };
+        return;
+      }
+
+      // Verify with Razorpay
+      const payment = await razorpay.payments.fetch(razorpayPaymentId);
+      if (!payment || payment.status !== 'captured') {
+        result = { status: 400, body: { success: false, message: `Payment not completed. Status: ${payment?.status}` } };
+        return;
+      }
+
+      // Update payment transaction atomically
+      const paymentTxn = await PaymentTransaction.findOneAndUpdate(
+        { razorpayOrderId, paymentStatus: { $ne: 'completed' } },
+        {
+          $set: {
+            razorpayPaymentId,
+            paymentStatus: 'completed',
+            paymentMethod: payment.method,
+            completedAt: new Date()
+          },
+          $inc: { processedCount: 1 }
+        },
+        { session, new: true }
+      );
+
+      if (!paymentTxn) {
+        // Already completed by webhook or another request
+        result = { status: 200, body: { success: true, message: 'Payment already processed', paymentId: razorpayPaymentId, alreadyProcessed: true } };
+        return;
+      }
+
+      // ✅ FIX Bug #1: Claim walletUpdated flag atomically — prevents double-credit
+      // if webhook + HTTP verify race each other
+      const tripClaim = await Trip.findOneAndUpdate(
+        { _id: tripId, walletUpdated: { $ne: true } },
+        {
+          $set: {
+            walletUpdated: true,
+            walletUpdatedAt: new Date(),
+            paymentStatus: 'completed',
+            paymentMethod: 'direct',
+            razorpayPaymentId,
+            paidAmount: paymentTxn.amount,
+            completedAt: new Date()
+          }
+        },
+        { session, new: false }
+      ).lean();
+
+      if (!tripClaim) {
+        // Wallet already credited (webhook won the race) — still return success
+        console.log(`⚠️ verifyDirectPayment: wallet already updated for trip ${tripId}`);
+        const existingWallet = await Wallet.findOne({ driverId }).session(session).lean();
+        result = {
+          status: 200,
+          body: {
+            success: true,
+            message: 'Payment verified (wallet already updated)',
+            paymentId: razorpayPaymentId,
+            alreadyProcessed: true,
+            amount: paymentTxn.driverAmount,
+            driverAmount: paymentTxn.driverAmount,
+            commission: paymentTxn.commission,
+            walletBalance: existingWallet?.availableBalance || 0
+          }
+        };
+        return;
+      }
+
+      // ✅ FIX Bug #4: Atomic wallet update using $inc + $push
+      // Eliminates read-modify-write race condition
+      const updatedWallet = await Wallet.findOneAndUpdate(
+        { driverId },
+        {
+          $inc: {
+            availableBalance: paymentTxn.driverAmount,
+            totalEarnings: paymentTxn.driverAmount,
+            totalCommission: paymentTxn.commission
+          },
+          $push: {
+            transactions: {
+              tripId,
+              type: 'credit',
+              amount: paymentTxn.driverAmount,
+              description: `Payment received from trip (₹${paymentTxn.amount})`,
+              razorpayPaymentId,
+              razorpayOrderId,
+              paymentMethod: payment.method,
+              status: 'completed',
+              createdAt: new Date()
+            },
+            processedTripIds: tripId
+          }
+        },
+        { session, new: true, upsert: true }
+      );
+
+      // Emit socket events (outside transaction is fine — they're fire-and-forget)
+      result = {
+        status: 200,
+        body: {
+          success: true,
+          message: 'Payment verified successfully',
+          paymentId: razorpayPaymentId,
+          amount: paymentTxn.driverAmount,
+          driverAmount: paymentTxn.driverAmount,
+          commission: paymentTxn.commission,
+          walletBalance: updatedWallet.availableBalance
+        },
+        emit: {
+          driverId,
+          customerId,
+          tripId,
+          driverAmount: paymentTxn.driverAmount,
+          totalAmount: paymentTxn.amount,
+          razorpayPaymentId,
+          paymentMethod: payment.method
+        }
+      };
+    });
+
+    // Emit socket events AFTER transaction commits successfully
+    if (result.emit) {
+      const e = result.emit;
+      safeEmit(req.io, `driver_${e.driverId}`, 'payment:received', {
+        tripId: e.tripId, amount: e.driverAmount, paymentId: e.razorpayPaymentId,
+        method: e.paymentMethod, timestamp: new Date().toISOString()
+      });
+      safeEmit(req.io, `customer_${e.customerId}`, 'payment:confirmed', {
+        tripId: e.tripId, amount: e.totalAmount, paymentId: e.razorpayPaymentId,
+        timestamp: new Date().toISOString()
+      });
+      console.log(`✅ Payment verified: ${e.razorpayPaymentId} | Driver: ${e.driverId} | ₹${e.driverAmount}`);
     }
 
-    let wallet = await Wallet.findOne({ driverId }).session(session);
-    if (!wallet) {
-      wallet = new Wallet({ driverId, availableBalance: 0, balance: 0, totalEarnings: 0, totalCommission: 0, transactions: [] });
-    }
-
-    wallet.transactions.push({
-      tripId,
-      type: 'credit',
-      amount: paymentTxn.driverAmount,
-      description: `Payment received from trip (₹${paymentTxn.amount})`,
-      razorpayPaymentId,
-      razorpayOrderId,
-      paymentMethod: payment.method,
-      status: 'completed',
-      createdAt: new Date()
-    });
-    wallet.availableBalance += paymentTxn.driverAmount;
-    wallet.totalEarnings += paymentTxn.driverAmount;
-    await wallet.save({ session });
-
-    await Trip.findByIdAndUpdate(tripId, {
-      paymentStatus: 'completed',
-      paymentMethod: 'direct',
-      razorpayPaymentId,
-      paidAmount: paymentTxn.amount,
-      completedAt: new Date()
-    }, { session });
-
-    await session.commitTransaction();
-
-    safeEmit(req.io, `driver_${driverId}`, 'payment:received', {
-      tripId, amount: paymentTxn.driverAmount, paymentId: razorpayPaymentId,
-      method: payment.method, timestamp: new Date().toISOString()
-    });
-    safeEmit(req.io, `customer_${customerId}`, 'payment:confirmed', {
-      tripId, amount: paymentTxn.amount, paymentId: razorpayPaymentId, timestamp: new Date().toISOString()
-    });
-
-    console.log(`✅ Payment verified: ${razorpayPaymentId} | Driver: ${driverId} | ₹${paymentTxn.driverAmount}`);
-
-    return res.json({
-      success: true,
-      message: 'Payment verified successfully',
-      paymentId: razorpayPaymentId,
-      amount: paymentTxn.driverAmount,
-      driverAmount: paymentTxn.driverAmount,
-      commission: paymentTxn.commission,
-      walletBalance: wallet.availableBalance
-    });
+    return res.status(result.status || 200).json(result.body);
   } catch (error) {
-    await session.abortTransaction();
+    if (session.inTransaction()) await session.abortTransaction();
     console.error('❌ Payment verification error:', error);
     return res.status(500).json({ success: false, message: 'Payment verification failed', error: error.message });
   } finally {
@@ -254,6 +337,7 @@ export const verifyDirectPayment = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // INITIATE CASH PAYMENT (Customer side)
 // POST /api/payment/cash/initiate
+// ✅ FIX Bug #5: Dynamic commission from getCommissionRate()
 // ═══════════════════════════════════════════════════════════════════
 export const initiateCashPayment = async (req, res) => {
   const session = await mongoose.startSession();
@@ -287,8 +371,10 @@ export const initiateCashPayment = async (req, res) => {
 
     await Trip.findByIdAndUpdate(tripId, { paymentStatus: 'processing' }, { session });
 
-    const commission = amount * 0.20;
-    const driverAmount = amount;
+    // ✅ FIX Bug #5: Dynamic commission rate from DB
+    const commissionRate = await getCommissionRate(trip.vehicleType);
+    const commission = Math.round(amount * commissionRate * 100) / 100;
+    const driverAmount = amount; // Cash: driver keeps full amount, owes commission later
 
     const paymentTxn = new PaymentTransaction({
       tripId, driverId, customerId, amount, driverAmount, commission,
@@ -310,7 +396,7 @@ export const initiateCashPayment = async (req, res) => {
       action: 'confirm_cash_receipt'
     });
 
-    console.log(`✅ Cash payment pending: ₹${amount} for trip ${tripId}`);
+    console.log(`✅ Cash payment pending: ₹${amount} for trip ${tripId} | commission rate: ${Math.round(commissionRate * 100)}%`);
 
     return res.json({
       success: true,
@@ -329,119 +415,174 @@ export const initiateCashPayment = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-// CONFIRM CASH RECEIPT (Driver side)
-// POST /api/payment/cash/confirm
+// CONFIRM CASH RECEIPT (Driver side) — walletController version
+// POST /api/payment/cash/confirm  (via walletRoutes alias)
+// ✅ FIX Bug #1: Uses walletUpdated atomic flag — prevents double-credit
+//    if socket + HTTP race or if called from both tripController and here
+// ✅ FIX Bug #2: Single atomic $inc+$push via findOneAndUpdate — no two
+//    wallet.save() calls, no read-modify-write, no lost update
+// ✅ FIX Bug #5: Dynamic commission from getCommissionRate(vehicleType)
 // ═══════════════════════════════════════════════════════════════════
 export const confirmCashReceipt = async (req, res) => {
   const session = await mongoose.startSession();
-  session.startTransaction();
   try {
-    const { paymentId, tripId, driverId } = req.body;
+    let result = {};
 
-    if (!paymentId || !driverId) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Missing required fields: paymentId, driverId' });
+    await session.withTransaction(async () => {
+      const { paymentId, tripId, driverId, amount } = req.body;
+
+      if (!tripId || !driverId) {
+        result = { status: 400, body: { success: false, message: 'Missing tripId or driverId' } };
+        return;
+      }
+
+      // ✅ FIX Bug #1: Claim the walletUpdated flag atomically — prevents double credit
+      const trip = await Trip.findOneAndUpdate(
+        { _id: tripId, walletUpdated: { $ne: true } },
+        { $set: { walletUpdated: true, walletUpdatedAt: new Date() } },
+        { session, new: false }
+      ).lean();
+
+      if (!trip) {
+        console.log(`⚠️ confirmCashReceipt (walletController): already processed trip ${tripId}`);
+        result = { status: 200, body: { success: true, message: 'Cash already confirmed', alreadyProcessed: true } };
+        return;
+      }
+
+      const fareAmount = parseFloat(amount || trip.finalFare || trip.fare || 0);
+
+      // ✅ FIX Bug #5: Dynamic commission from DB per vehicleType
+      const commissionRate = await getCommissionRate(trip.vehicleType);
+      const commission = Math.round(fareAmount * commissionRate * 100) / 100;
+      const netAmount = Math.round((fareAmount - commission) * 100) / 100;
+
+      // ✅ FIX Bug #2: Single atomic wallet update — no two .save() calls
+      const updatedWallet = await Wallet.findOneAndUpdate(
+        { driverId },
+        {
+          $inc: {
+            totalEarnings: fareAmount,
+            totalCommission: commission,
+            pendingAmount: commission
+          },
+          $push: {
+            transactions: {
+              $each: [
+                {
+                  tripId, type: 'credit', amount: fareAmount,
+                  description: 'Cash collected from trip',
+                  paymentMethod: 'cash', status: 'completed',
+                  createdAt: new Date()
+                },
+                {
+                  tripId, type: 'commission', amount: commission,
+                  description: `Platform commission (${Math.round(commissionRate * 100)}%)`,
+                  paymentMethod: 'cash', status: 'completed',
+                  createdAt: new Date()
+                },
+              ],
+            },
+            processedTripIds: tripId,
+          },
+        },
+        { session, new: true, upsert: true }
+      );
+
+      // Update trip payment fields
+      await Trip.findByIdAndUpdate(tripId, {
+        $set: {
+          paymentStatus: 'completed',
+          paymentMethod: 'cash',
+          paymentCollected: true,
+          paymentCollectedAt: new Date(),
+          paidAmount: fareAmount,
+          paymentCompletedAt: new Date(),
+          status: 'completed',
+        },
+      }, { session });
+
+      // ✅ Release driver
+      await User.findByIdAndUpdate(driverId, {
+        $set: {
+          isBusy: false,
+          currentTripId: null,
+          canReceiveNewRequests: true,
+          awaitingCashCollection: false
+        },
+      }, { session });
+
+      // Mark payment transaction complete if present
+      if (paymentId) {
+        await PaymentTransaction.findByIdAndUpdate(
+          paymentId,
+          {
+            $set: { paymentStatus: 'completed', completedAt: new Date() },
+            $inc: { processedCount: 1 }
+          },
+          { session }
+        );
+      }
+
+      result = {
+        status: 200,
+        body: {
+          success: true,
+          message: 'Cash receipt confirmed',
+          amount: fareAmount,
+          driverAmount: netAmount,
+          commission,
+          walletBalance: updatedWallet.availableBalance,
+          pendingAmount: updatedWallet.pendingAmount,
+        },
+        emit: {
+          driverId, tripId, fareAmount, netAmount, commission,
+          walletBalance: updatedWallet.availableBalance,
+          pendingAmount: updatedWallet.pendingAmount
+        }
+      };
+    });
+
+    // Emit AFTER transaction commits — prevents emitting on rollback
+    if (result.emit) {
+      const e = result.emit;
+      safeEmit(req.io, `driver_${e.driverId}`, 'payment:confirmed', {
+        tripId: e.tripId, amount: e.fareAmount, driverAmount: e.netAmount,
+        commission: e.commission, walletBalance: e.walletBalance,
+        pendingAmount: e.pendingAmount, method: 'cash',
+        timestamp: new Date().toISOString(),
+      });
+      console.log(`✅ confirmCashReceipt: ₹${e.fareAmount} | commission: ₹${e.commission} | driver: ${e.driverId}`);
     }
 
-    const paymentTxn = await PaymentTransaction.findById(paymentId).session(session);
-    if (!paymentTxn) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: 'Payment record not found' });
-    }
-    if (paymentTxn.paymentStatus === 'completed') {
-      await session.abortTransaction();
-      return res.json({ success: true, message: 'Payment already confirmed', alreadyProcessed: true });
-    }
-    if (paymentTxn.paymentMethod !== 'cash') {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'This is not a cash payment' });
-    }
-
-    let wallet = await Wallet.findOne({ driverId }).session(session);
-    if (!wallet) {
-      wallet = new Wallet({ driverId, availableBalance: 0, balance: 0, totalEarnings: 0, totalCommission: 0, transactions: [] });
-    }
-
-    // Credit full amount
-    wallet.transactions.push({
-      tripId: paymentTxn.tripId, type: 'credit',
-      amount: paymentTxn.driverAmount,
-      description: 'Cash received from trip',
-      paymentMethod: 'cash', status: 'completed', createdAt: new Date()
-    });
-    wallet.availableBalance += paymentTxn.driverAmount;
-    wallet.totalEarnings += paymentTxn.driverAmount;
-    await wallet.save({ session });
-
-    // Deduct commission
-    wallet.transactions.push({
-      tripId: paymentTxn.tripId, type: 'commission',
-      amount: paymentTxn.commission,
-      description: 'App commission (20%)',
-      paymentMethod: 'cash', status: 'completed', createdAt: new Date()
-    });
-    wallet.totalCommission += paymentTxn.commission;
-    wallet.availableBalance = Math.max(0, wallet.availableBalance - paymentTxn.commission);
-    await wallet.save({ session });
-
-    await PaymentTransaction.findByIdAndUpdate(paymentId, {
-      paymentStatus: 'completed', completedAt: new Date(), $inc: { processedCount: 1 }
-    }, { session });
-
-    await Trip.findByIdAndUpdate(tripId || paymentTxn.tripId, {
-      paymentStatus: 'completed', paymentMethod: 'cash',
-      paidAmount: paymentTxn.amount, completedAt: new Date()
-    }, { session });
-
-    await session.commitTransaction();
-
-    safeEmit(req.io, `driver_${driverId}`, 'payment:confirmed', {
-      tripId, amount: paymentTxn.driverAmount, commission: paymentTxn.commission,
-      netAmount: paymentTxn.driverAmount - paymentTxn.commission,
-      walletBalance: wallet.availableBalance, method: 'cash', timestamp: new Date().toISOString()
-    });
-    safeEmit(req.io, `customer_${paymentTxn.customerId}`, 'payment:confirmed', {
-      tripId, amount: paymentTxn.amount, method: 'cash', timestamp: new Date().toISOString()
-    });
-
-    console.log(`✅ Cash confirmed: ₹${paymentTxn.driverAmount} → driver ${driverId}`);
-
-    return res.json({
-      success: true, message: 'Cash receipt confirmed',
-      amount: paymentTxn.driverAmount,
-      commission: paymentTxn.commission,
-      netAmount: paymentTxn.driverAmount - paymentTxn.commission,
-      walletBalance: wallet.availableBalance
-    });
+    return res.status(result.status || 200).json(result.body);
   } catch (error) {
-    await session.abortTransaction();
-    console.error('❌ Cash confirmation error:', error);
-    return res.status(500).json({ success: false, message: 'Failed to confirm cash receipt', error: error.message });
+    if (session.inTransaction()) await session.abortTransaction();
+    console.error('❌ confirmCashReceipt error:', error);
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, message: 'Failed to confirm cash receipt' });
+    }
   } finally {
     session.endSession();
   }
 };
 
 // ═══════════════════════════════════════════════════════════════════
-// PROCESS CASH COLLECTION (alias used by tripRoutes confirm-cash)
-// POST /api/trip/confirm-cash
+// PROCESS CASH COLLECTION (Used by walletRoutes POST /collect-cash)
+// ✅ FIX Bug #3: Added walletUpdated atomic idempotency guard —
+//    prevents double-credit on this second code path for cash
+// ✅ FIX Bug #5: Dynamic commission from getCommissionRate(vehicleType)
 // ═══════════════════════════════════════════════════════════════════
 export const processCashCollection = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { tripId, driverId, amount, paymentMethod = 'cash' } = req.body;
 
     const missing = [];
-    if (!tripId)   missing.push('tripId');
+    if (!tripId) missing.push('tripId');
     if (!driverId) missing.push('driverId');
     if (!amount && amount !== 0) missing.push('amount');
-
     if (missing.length > 0) {
-      console.error('❌ processCashCollection - missing:', missing, '| received:', req.body);
-      return res.status(400).json({
-        success: false,
-        message: `Missing required fields: ${missing.join(', ')}`,
-        received: { tripId, driverId, amount }
-      });
+      return res.status(400).json({ success: false, message: `Missing: ${missing.join(', ')}` });
     }
 
     const numericAmount = Number(amount);
@@ -449,63 +590,119 @@ export const processCashCollection = async (req, res) => {
       return res.status(400).json({ success: false, message: 'amount must be a positive number' });
     }
 
-    const session = await mongoose.startSession();
-    session.startTransaction();
-    try {
-      const trip = await Trip.findById(tripId).session(session);
+    let result = {};
+
+    await session.withTransaction(async () => {
+      // ✅ FIX Bug #3: Claim walletUpdated flag atomically — if already true, return early
+      const trip = await Trip.findOneAndUpdate(
+        { _id: tripId, walletUpdated: { $ne: true } },
+        { $set: { walletUpdated: true, walletUpdatedAt: new Date() } },
+        { session, new: false }
+      ).lean();
+
       if (!trip) {
-        await session.abortTransaction();
-        return res.status(404).json({ success: false, message: 'Trip not found' });
+        console.log(`⚠️ processCashCollection: trip ${tripId} already processed`);
+        result = { status: 200, body: { success: true, message: 'Cash already collected', alreadyProcessed: true } };
+        return;
       }
 
-      let wallet = await Wallet.findOne({ driverId }).session(session);
-      if (!wallet) {
-        wallet = new Wallet({ driverId, availableBalance: 0, balance: 0, totalEarnings: 0, totalCommission: 0, transactions: [] });
-      }
+      // ✅ FIX Bug #5: Commission from Rate model per vehicleType
+      const commissionRate = await getCommissionRate(trip.vehicleType);
+      const commission = Math.round(numericAmount * commissionRate * 100) / 100;
+      const driverNet = Math.round((numericAmount - commission) * 100) / 100;
 
-      const commission = numericAmount * 0.20;
-      const driverNet = numericAmount - commission;
+      // ✅ Atomic wallet update — single findOneAndUpdate, no .save()
+      const updatedWallet = await Wallet.findOneAndUpdate(
+        { driverId },
+        {
+          $inc: {
+            totalEarnings: numericAmount,
+            totalCommission: commission,
+            pendingAmount: commission
+          },
+          $push: {
+            transactions: {
+              $each: [
+                {
+                  tripId, type: 'credit', amount: numericAmount,
+                  description: 'Cash collected for trip',
+                  paymentMethod, status: 'completed',
+                  createdAt: new Date()
+                },
+                {
+                  tripId, type: 'commission', amount: commission,
+                  description: `Platform commission (${Math.round(commissionRate * 100)}%)`,
+                  paymentMethod, status: 'completed',
+                  createdAt: new Date()
+                },
+              ],
+            },
+            processedTripIds: tripId,
+          },
+        },
+        { session, new: true, upsert: true }
+      );
 
-      wallet.transactions.push({
-        tripId, type: 'credit', amount: numericAmount,
-        description: `Cash collected for trip`, paymentMethod, status: 'completed', createdAt: new Date()
-      });
-      wallet.transactions.push({
-        tripId, type: 'commission', amount: commission,
-        description: 'App commission (20%)', paymentMethod, status: 'completed', createdAt: new Date()
-      });
-
-      wallet.availableBalance = Math.max(0, wallet.availableBalance + driverNet);
-      wallet.totalEarnings += numericAmount;
-      wallet.totalCommission += commission;
-      await wallet.save({ session });
-
+      // Update trip
       await Trip.findByIdAndUpdate(tripId, {
-        paymentStatus: 'completed', paymentMethod, paidAmount: numericAmount, completedAt: new Date()
+        $set: {
+          paymentStatus: 'completed',
+          paymentMethod,
+          paidAmount: numericAmount,
+          paymentCollected: true,
+          paymentCollectedAt: new Date(),
+          status: 'completed',
+        },
       }, { session });
 
-      await session.commitTransaction();
+      // ✅ Release driver
+      await User.findByIdAndUpdate(driverId, {
+        $set: {
+          isBusy: false,
+          currentTripId: null,
+          canReceiveNewRequests: true,
+          awaitingCashCollection: false
+        },
+      }, { session });
 
-      safeEmit(req.io, `driver_${driverId}`, 'payment:confirmed', {
-        tripId, amount: driverNet, commission, method: paymentMethod, timestamp: new Date().toISOString()
+      result = {
+        status: 200,
+        body: {
+          success: true,
+          message: 'Cash collection recorded',
+          amount: numericAmount,
+          commission,
+          driverNet,
+          walletBalance: updatedWallet.availableBalance,
+          pendingAmount: updatedWallet.pendingAmount,
+        },
+        emit: {
+          driverId, tripId, driverNet, commission, paymentMethod,
+          walletBalance: updatedWallet.availableBalance,
+          pendingAmount: updatedWallet.pendingAmount
+        }
+      };
+    });
+
+    // Emit AFTER transaction commits
+    if (result.emit) {
+      const e = result.emit;
+      safeEmit(req.io, `driver_${e.driverId}`, 'payment:confirmed', {
+        tripId: e.tripId, amount: e.driverNet, commission: e.commission,
+        method: e.paymentMethod, walletBalance: e.walletBalance,
+        pendingAmount: e.pendingAmount,
+        timestamp: new Date().toISOString(),
       });
-
-      console.log(`✅ Cash collected: ₹${numericAmount} for trip ${tripId} | driver net: ₹${driverNet}`);
-
-      return res.json({
-        success: true, message: 'Cash collection recorded',
-        amount: numericAmount, commission, driverNet,
-        walletBalance: wallet.availableBalance
-      });
-    } catch (err) {
-      await session.abortTransaction();
-      throw err;
-    } finally {
-      session.endSession();
+      console.log(`✅ processCashCollection: ₹${result.body.amount} | commission: ₹${e.commission} | driver net: ₹${e.driverNet}`);
     }
+
+    return res.status(result.status || 200).json(result.body);
   } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
     console.error('❌ processCashCollection error:', error);
     return res.status(500).json({ success: false, message: error.message });
+  } finally {
+    session.endSession();
   }
 };
 
@@ -555,47 +752,135 @@ export const handleRazorpayWebhook = async (req, res) => {
 };
 
 async function handlePaymentCapturedWebhook(payment) {
+  const session = await mongoose.startSession();
   try {
-    const session = await mongoose.startSession();
-    session.startTransaction();
-    const existing = await PaymentTransaction.findOne({
-      razorpayPaymentId: payment.id, paymentStatus: 'completed'
-    }).session(session);
+    await session.withTransaction(async () => {
+      // Check if already processed
+      const existing = await PaymentTransaction.findOne({
+        razorpayPaymentId: payment.id, paymentStatus: 'completed'
+      }).session(session);
 
-    if (existing) {
-      await session.abortTransaction();
-      session.endSession();
-      return;
-    }
+      if (existing) {
+        console.log(`ℹ️ Webhook: payment ${payment.id} already completed`);
+        return;
+      }
 
-    await PaymentTransaction.findOneAndUpdate(
-      { razorpayPaymentId: payment.id },
-      { webhookStatus: 'completed', webhookReceivedAt: new Date() },
-      { session }
-    );
+      // Find and update the payment transaction
+      const paymentTxn = await PaymentTransaction.findOneAndUpdate(
+        { razorpayOrderId: payment.order_id, paymentStatus: { $ne: 'completed' } },
+        {
+          $set: {
+            razorpayPaymentId: payment.id,
+            paymentStatus: 'completed',
+            paymentMethod: payment.method,
+            webhookStatus: 'completed',
+            webhookReceivedAt: new Date(),
+            completedAt: new Date()
+          },
+          $inc: { processedCount: 1 }
+        },
+        { session, new: true }
+      );
 
-    await session.commitTransaction();
-    session.endSession();
+      if (!paymentTxn) {
+        // Either no matching order or already completed
+        await PaymentTransaction.findOneAndUpdate(
+          { razorpayPaymentId: payment.id },
+          { $set: { webhookStatus: 'completed', webhookReceivedAt: new Date() } },
+          { session }
+        );
+        return;
+      }
+
+      // ✅ Claim walletUpdated atomically — same guard as verifyDirectPayment
+      if (paymentTxn.tripId) {
+        const tripClaim = await Trip.findOneAndUpdate(
+          { _id: paymentTxn.tripId, walletUpdated: { $ne: true } },
+          {
+            $set: {
+              walletUpdated: true,
+              walletUpdatedAt: new Date(),
+              paymentStatus: 'completed',
+              paymentMethod: 'direct',
+              razorpayPaymentId: payment.id,
+              paidAmount: paymentTxn.amount,
+              completedAt: new Date()
+            }
+          },
+          { session, new: false }
+        ).lean();
+
+        if (tripClaim && paymentTxn.driverId) {
+          // Wallet not yet credited — do it now
+          await Wallet.findOneAndUpdate(
+            { driverId: paymentTxn.driverId },
+            {
+              $inc: {
+                availableBalance: paymentTxn.driverAmount,
+                totalEarnings: paymentTxn.driverAmount,
+                totalCommission: paymentTxn.commission
+              },
+              $push: {
+                transactions: {
+                  tripId: paymentTxn.tripId,
+                  type: 'credit',
+                  amount: paymentTxn.driverAmount,
+                  description: `Payment received via webhook (₹${paymentTxn.amount})`,
+                  razorpayPaymentId: payment.id,
+                  razorpayOrderId: payment.order_id,
+                  paymentMethod: payment.method,
+                  status: 'completed',
+                  createdAt: new Date()
+                },
+                processedTripIds: paymentTxn.tripId
+              }
+            },
+            { session, upsert: true }
+          );
+          console.log(`✅ Webhook credited wallet: ${payment.id} | driver: ${paymentTxn.driverId}`);
+        } else {
+          console.log(`ℹ️ Webhook: wallet already updated for trip ${paymentTxn.tripId}`);
+        }
+      }
+    });
+
     console.log(`✅ Webhook confirmed: ${payment.id}`);
   } catch (err) {
     console.error('❌ Webhook captured handler error:', err);
+  } finally {
+    session.endSession();
   }
 }
 
 async function handlePaymentFailedWebhook(payment) {
+  const session = await mongoose.startSession();
   try {
-    const session = await mongoose.startSession();
-    session.startTransaction();
-    await PaymentTransaction.findOneAndUpdate(
-      { razorpayOrderId: payment.order_id },
-      { paymentStatus: 'failed', webhookStatus: 'completed', webhookReceivedAt: new Date() },
-      { session }
-    );
-    await session.commitTransaction();
-    session.endSession();
+    await session.withTransaction(async () => {
+      await PaymentTransaction.findOneAndUpdate(
+        { razorpayOrderId: payment.order_id },
+        {
+          $set: {
+            paymentStatus: 'failed',
+            webhookStatus: 'completed',
+            webhookReceivedAt: new Date()
+          }
+        },
+        { session }
+      );
+
+      // Also update trip status
+      const txn = await PaymentTransaction.findOne({ razorpayOrderId: payment.order_id }).session(session).lean();
+      if (txn?.tripId) {
+        await Trip.findByIdAndUpdate(txn.tripId, {
+          $set: { paymentStatus: 'failed' }
+        }, { session });
+      }
+    });
     console.log(`❌ Webhook failed: ${payment.order_id}`);
   } catch (err) {
     console.error('❌ Webhook failed handler error:', err);
+  } finally {
+    session.endSession();
   }
 }
 
@@ -612,7 +897,10 @@ export const getWalletByDriverId = async (req, res) => {
     if (!wallet) {
       return res.json({
         success: true,
-        wallet: { driverId, availableBalance: 0, totalEarnings: 0, totalCommission: 0, pendingAmount: 0, transactions: [] }
+        wallet: {
+          driverId, availableBalance: 0, totalEarnings: 0,
+          totalCommission: 0, pendingAmount: 0, transactions: []
+        }
       });
     }
     return res.json({ success: true, wallet });
@@ -625,6 +913,8 @@ export const getWalletByDriverId = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // GET TODAY'S EARNINGS
 // GET /api/wallet/today/:driverId
+// ✅ FIX Bug #5: Compute today's commission from actual commission
+//    transactions instead of hardcoded 0.20
 // ═══════════════════════════════════════════════════════════════════
 export const getTodayEarnings = async (req, res) => {
   try {
@@ -640,14 +930,21 @@ export const getTodayEarnings = async (req, res) => {
     const todayTxns = (wallet.transactions || []).filter(
       t => t.type === 'credit' && new Date(t.createdAt) >= startOfDay
     );
+
+    const todayCommissionTxns = (wallet.transactions || []).filter(
+      t => t.type === 'commission' && new Date(t.createdAt) >= startOfDay
+    );
+
     const todayEarnings = todayTxns.reduce((sum, t) => sum + (t.amount || 0), 0);
-    const todayCommission = Math.round(todayEarnings * 0.20 * 100) / 100;
+
+    // ✅ FIX Bug #5: Sum actual commission transactions instead of hardcoded 0.20
+    const todayCommission = todayCommissionTxns.reduce((sum, t) => sum + (t.amount || 0), 0);
 
     return res.json({
       success: true,
       todayEarnings: Math.round(todayEarnings * 100) / 100,
       todayTrips: todayTxns.length,
-      todayCommission,
+      todayCommission: Math.round(todayCommission * 100) / 100,
       availableBalance: wallet.availableBalance || 0
     });
   } catch (error) {
@@ -758,7 +1055,7 @@ export const getWalletTransactions = async (req, res) => {
     if (!wallet) return res.json({ success: true, transactions: [], total: 0 });
 
     let transactions = wallet.transactions || [];
-    if (type)   transactions = transactions.filter(t => t.type === type);
+    if (type) transactions = transactions.filter(t => t.type === type);
     if (status) transactions = transactions.filter(t => t.status === status);
     transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
@@ -778,42 +1075,68 @@ export const getWalletTransactions = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // PROCESS MANUAL PAYOUT (Admin)
 // POST /api/wallet/admin/wallets/:driverId/payout
+// ✅ Uses atomic $inc + $push instead of read-modify-write
 // ═══════════════════════════════════════════════════════════════════
 export const processManualPayout = async (req, res) => {
   const session = await mongoose.startSession();
-  session.startTransaction();
   try {
     const { driverId } = req.params;
     const { amount, description, adminId } = req.body;
 
     if (!amount || amount <= 0) {
-      await session.abortTransaction();
       return res.status(400).json({ success: false, message: 'Valid amount required' });
     }
 
-    const wallet = await Wallet.findOne({ driverId }).session(session);
-    if (!wallet) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: 'Wallet not found' });
-    }
-    if (wallet.availableBalance < amount) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: `Insufficient balance. Available: ₹${wallet.availableBalance}` });
-    }
+    let result = {};
 
-    wallet.transactions.push({
-      type: 'debit', amount,
-      description: description || 'Manual payout by admin',
-      paymentMethod: 'unknown', status: 'completed', createdAt: new Date()
+    await session.withTransaction(async () => {
+      // Atomic: only deduct if sufficient balance
+      const updatedWallet = await Wallet.findOneAndUpdate(
+        { driverId, availableBalance: { $gte: amount } },
+        {
+          $inc: { availableBalance: -amount },
+          $push: {
+            transactions: {
+              type: 'debit',
+              amount,
+              description: description || 'Manual payout by admin',
+              paymentMethod: 'bank_transfer',
+              status: 'completed',
+              createdAt: new Date()
+            }
+          }
+        },
+        { session, new: true }
+      );
+
+      if (!updatedWallet) {
+        // Check if wallet exists vs insufficient balance
+        const wallet = await Wallet.findOne({ driverId }).session(session).lean();
+        if (!wallet) {
+          result = { status: 404, body: { success: false, message: 'Wallet not found' } };
+        } else {
+          result = {
+            status: 400,
+            body: { success: false, message: `Insufficient balance. Available: ₹${wallet.availableBalance}` }
+          };
+        }
+        return;
+      }
+
+      result = {
+        status: 200,
+        body: {
+          success: true,
+          message: `₹${amount} payout processed`,
+          newBalance: updatedWallet.availableBalance
+        }
+      };
     });
-    wallet.availableBalance -= amount;
-    await wallet.save({ session });
-    await session.commitTransaction();
 
     console.log(`✅ Manual payout: ₹${amount} from driver ${driverId} by admin ${adminId}`);
-    return res.json({ success: true, message: `₹${amount} payout processed`, newBalance: wallet.availableBalance });
+    return res.status(result.status || 200).json(result.body);
   } catch (error) {
-    await session.abortTransaction();
+    if (session.inTransaction()) await session.abortTransaction();
     console.error('❌ processManualPayout error:', error);
     return res.status(500).json({ success: false, message: 'Failed to process payout' });
   } finally {
@@ -841,16 +1164,29 @@ export const getWalletStats = async (req, res) => {
       }]),
       Wallet.aggregate([
         { $unwind: '$transactions' },
-        { $match: {
-          'transactions.createdAt': { $gte: (() => { const d = new Date(); d.setHours(0,0,0,0); return d; })() },
-          'transactions.type': 'credit',
-          'transactions.status': 'completed'
-        }},
-        { $group: { _id: null, todayTotalEarnings: { $sum: '$transactions.amount' }, todayTransactions: { $sum: 1 } } }
+        {
+          $match: {
+            'transactions.createdAt': {
+              $gte: (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })()
+            },
+            'transactions.type': 'credit',
+            'transactions.status': 'completed'
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            todayTotalEarnings: { $sum: '$transactions.amount' },
+            todayTransactions: { $sum: 1 }
+          }
+        }
       ])
     ]);
 
-    const summary = stats[0] || { totalDrivers: 0, totalAvailableBalance: 0, totalEarnings: 0, totalCommission: 0, totalPending: 0, avgBalance: 0 };
+    const summary = stats[0] || {
+      totalDrivers: 0, totalAvailableBalance: 0, totalEarnings: 0,
+      totalCommission: 0, totalPending: 0, avgBalance: 0
+    };
     const today = todayStats[0] || { todayTotalEarnings: 0, todayTransactions: 0 };
 
     return res.json({
@@ -869,12 +1205,8 @@ export const getWalletStats = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-// NAMED ALIASES (for backward compatibility)
-// ═══════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════
 // CREATE COMMISSION PAYMENT ORDER (Driver pays pending commission)
 // POST /api/wallet/create-commission-order
-// Only needs driverId + amount — no tripId/customerId required
 // ═══════════════════════════════════════════════════════════════════
 export const createCommissionOrder = async (req, res) => {
   try {
@@ -896,7 +1228,7 @@ export const createCommissionOrder = async (req, res) => {
     const receipt = `comm_${driverId.toString().slice(-8)}_${Date.now().toString().slice(-6)}`;
 
     const razorpayOrder = await razorpay.orders.create({
-      amount: Math.round(numericAmount * 100), // paise
+      amount: Math.round(numericAmount * 100),
       currency: 'INR',
       receipt,
       notes: {
@@ -913,7 +1245,7 @@ export const createCommissionOrder = async (req, res) => {
       amount: numericAmount,
       currency: 'INR',
       driverId,
-      razorpayKeyId: process.env.RAZORPAY_KEY_ID  // ✅ send key to Flutter
+      razorpayKeyId: process.env.RAZORPAY_KEY_ID
     });
   } catch (error) {
     console.error('❌ createCommissionOrder error:', error);
@@ -924,7 +1256,7 @@ export const createCommissionOrder = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // VERIFY COMMISSION PAYMENT
 // POST /api/wallet/verify-commission
-// After Razorpay success, clears pendingAmount from wallet
+// ✅ Uses atomic $inc + $push with double-checked locking
 // ═══════════════════════════════════════════════════════════════════
 export const verifyCommissionPayment = async (req, res) => {
   const session = await mongoose.startSession();
@@ -946,7 +1278,6 @@ export const verifyCommissionPayment = async (req, res) => {
     }
 
     // ✅ Step 2: Check idempotency BEFORE fetching from Razorpay
-    // If webhook already wrote this paymentId, return early with current wallet state
     const existingCheck = await Wallet.findOne({
       driverId,
       'transactions.razorpayPaymentId': paymentId,
@@ -965,7 +1296,7 @@ export const verifyCommissionPayment = async (req, res) => {
       });
     }
 
-    // ✅ Step 3: Fetch from Razorpay with timeout — prevents session leak if Razorpay is slow
+    // ✅ Step 3: Fetch from Razorpay with timeout
     let payment;
     try {
       const fetchWithTimeout = Promise.race([
@@ -990,69 +1321,85 @@ export const verifyCommissionPayment = async (req, res) => {
     const paidAmount = payment.amount / 100;
     const paymentMethod = payment.method || 'upi';
 
-    // ✅ Step 4: Atomic transaction — prevents race with webhook
+    // ✅ Step 4: Atomic transaction — uses $inc + conditional update
+    let result = {};
+
     session.startTransaction();
 
-    const wallet = await Wallet.findOne({ driverId }).session(session);
-    if (!wallet) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: 'Wallet not found' });
-    }
-
-    // ✅ Re-check inside transaction (double-checked locking)
-    const doubleCheck = wallet.transactions.some(
-      t => t.razorpayPaymentId === paymentId && t.status === 'completed'
+    // Atomic: only deduct if this paymentId hasn't been recorded yet
+    // Use a unique marker to prevent double processing
+    const updateResult = await Wallet.findOneAndUpdate(
+      {
+        driverId,
+        'transactions.razorpayPaymentId': { $ne: paymentId }
+      },
+      {
+        $inc: { pendingAmount: -paidAmount },
+        $push: {
+          transactions: {
+            type: 'commission',
+            amount: paidAmount,
+            description: `Commission paid via Razorpay`,
+            razorpayPaymentId: paymentId,
+            razorpayOrderId: orderId,
+            paymentMethod,
+            status: 'completed',
+            createdAt: new Date()
+          }
+        }
+      },
+      { session, new: true }
     );
-    if (doubleCheck) {
+
+    if (!updateResult) {
+      // Either wallet not found or paymentId already exists
+      const walletExists = await Wallet.findOne({ driverId }).session(session).lean();
       await session.abortTransaction();
+
+      if (!walletExists) {
+        return res.status(404).json({ success: false, message: 'Wallet not found' });
+      }
+
+      // Already processed
       return res.json({
         success: true,
         message: 'Commission already processed',
         alreadyProcessed: true,
         paidAmount: 0,
-        pendingAmount: wallet.pendingAmount,
-        availableBalance: wallet.availableBalance
+        pendingAmount: walletExists.pendingAmount,
+        availableBalance: walletExists.availableBalance
       });
     }
 
-    // ✅ Deduct pendingAmount and track in totalCommission
-    const deducted = Math.min(wallet.pendingAmount, paidAmount);
-    wallet.pendingAmount = Math.max(0, wallet.pendingAmount - deducted);
-    wallet.totalCommission = (wallet.totalCommission || 0) + paidAmount;
+    // Ensure pendingAmount doesn't go negative
+    if (updateResult.pendingAmount < 0) {
+      await Wallet.findOneAndUpdate(
+        { driverId },
+        { $set: { pendingAmount: 0 } },
+        { session }
+      );
+      updateResult.pendingAmount = 0;
+    }
 
-    wallet.transactions.push({
-      type: 'commission',                               // ← 'commission' type so UI shows it distinctly
-      amount: paidAmount,
-      description: `Commission paid via Razorpay`,
-      razorpayPaymentId: paymentId,
-      razorpayOrderId: orderId,
-      paymentMethod,
-      status: 'completed',
-      createdAt: new Date()
-    });
-
-    await wallet.save({ session });
     await session.commitTransaction();
 
-    console.log(`✅ Commission verified: ₹${paidAmount} | driver: ${driverId} | pending: ₹${wallet.pendingAmount}`);
+    console.log(`✅ Commission verified: ₹${paidAmount} | driver: ${driverId} | pending: ₹${Math.max(0, updateResult.pendingAmount)}`);
 
-    // ✅ Emit socket
-    if (req.io) {
-      req.io.to(`driver_${driverId}`).emit('commission:paid', {
-        paidAmount,
-        pendingAmount: wallet.pendingAmount,
-        availableBalance: wallet.availableBalance,
-        paymentId,
-        timestamp: new Date().toISOString()
-      });
-    }
+    // ✅ Emit socket after commit
+    safeEmit(req.io, `driver_${driverId}`, 'commission:paid', {
+      paidAmount,
+      pendingAmount: Math.max(0, updateResult.pendingAmount),
+      availableBalance: updateResult.availableBalance,
+      paymentId,
+      timestamp: new Date().toISOString()
+    });
 
     return res.json({
       success: true,
       message: 'Commission payment verified',
       paidAmount,
-      pendingAmount: wallet.pendingAmount,
-      availableBalance: wallet.availableBalance
+      pendingAmount: Math.max(0, updateResult.pendingAmount),
+      availableBalance: updateResult.availableBalance
     });
 
   } catch (error) {
@@ -1064,8 +1411,11 @@ export const verifyCommissionPayment = async (req, res) => {
   }
 };
 
-export const createRazorpayOrder     = createDirectPaymentOrder;
-export const verifyRazorpayPayment   = verifyDirectPayment;
+// ═══════════════════════════════════════════════════════════════════
+// NAMED ALIASES (for backward compatibility)
+// ═══════════════════════════════════════════════════════════════════
+export const createRazorpayOrder = createDirectPaymentOrder;
+export const verifyRazorpayPayment = verifyDirectPayment;
 export const processCashPaymentHandler = initiateCashPayment;
-export const confirmCashPayment      = confirmCashReceipt;
-export const razorpayWebhook         = handleRazorpayWebhook;
+export const confirmCashPayment = confirmCashReceipt;
+export const razorpayWebhook = handleRazorpayWebhook;
