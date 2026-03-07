@@ -90,7 +90,7 @@ app.use(cors({
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 'x-admin-token'],
+allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 'x-admin-token'],
   exposedHeaders: ['Content-Range', 'X-Content-Range']
 }));
 
@@ -283,25 +283,12 @@ app.use((req, res) => {
 });
 
 /**
- * ✅ #10 Network Handling — Global Error Handler
- * Tags errors as retryable/non-retryable so the app can show
- * "Retry" vs "Something went wrong" UI appropriately.
+ * Error Handler
  */
 app.use((err, req, res, _next) => {
-  const status = err.status || err.statusCode || 500;
-  const isRetryable = status >= 500 || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
-  const isDbError = err.name === 'MongoNetworkError' || err.name === 'MongoTimeoutError';
-
-  console.error(`❌ [${status}] ${req.method} ${req.path} — ${err.message}`);
-  if (isDbError) console.error('   DB error:', err.name);
-
-  res.status(status).json({
-    success: false,
+  console.error('❌ Server error:', err);
+  res.status(err.status || 500).json({
     message: err.message || '🚨 Internal Server Error',
-    error_code: err.code || err.name || 'INTERNAL_ERROR',
-    // ✅ App uses this to decide whether to show a "Retry" button
-    retryable: isRetryable,
-    timestamp: new Date().toISOString(),
   });
 });
 

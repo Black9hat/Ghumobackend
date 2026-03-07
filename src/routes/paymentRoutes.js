@@ -1,37 +1,44 @@
-// src/routes/paymentRoutes.js
-// ⚠️  Razorpay webhook is NOT here.
-//     It is at: /api/webhook/razorpay  (webhookRoutes.js → webhookController.js)
-//     That route is mounted BEFORE express.json() in server.js to get the raw body.
-
+// routes/paymentRoutes.js
 import express from 'express';
 import {
   createDirectPaymentOrder,
   verifyDirectPayment,
   initiateCashPayment,
   confirmCashReceipt,
+  handleRazorpayWebhook
 } from '../controllers/paymentController.js';
 import { authenticateUser } from '../middlewares/auth.js';
 
 const router = express.Router();
 
 // ═══════════════════════════════════════════════════════════════════
-// CUSTOMER ROUTES
+// CUSTOMER PAYMENT ROUTES
 // ═══════════════════════════════════════════════════════════════════
 
-// Create Razorpay order (QR / direct payment)
+// Create Razorpay order (QR code payment)
 router.post('/direct/create', authenticateUser, createDirectPaymentOrder);
 
-// Verify payment after customer completes it in the app
+// Verify payment after customer pays
 router.post('/direct/verify', authenticateUser, verifyDirectPayment);
 
-// Customer signals they will pay cash
+// Customer chooses to pay cash
 router.post('/cash/initiate', authenticateUser, initiateCashPayment);
 
 // ═══════════════════════════════════════════════════════════════════
-// DRIVER ROUTES
+// DRIVER PAYMENT ROUTES
 // ═══════════════════════════════════════════════════════════════════
 
-// Driver confirms they received the cash
+// Driver confirms they received cash
 router.post('/cash/confirm', authenticateUser, confirmCashReceipt);
+
+// ═══════════════════════════════════════════════════════════════════
+// WEBHOOK (No auth - verified by Razorpay signature)
+// ═══════════════════════════════════════════════════════════════════
+
+router.post(
+  '/webhook/razorpay',
+  express.raw({ type: 'application/json' }),
+  handleRazorpayWebhook
+);
 
 export default router;
