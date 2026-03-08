@@ -1691,33 +1691,16 @@ const getDriverActiveTrip = async (req, res) => {
 const getActiveRide = async (req, res) => {
   try {
     const { customerId } = req.params;
-
-    // ✅ Include completed trips that are awaiting cash collection (paymentCollected=false)
     const trip = await Trip.findOne({
       customerId,
-      $or: [
-        { status: { $in: ['driver_assigned', 'driver_going_to_pickup', 'driver_at_pickup', 'ride_started'] } },
-        { status: 'completed', paymentCollected: { $ne: true } }
-      ]
+      status: { $in: ['driver_assigned', 'driver_going_to_pickup', 'driver_at_pickup', 'ride_started'] }
     }).populate('assignedDriver', 'name phone photoUrl rating vehicleBrand vehicleNumber location').lean();
 
     if (!trip) return res.status(200).json({ success: true, hasActiveRide: false });
 
-    // ✅ If completed but cash not yet collected → still an "active" ride for the customer
-    const awaitingCashCollection = trip.status === 'completed' && !trip.paymentCollected;
-
     res.status(200).json({
-      success: true,
-      hasActiveRide: true,
-      awaitingCashCollection,
-      trip: {
-        tripId: trip._id.toString(),
-        status: trip.status,
-        fare: trip.fare,
-        finalFare: trip.finalFare || trip.fare,
-        paymentCollected: trip.paymentCollected || false,
-        awaitingCashCollection
-      },
+      success: true, hasActiveRide: true,
+      trip: { tripId: trip._id.toString(), status: trip.status, fare: trip.fare },
       driver: trip.assignedDriver
     });
   } catch (err) {
