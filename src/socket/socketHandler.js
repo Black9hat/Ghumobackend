@@ -1334,6 +1334,109 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
+    // DRIVER CASH COLLECTED — triggered when driver clicks "Cash Collected" button
+    // This is the TRUE completion event. Both driver and customer leave ride screen.
+    // =========================================================================
+    socket.on('driver:cash_collected', async ({ tripId, driverId, fare }) => {
+      try {
+        console.log(`\n💰 ═══════════════════════════════════════════════`);
+        console.log(`💰 DRIVER CASH COLLECTED (Socket)`);
+        console.log(`   Trip: ${tripId} | Driver: ${driverId} | Fare: ₹${fare}`);
+        console.log(`💰 ═══════════════════════════════════════════════`);
+
+        const trip = await Trip.findById(tripId);
+        if (!trip) {
+          socket.emit('cash_collection_error', { message: 'Trip not found' });
+          return;
+        }
+
+        if (trip.assignedDriver?.toString() !== driverId) {
+          socket.emit('cash_collection_error', { message: 'Not authorized' });
+          return;
+        }
+
+        if (trip.status !== 'completed') {
+          socket.emit('cash_collection_error', { message: 'Ride must be completed first' });
+          return;
+        }
+
+        if (trip.paymentCollected === true) {
+          // Already collected — just send the confirmation events silently
+          socket.emit('payment:confirmed', { tripId, alreadyProcessed: true });
+          return;
+        }
+
+        // ── Mark payment collected ──────────────────────────────────────────
+        const fareAmount = Number(fare) || trip.finalFare || trip.fare || 0;
+        const COMMISSION_RATE = 0.20;
+        const commission    = Math.round(fareAmount * COMMISSION_RATE * 100) / 100;
+        const driverEarning = Math.round((fareAmount - commission) * 100) / 100;
+
+        await Trip.findByIdAndUpdate(tripId, {
+          $set: {
+            paymentCollected: true,
+            paymentStatus: 'completed',
+            paymentMethod: 'cash',
+            paidAmount: fareAmount,
+            paymentCompletedAt: new Date()
+          },
+          $inc: { version: 1 }
+        });
+
+        // ── Release driver ──────────────────────────────────────────────────
+        await User.findByIdAndUpdate(driverId, {
+          $set: {
+            isBusy: false,
+            currentTripId: null,
+            canReceiveNewRequests: true,
+            awaitingCashCollection: false,
+            lastTripCompletedAt: new Date()
+          }
+        });
+
+        console.log(`✅ Trip ${tripId} — payment marked collected, driver released`);
+
+        // ── Find customer socket ────────────────────────────────────────────
+        const customerIdStr = trip.customerId.toString();
+        let customerSocketId = null;
+        for (const [socketId, custId] of connectedCustomers.entries()) {
+          if (custId === customerIdStr) {
+            customerSocketId = socketId;
+            break;
+          }
+        }
+
+        const payload = {
+          tripId: tripId.toString(),
+          fare: fareAmount,
+          message: 'Driver confirmed cash received. Thank you!',
+          timestamp: new Date().toISOString()
+        };
+
+        // ── Notify customer → go off ride screen ───────────────────────────
+        if (customerSocketId) {
+          io.to(customerSocketId).emit('trip:cash_collected', payload);
+          console.log(`✅ Sent trip:cash_collected to customer`);
+        }
+
+        // ── Notify driver → go off ride screen ────────────────────────────
+        socket.emit('payment:confirmed', {
+          tripId: tripId.toString(),
+          amount: fareAmount,
+          driverAmount: driverEarning,
+          commission,
+          method: 'cash',
+          timestamp: new Date().toISOString()
+        });
+
+        console.log(`✅ Cash collection complete for trip ${tripId}`);
+      } catch (e) {
+        console.error('❌ driver:cash_collected error:', e);
+        socket.emit('cash_collection_error', { message: 'Failed to confirm cash: ' + e.message });
+      }
+    });
+
+    // =========================================================================
     // DRIVER GOING TO PICKUP
     // =========================================================================
     socket.on('driver:going_to_pickup', async ({ tripId, driverId }) => {
