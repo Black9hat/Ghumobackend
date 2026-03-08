@@ -1,0 +1,14 @@
+Revert "2"
+
+This reverts commit c41ce5a457971d06459b3a987942ba8ceef6b9d6.
+
+# Please enter the commit message for your changes. Lines starting
+# with '#' will be ignored, and an empty message aborts the commit.
+#
+# On branch main
+# Your branch is up to date with 'origin/main'.
+#
+# Changes to be committed:
+#	modified:   src/controllers/tripController.js
+#	modified:   src/socket/socketHandler.js
+#
