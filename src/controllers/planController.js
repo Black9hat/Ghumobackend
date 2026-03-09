@@ -68,7 +68,7 @@ export const createPlan = async (req, res) => {
       monthlyFee: monthlyFee || 0,
       description: description || '',
       benefits: benefits || [],
-      createdBy: req.user?._id ?? null,
+      createdBy: req.admin?._id || req.admin?.id,
       isActive: true
     });
 
@@ -185,7 +185,7 @@ export const updatePlan = async (req, res) => {
       }
     }
 
-    updates.updatedBy = req.user?._id ?? null;
+    updates.updatedBy = req.admin?._id || req.admin?.id;
     updates.updatedAt = new Date();
 
     const plan = await Plan.findByIdAndUpdate(planId, updates, { new: true });
@@ -330,7 +330,7 @@ export const assignPlanToDriver = async (req, res) => {
       isActive: true,
       activatedDate,
       expiryDate,
-      createdBy: req.user?._id ?? null,
+      createdBy: req.admin?._id || req.admin?.id,
       reason: reason || ''
     });
 
@@ -456,11 +456,7 @@ export const deactivateDriverPlan = async (req, res) => {
  */
 export const getCurrentPlan = async (req, res) => {
   try {
-    const driverId = req.user?._id;
-
-    if (!driverId) {
-      return res.status(401).json({ success: false, message: 'Unauthorized' });
-    }
+    const driverId = req.user._id; // From auth middleware
 
     const driverPlan = await DriverPlan.findOne({
       driver: driverId,
@@ -522,11 +518,7 @@ export const getAvailablePlans = async (req, res) => {
  */
 export const getPlanHistory = async (req, res) => {
   try {
-    const driverId = req.user?._id;
-
-    if (!driverId) {
-      return res.status(401).json({ success: false, message: 'Unauthorized' });
-    }
+    const driverId = req.user._id;
 
     const planHistory = await DriverPlan.find({ driver: driverId })
       .populate('plan')
