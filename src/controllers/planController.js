@@ -36,7 +36,7 @@ export const createPlan = async (req, res) => {
       });
     }
 
-    if (![0, 100].some(v => commissionRate >= v && commissionRate <= (v ? 100 : 0))) {
+    if (commissionRate < 0 || commissionRate > 100) {
       return res.status(400).json({
         success: false,
         message: 'commissionRate must be between 0 and 100'
