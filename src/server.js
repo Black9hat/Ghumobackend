@@ -19,7 +19,7 @@ import privacyRoutes from './routes/privacyRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';  // ← NEW
 import webhookRoutes from './routes/webhookRoutes.js';  // ← Razorpay webhook
 import planRoutes from './routes/planRoutes.js';
-
+import zoneRoutes from './routes/zoneroutes.js';
 // Routes
 import userRoutes from './routes/userRoutes.js';
 import authRoutes from './routes/authRoutes.js';
@@ -122,7 +122,7 @@ app.use('/api/support', supportRoutes);
 app.use('/api', adminIncentiveRoutes);
 app.use('/api/driver/incentives', driverIncentiveRoutes);
 app.use('/api', planRoutes);
-
+app.use('/api/zones', zoneRoutes);
 // Static file serving for uploaded images
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 app.use("/api/customer/banners", customerBannerRoutes);
