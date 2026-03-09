@@ -48,7 +48,7 @@ import {
 
 // Import your existing auth middleware — adjust path if needed
 import { authenticateUser as protect } from '../middlewares/auth.js';
-import { verifyAdminToken as adminOnly } from '../middleware/adminAuth.js';
+import { verifyAdminToken as adminOnly } from '../middlewares/adminAuth.js';
 const router = express.Router();
 
 // ═══════════════════════════════════════════════════════════════════
