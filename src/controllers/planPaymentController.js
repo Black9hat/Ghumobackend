@@ -113,14 +113,22 @@ export const createRazorpayPlanOrder = async (req, res) => {
       createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) }, // Last 5 minutes
     }).session(session);
 
-    if (recentOrder) {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: 'Please wait before trying to purchase this plan again',
-        existingOrderId: recentOrder.razorpayOrderId,
-      });
-    }
+   if (recentOrder) {
+  await session.abortTransaction();
+
+  console.log("⚠️ Reusing existing Razorpay order:", recentOrder.razorpayOrderId);
+
+  return res.status(200).json({
+    success: true,
+    message: "Existing order reused",
+    data: {
+      orderId: recentOrder.razorpayOrderId,
+      planId,
+      amount: recentOrder.amount,
+      razorpayKey: process.env.RAZORPAY_KEY_ID,
+    },
+  });
+}
 
     // ── Create Razorpay order ──
     if (!razorpay) {
