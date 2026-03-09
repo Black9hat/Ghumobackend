@@ -46,9 +46,12 @@ import {
   getPlanAnalytics,
 } from '../controllers/planController.js';
 
-// Import your existing auth middleware — adjust path if needed
-import { authenticateUser as protect } from '../middlewares/auth.js';
-import { verifyAdminToken as adminOnly } from '../middlewares/adminAuth.js';
+// Admin routes  → verified via JWT (adminAuth)
+import { verifyAdminToken } from '../middlewares/adminAuth.js';
+
+// Driver routes → verified via Firebase token (auth)
+import { authenticateUser as driverProtect } from '../middlewares/auth.js';
+
 const router = express.Router();
 
 // ═══════════════════════════════════════════════════════════════════
@@ -59,64 +62,59 @@ const router = express.Router();
 // the literal string "analytics" as a planId parameter.
 router.get(
   '/admin/plans/analytics',
-  protect,
-  adminOnly,
+  verifyAdminToken,
   getPlanAnalytics
 );
 
 router
   .route('/admin/plans')
-  .get(protect, adminOnly, getPlans)
-  .post(protect, adminOnly, createPlan);
+  .get(verifyAdminToken, getPlans)
+  .post(verifyAdminToken, createPlan);
 
 router
   .route('/admin/plans/:planId')
-  .get(protect, adminOnly, getPlanById)
-  .put(protect, adminOnly, updatePlan)
-  .delete(protect, adminOnly, deletePlan);
+  .get(verifyAdminToken, getPlanById)
+  .put(verifyAdminToken, updatePlan)
+  .delete(verifyAdminToken, deletePlan);
 
 // ═══════════════════════════════════════════════════════════════════
 // ADMIN — Drivers with plans
 // ═══════════════════════════════════════════════════════════════════
 
-// GET /api/admin/drivers/plans  ← the route the frontend actually fetches
+// GET /api/admin/drivers/plans
 router.get(
   '/admin/drivers/plans',
-  protect,
-  adminOnly,
+  verifyAdminToken,
   getDriversWithPlans
 );
 
 // POST /api/admin/drivers/:driverId/assign-plan
 router.post(
   '/admin/drivers/:driverId/assign-plan',
-  protect,
-  adminOnly,
+  verifyAdminToken,
   assignPlanToDriver
 );
 
-// PUT  /api/admin/drivers/:driverId/plans/:driverPlanId
+// PUT /api/admin/drivers/:driverId/plans/:driverPlanId
 router.put(
   '/admin/drivers/:driverId/plans/:driverPlanId',
-  protect,
-  adminOnly,
+  verifyAdminToken,
   updateDriverPlan
 );
 
 // POST /api/admin/drivers/:driverId/plans/:driverPlanId/deactivate
 router.post(
   '/admin/drivers/:driverId/plans/:driverPlanId/deactivate',
-  protect,
-  adminOnly,
+  verifyAdminToken,
   deactivateDriverPlan
 );
 
 // ═══════════════════════════════════════════════════════════════════
-// DRIVER — Self-service plan endpoints
+// DRIVER — Self-service plan endpoints (Firebase token)
 // ═══════════════════════════════════════════════════════════════════
 
-router.get('/driver/plans/available', protect, getAvailablePlans);
-router.get('/driver/plan/current',    protect, getCurrentPlan);
-router.get('/driver/plan/history',    protect, getPlanHistory);
+router.get('/driver/plans/available', driverProtect, getAvailablePlans);
+router.get('/driver/plan/current',    driverProtect, getCurrentPlan);
+router.get('/driver/plan/history',    driverProtect, getPlanHistory);
 
 export default router;
