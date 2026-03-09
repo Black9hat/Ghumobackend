@@ -134,7 +134,7 @@ export const createRazorpayPlanOrder = async (req, res) => {
     const razorpayOrder = await razorpay.orders.create({
       amount: Math.round(plan.planPrice * 100), // Convert to paise
       currency: 'INR',
-      receipt: `plan_${driverId}_${planId}_${Date.now()}`,
+receipt: `pl_${driverId.toString().slice(-8)}_${planId.toString().slice(-8)}_${Date.now().toString().slice(-5)}`,
       notes: {
         driverId: driverId.toString(),
         planId: planId.toString(),
