@@ -47,8 +47,8 @@ import {
 } from '../controllers/planController.js';
 
 // Import your existing auth middleware — adjust path if needed
-import { protect, adminOnly } from '../middleware/auth.js';
-
+import { authenticateUser as protect } from '../middlewares/auth.js';
+import { verifyAdminToken as adminOnly } from '../middleware/adminAuth.js';
 const router = express.Router();
 
 // ═══════════════════════════════════════════════════════════════════
