@@ -17,16 +17,19 @@ import mongoose from 'mongoose';
  */
 export const createPlan = async (req, res) => {
   try {
-    const {
-      planName,
-      planType,
-      commissionRate,
-      bonusMultiplier,
-      noCommission,
-      monthlyFee,
-      description,
-      benefits
-    } = req.body;
+   // AFTER
+const {
+  planName,
+  planType,
+  commissionRate,
+  bonusMultiplier,
+  noCommission,
+  monthlyFee,
+  planPrice,      // ← ADD
+  durationDays,   // ← ADD
+  description,
+  benefits
+} = req.body;
 
     // Validation
     if (!planName || !planType) {
@@ -59,18 +62,21 @@ export const createPlan = async (req, res) => {
       });
     }
 
-    const plan = new Plan({
-      planName,
-      planType,
-      commissionRate: noCommission ? 0 : commissionRate,
-      bonusMultiplier,
-      noCommission,
-      monthlyFee: monthlyFee || 0,
-      description: description || '',
-      benefits: benefits || [],
-      createdBy: req.admin?._id || req.admin?.id,
-      isActive: true
-    });
+   // AFTER
+const plan = new Plan({
+  planName,
+  planType,
+  commissionRate: noCommission ? 0 : commissionRate,
+  bonusMultiplier,
+  noCommission,
+  monthlyFee: monthlyFee || 0,
+  planPrice: planPrice ?? monthlyFee ?? 0,   // ← ADD (falls back to monthlyFee for backwards compat)
+  durationDays: durationDays || 30,          // ← ADD
+  description: description || '',
+  benefits: benefits || [],
+  createdBy: req.admin?._id || req.admin?.id,
+  isActive: true
+});
 
     await plan.save();
 
