@@ -55,7 +55,7 @@ const transactionSchema = new mongoose.Schema(
 
     paymentMethod: {
       type: String,
-      enum: ['upi', 'card', 'netbanking', 'wallet', 'cash', 'unknown'],
+      enum: ['upi', 'card', 'netbanking', 'wallet', 'cash', 'razorpay', 'unknown'],
       default: 'unknown',
     },
 

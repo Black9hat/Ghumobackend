@@ -84,7 +84,7 @@ const paymentPlanSchema = new mongoose.Schema(
 
     paymentMethod: {
       type: String,
-      enum: ['upi', 'card', 'netbanking', 'wallet', 'unknown'],
+      enum: ['upi', 'card', 'netbanking', 'wallet', 'cash', 'razorpay', 'unknown'],
       sparse: true,
       description: 'Payment method used by driver',
     },
