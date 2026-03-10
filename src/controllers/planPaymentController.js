@@ -91,19 +91,24 @@ export const createRazorpayPlanOrder = async (req, res) => {
     const activeDriverPlan = await DriverPlan.findOne({
       driver: driverId,
       isActive: true,
-      expiryDate: { $gte: new Date() },
+      paymentStatus: 'completed',
+      $or: [{ expiryDate: null }, { expiryDate: { $gte: new Date() } }],
     }).session(session);
 
-    // ⚠️ Optional: Prevent multiple simultaneous plans
-    // Uncomment if business requirement is "one plan per driver at a time"
-    // if (activeDriverPlan) {
-    //   await session.abortTransaction();
-    //   return res.status(400).json({
-    //     success: false,
-    //     message: 'You already have an active plan. Please wait for it to expire.',
-    //     activePlanExpiry: activeDriverPlan.expiryDate
-    //   });
-    // }
+    if (activeDriverPlan) {
+      await session.abortTransaction();
+      await session.endSession();
+      return res.status(400).json({
+        success: false,
+        message: 'You already have an active plan. Wait for it to expire.',
+        activePlanExpiry: activeDriverPlan.expiryDate,
+        daysRemaining: activeDriverPlan.expiryDate
+          ? Math.ceil(
+              (new Date(activeDriverPlan.expiryDate) - new Date()) / (1000 * 60 * 60 * 24)
+            )
+          : null,
+      });
+    }
 
     // ── Check for recent duplicate orders (prevent accidental duplicates) ──
     const recentOrder = await PaymentPlan.findOne({

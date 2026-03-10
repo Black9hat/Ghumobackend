@@ -103,11 +103,17 @@ const plan = new Plan({
  */
 export const getPlans = async (req, res) => {
   try {
-    const { active } = req.query;
+    const { active, planType, isActive } = req.query;
     let query = {};
 
-    if (active === 'true') {
+    if (active === 'true' || isActive === 'true') {
       query.isActive = true;
+    } else if (isActive === 'false') {
+      query.isActive = false;
+    }
+
+    if (planType) {
+      query.planType = planType;
     }
 
     const plans = await Plan.find(query)
@@ -227,26 +233,23 @@ export const deletePlan = async (req, res) => {
   try {
     const { planId } = req.params;
 
-    // Check if any drivers are using this plan
-    const activeDriverPlans = await DriverPlan.countDocuments({
-      plan: planId,
-      isActive: true
-    });
-
-    if (activeDriverPlans > 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot delete plan. ${activeDriverPlans} drivers are currently using it.`
-      });
-    }
-
-    const result = await Plan.findByIdAndDelete(planId);
-    if (!result) {
+    const plan = await Plan.findById(planId);
+    if (!plan) {
       return res.status(404).json({
         success: false,
         message: 'Plan not found'
       });
     }
+
+    // Block deletion if plan has ever been purchased
+    if (plan.totalPurchases > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete plan. It has been purchased ${plan.totalPurchases} time(s). Deactivate it instead.`
+      });
+    }
+
+    await Plan.findByIdAndDelete(planId);
 
     console.log(`✅ Plan deleted: ${planId}`);
 
@@ -502,7 +505,24 @@ export const getCurrentPlan = async (req, res) => {
  */
 export const getAvailablePlans = async (req, res) => {
   try {
-    const plans = await Plan.find({ isActive: true }).sort({ planType: 1 });
+    const driverId = req.user._id;
+
+    // Find plan IDs the driver currently has an active subscription for
+    const activeDriverPlans = await DriverPlan.find({
+      driver: driverId,
+      isActive: true,
+      paymentStatus: 'completed',
+      $or: [{ expiryDate: null }, { expiryDate: { $gt: new Date() } }],
+    }).select('plan').lean();
+
+    const activePlanIds = activeDriverPlans.map((dp) => dp.plan).filter(Boolean);
+
+    const query = { isActive: true };
+    if (activePlanIds.length > 0) {
+      query._id = { $nin: activePlanIds };
+    }
+
+    const plans = await Plan.find(query).sort({ planType: 1 });
 
     res.json({
       success: true,
@@ -614,6 +634,133 @@ export const calculateEarningWithPlan = async (driverId, baseEarning) => {
       appliedPlan: null,
       error: true
     };
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// TOGGLE PLAN STATUS (ADMIN)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * TOGGLE PLAN STATUS (enable/disable)
+ * PATCH /api/admin/plans/:planId/toggle
+ */
+export const togglePlanStatus = async (req, res) => {
+  try {
+    const { planId } = req.params;
+
+    const plan = await Plan.findById(planId);
+    if (!plan) {
+      return res.status(404).json({
+        success: false,
+        message: 'Plan not found'
+      });
+    }
+
+    plan.isActive = !plan.isActive;
+    plan.updatedBy = req.admin?._id || req.admin?.id;
+    await plan.save();
+
+    console.log(`✅ Plan ${plan.isActive ? 'enabled' : 'disabled'}: ${planId}`);
+
+    res.json({
+      success: true,
+      message: `Plan ${plan.isActive ? 'enabled' : 'disabled'} successfully`,
+      data: {
+        _id: plan._id,
+        planName: plan.planName,
+        isActive: plan.isActive
+      }
+    });
+  } catch (error) {
+    console.error('❌ togglePlanStatus error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to toggle plan status',
+      error: error.message
+    });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// REVENUE STATS (ADMIN)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * GET REVENUE STATS
+ * GET /api/admin/plans/stats/revenue
+ */
+export const getRevenueStats = async (req, res) => {
+  try {
+    const plans = await Plan.find({}).lean();
+
+    const totalRevenue = plans.reduce((s, p) => s + (p.totalRevenueGenerated || 0), 0);
+    const totalPurchases = plans.reduce((s, p) => s + (p.totalPurchases || 0), 0);
+    const activePlansCount = plans.filter((p) => p.isActive).length;
+
+    const mostPopularPlan = plans.reduce((best, p) => {
+      if (!best || (p.totalPurchases || 0) > (best.totalPurchases || 0)) return p;
+      return best;
+    }, null);
+
+    res.json({
+      success: true,
+      data: {
+        totalRevenue,
+        totalPurchases,
+        activePlansCount,
+        mostPopularPlan: mostPopularPlan
+          ? { planName: mostPopularPlan.planName, totalPurchases: mostPopularPlan.totalPurchases || 0 }
+          : null
+      }
+    });
+  } catch (error) {
+    console.error('❌ getRevenueStats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch revenue stats',
+      error: error.message
+    });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// PURCHASE HISTORY (ADMIN)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * GET PURCHASE HISTORY FOR A PLAN
+ * GET /api/admin/plans/:planId/purchases
+ */
+export const getPurchaseHistory = async (req, res) => {
+  try {
+    const { planId } = req.params;
+
+    const purchases = await DriverPlan.find({ plan: planId })
+      .populate('driver', 'name phone')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const mapped = purchases.map((dp) => ({
+      _id: dp._id,
+      driver: dp.driver,
+      amountPaid: dp.amountPaid ?? dp.planPrice ?? dp.monthlyFee ?? 0,
+      createdAt: dp.createdAt,
+      paymentStatus: dp.paymentStatus || 'completed',
+      expiryDate: dp.expiryDate,
+    }));
+
+    res.json({
+      success: true,
+      data: mapped
+    });
+  } catch (error) {
+    console.error('❌ getPurchaseHistory error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch purchase history',
+      error: error.message
+    });
   }
 };
 

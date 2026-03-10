@@ -9,6 +9,7 @@
 //    GET    /api/admin/plans/:planId                   → getPlanById
 //    PUT    /api/admin/plans/:planId                   → updatePlan
 //    DELETE /api/admin/plans/:planId                   → deletePlan
+//    PATCH  /api/admin/plans/:planId/toggle              → togglePlanStatus
 //
 //  ADMIN — Drivers with plans
 //    GET    /api/admin/drivers/plans                   → getDriversWithPlans
@@ -51,6 +52,9 @@ import {
   getCurrentPlan,
   getPlanHistory,
 
+  // ── Plan toggle ──
+  togglePlanStatus,
+
   // ── Analytics ──
   getPlanAnalytics,
 } from '../controllers/planController.js';
@@ -76,8 +80,10 @@ const router = express.Router();
 // ADMIN — Plan templates
 // ════════════════════════════════════════════════════════════════════════════
 
-// NOTE: /analytics must come BEFORE /:planId
+// NOTE: Static routes (/analytics, /stats/revenue) MUST come BEFORE /:planId
+// to prevent Express matching them as planId param values.
 router.get('/admin/plans/analytics', verifyAdminToken, getPlanAnalytics);
+router.get('/admin/plans/stats/revenue', verifyAdminToken, getPlanRevenueStats);
 
 router
   .route('/admin/plans')
@@ -94,8 +100,8 @@ router
 // ✨ NEW: ADMIN — Plan Purchase Analytics
 // ════════════════════════════════════════════════════════════════════════════
 
-// NOTE: Must come BEFORE /:planId routes
-router.get('/admin/plans/stats/revenue', verifyAdminToken, getPlanRevenueStats);
+// PATCH /api/admin/plans/:planId/toggle
+router.patch('/admin/plans/:planId/toggle', verifyAdminToken, togglePlanStatus);
 
 // GET /api/admin/plans/:planId/purchases
 router.get('/admin/plans/:planId/purchases', verifyAdminToken, getPlanPurchaseHistory);
