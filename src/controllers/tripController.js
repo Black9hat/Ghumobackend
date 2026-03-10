@@ -15,6 +15,7 @@ import RideHistory from '../models/RideHistory.js';
 
 import RewardSettings from '../models/RewardSettings.js';
 import Reward from '../models/Reward.js';
+import { awardCoins, handleFirstRideReferral } from '../services/rewardService.js';
 
 // ✅ LEGAL STATUS TRANSITIONS
 const ALLOWED_TRANSITIONS = {
@@ -1359,7 +1360,20 @@ const completeRideWithVerification = async (req, res) => {
         trip.drop.coordinates[1], trip.drop.coordinates[0]
       );
 
-      coinReward = await awardCoinsToCustomer(trip.customerId, tripId, tripDistance, session);
+      coinReward = await awardCoins(trip.customerId, tripId, 'ride_reward');
+
+      // Check first ride for referral
+      const completedCount = await Trip.countDocuments({
+        customerId: trip.customerId,
+        status: 'completed',
+        paymentStatus: 'completed',
+      });
+      if (completedCount === 1) {
+        handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
+          console.warn('⚠️ handleFirstRideReferral failed:', e.message)
+        );
+      }
+
       driverIncentives = await awardIncentivesToDriver(driverId, tripId, session);
 
       await User.findByIdAndUpdate(driverId, {
@@ -1573,11 +1587,24 @@ const confirmCashCollection = async (req, res) => {
 
     console.log('✅ Cash collection complete');
 
-    // ── 6. Award coins to customer (non-critical) ────────────────────
+    // ── 6. Award coins to customer + handle first-ride referral (non-critical) ─
     let coinReward = null;
     try {
       if (trip.customerId) {
-        coinReward = await awardCoinsToCustomer(trip.customerId, tripId, null);
+        // Use the new rewardService for consistent coin logic
+        coinReward = await awardCoins(trip.customerId, tripId, 'ride_reward');
+
+        // Check if this is their first completed ride → trigger referral chain
+        const completedCount = await Trip.countDocuments({
+          customerId: trip.customerId,
+          status: 'completed',
+          paymentCollected: true,
+        });
+        if (completedCount === 1) {
+          handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
+            console.warn('⚠️ handleFirstRideReferral failed:', e.message)
+          );
+        }
       }
     } catch (coinErr) {
       console.warn('⚠️ Coin award failed (non-critical):', coinErr.message);
