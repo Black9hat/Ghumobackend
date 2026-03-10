@@ -2,6 +2,9 @@
 
 import DriverPlan from '../models/DriverPlan.js';
 
+// Module-level interval reference for graceful shutdown
+let _intervalId = null;
+
 /**
  * Runs every 15 minutes.
  * Finds all DriverPlan records where:
@@ -51,12 +54,23 @@ export function startPlanExpiryJob() {
   // Run immediately on startup
   runPlanExpiryJob();
 
-  // Then run every 15 minutes
-  const intervalId = setInterval(runPlanExpiryJob, INTERVAL_MS);
+  // Then run every 15 minutes; store reference for graceful shutdown
+  _intervalId = setInterval(runPlanExpiryJob, INTERVAL_MS);
 
   console.log('⏰ [PlanExpiryJob] Started — runs every 15 minutes');
 
-  return intervalId;
+  return _intervalId;
 }
 
-export default { startPlanExpiryJob, runPlanExpiryJob };
+/**
+ * Stop the cron job (for graceful shutdown).
+ */
+export function stopPlanExpiryJob() {
+  if (_intervalId) {
+    clearInterval(_intervalId);
+    _intervalId = null;
+    console.log('⏰ [PlanExpiryJob] Stopped');
+  }
+}
+
+export default { startPlanExpiryJob, stopPlanExpiryJob, runPlanExpiryJob };
