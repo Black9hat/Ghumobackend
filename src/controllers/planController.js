@@ -28,7 +28,12 @@ const {
   planPrice,      // ← ADD
   durationDays,   // ← ADD
   description,
-  benefits
+  benefits,
+  isTimeBasedPlan,
+  planStartTime,
+  planEndTime,
+  planActivationDate,
+  planExpiryDate,
 } = req.body;
 
     // Validation
@@ -62,6 +67,14 @@ const {
       });
     }
 
+    // Validate offer window dates if provided
+    if (planActivationDate && isNaN(new Date(planActivationDate).getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid planActivationDate' });
+    }
+    if (planExpiryDate && isNaN(new Date(planExpiryDate).getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid planExpiryDate' });
+    }
+
    // AFTER
 const plan = new Plan({
   planName,
@@ -74,6 +87,11 @@ const plan = new Plan({
   durationDays: durationDays || 30,          // ← ADD
   description: description || '',
   benefits: benefits || [],
+  isTimeBasedPlan: isTimeBasedPlan || false,
+  planStartTime: planStartTime || '00:00',
+  planEndTime: planEndTime || '23:59',
+  planActivationDate: planActivationDate ? new Date(planActivationDate) : null,
+  planExpiryDate: planExpiryDate ? new Date(planExpiryDate) : null,
   createdBy: req.admin?._id || req.admin?.id,
   isActive: true
 });
@@ -194,6 +212,20 @@ export const updatePlan = async (req, res) => {
     updates.updatedBy = req.admin?._id || req.admin?.id;
     updates.updatedAt = new Date();
 
+    // Handle planActivationDate and planExpiryDate explicitly
+    if (updates.planActivationDate !== undefined) {
+      if (updates.planActivationDate && isNaN(new Date(updates.planActivationDate).getTime())) {
+        return res.status(400).json({ success: false, message: 'Invalid planActivationDate' });
+      }
+      updates.planActivationDate = updates.planActivationDate ? new Date(updates.planActivationDate) : null;
+    }
+    if (updates.planExpiryDate !== undefined) {
+      if (updates.planExpiryDate && isNaN(new Date(updates.planExpiryDate).getTime())) {
+        return res.status(400).json({ success: false, message: 'Invalid planExpiryDate' });
+      }
+      updates.planExpiryDate = updates.planExpiryDate ? new Date(updates.planExpiryDate) : null;
+    }
+
     const plan = await Plan.findByIdAndUpdate(planId, updates, { new: true });
     if (!plan) {
       return res.status(404).json({
@@ -261,6 +293,31 @@ export const deletePlan = async (req, res) => {
       message: 'Failed to delete plan',
       error: error.message
     });
+  }
+};
+
+/**
+ * TOGGLE PLAN STATUS (Enable/Disable)
+ * PATCH /api/admin/plans/:planId/toggle
+ */
+export const togglePlanStatus = async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const plan = await Plan.findById(planId);
+    if (!plan) {
+      return res.status(404).json({ success: false, message: 'Plan not found' });
+    }
+    plan.isActive = !plan.isActive;
+    plan.updatedBy = req.admin?._id || req.user?._id;
+    await plan.save();
+    return res.json({
+      success: true,
+      message: `Plan ${plan.isActive ? 'enabled' : 'disabled'} successfully`,
+      data: { planId: plan._id, isActive: plan.isActive },
+    });
+  } catch (error) {
+    console.error('❌ togglePlanStatus error:', error);
+    res.status(500).json({ success: false, message: 'Failed to toggle plan status', error: error.message });
   }
 };
 
@@ -502,7 +559,14 @@ export const getCurrentPlan = async (req, res) => {
  */
 export const getAvailablePlans = async (req, res) => {
   try {
-    const plans = await Plan.find({ isActive: true }).sort({ planType: 1 });
+    const now = new Date();
+    const plans = await Plan.find({
+      isActive: true,
+      $and: [
+        { $or: [{ planActivationDate: null }, { planActivationDate: { $lte: now } }] },
+        { $or: [{ planExpiryDate: null }, { planExpiryDate: { $gte: now } }] },
+      ],
+    }).sort({ planType: 1 });
 
     res.json({
       success: true,

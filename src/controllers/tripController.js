@@ -14,6 +14,7 @@ import RideHistory from '../models/RideHistory.js';
 
 import RewardSettings from '../models/RewardSettings.js';
 import Reward from '../models/Reward.js';
+import DriverPlan from '../models/DriverPlan.js';
 
 // ✅ LEGAL STATUS TRANSITIONS
 const ALLOWED_TRANSITIONS = {
@@ -89,14 +90,64 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
   try {
     console.log(`💳 Processing wallet: Driver ${driverId}, Fare ₹${fareAmount}`);
 
+    // ── 1. Fetch commission % from DB ──
     const db = mongoose.connection.db;
     const CommissionSettings = db.collection('commissionSettings');
     const commissionSettings = await CommissionSettings.findOne({ type: 'global' });
-    const commissionPercentage = commissionSettings?.percentage || 15;
+    const defaultCommissionPercentage = commissionSettings?.percentage || 15;
 
+    // ── 2. Check if driver has a valid active plan ──
+    const now = new Date();
+    const activePlan = await DriverPlan.findOne({
+      driver: driverId,
+      isActive: true,
+      expiryDate: { $gt: now },
+      $or: [
+        { paymentStatus: 'completed' },
+        { purchaseMethod: 'admin_assigned' },
+      ],
+    }).session(session);
+
+    let commissionPercentage = defaultCommissionPercentage;
+    let planApplied = false;
+    let planBonus = 0;
+    let appliedPlanDetails = null;
+
+    if (activePlan) {
+      // Check time window if applicable
+      const isInTimeWindow = activePlan.isValidNow ? activePlan.isValidNow() : true;
+
+      if (isInTimeWindow) {
+        planApplied = true;
+
+        // Apply plan commission (0% if noCommission)
+        commissionPercentage = activePlan.noCommission ? 0 : activePlan.commissionRate;
+
+        appliedPlanDetails = {
+          planId: activePlan.plan,
+          driverPlanId: activePlan._id,
+          planName: activePlan.planName,
+          commissionRate: commissionPercentage,
+          bonusMultiplier: activePlan.bonusMultiplier || 1.0,
+        };
+
+        console.log(
+          `📋 Plan applied: "${activePlan.planName}" | Commission: ${commissionPercentage}% | Bonus: x${activePlan.bonusMultiplier || 1.0}`
+        );
+      } else {
+        // Plan is in DB but outside time window — treat as no plan
+        console.log(`⏰ Plan "${activePlan.planName}" exists but outside time window — using default commission`);
+      }
+    }
+
+    // ── 3. Calculate final earning ──
     const commission = (fareAmount * commissionPercentage) / 100;
-    const driverEarning = fareAmount - commission;
+    const baseEarning = fareAmount - commission;
+    const bonusMultiplier = planApplied ? (activePlan.bonusMultiplier || 1.0) : 1.0;
+    const driverEarning = baseEarning * bonusMultiplier;
+    planBonus = driverEarning - baseEarning;
 
+    // ── 4. Update driver User fields ──
     const driver = await User.findById(driverId).session(session);
     if (!driver) throw new Error('Driver not found for wallet update');
 
@@ -104,25 +155,76 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
     const currentCommission = driver.totalCommissionPaid || 0;
     const currentPending = driver.pendingAmount || 0;
 
-    await User.findByIdAndUpdate(driverId, {
-      $set: {
-        totalEarnings: currentEarnings + driverEarning,
-        totalCommissionPaid: currentCommission + commission,
-        pendingAmount: currentPending + driverEarning,
-        lastEarningAt: new Date()
-      }
-    }, { session });
+    await User.findByIdAndUpdate(
+      driverId,
+      {
+        $set: {
+          totalEarnings: currentEarnings + driverEarning,
+          totalCommissionPaid: currentCommission + commission,
+          pendingAmount: currentPending + driverEarning,
+          lastEarningAt: new Date(),
+        },
+      },
+      { session }
+    );
 
-    console.log(`✅ Wallet updated: Earning ₹${driverEarning.toFixed(2)}, Commission ₹${commission.toFixed(2)}`);
+    // ── 5. Update Wallet document with detailed breakdown ──
+    let wallet = await Wallet.findOne({ driverId }).session(session);
+    if (!wallet) {
+      wallet = new Wallet({ driverId });
+    }
+
+    const transactionEntry = {
+      tripId,
+      type: 'credit',
+      amount: driverEarning,
+      description: planApplied
+        ? `Ride earnings: ₹${fareAmount} (Plan: ${appliedPlanDetails.planName})`
+        : `Ride earnings: ₹${fareAmount}`,
+      planApplied,
+      planId: appliedPlanDetails?.planId || undefined,
+      driverPlanId: appliedPlanDetails?.driverPlanId || undefined,
+      planName: appliedPlanDetails?.planName || undefined,
+      planCommissionRate: planApplied ? commissionPercentage : undefined,
+      planBonusMultiplier: planApplied ? bonusMultiplier : undefined,
+      originalFare: fareAmount,
+      commissionDeducted: commission,
+      planBonus: planBonus,
+      finalEarning: driverEarning,
+      status: 'completed',
+      createdAt: new Date(),
+    };
+
+    wallet.transactions.push(transactionEntry);
+    wallet.totalEarnings = (wallet.totalEarnings || 0) + driverEarning;
+    wallet.totalCommission = (wallet.totalCommission || 0) + commission;
+    wallet.availableBalance = (wallet.availableBalance || 0) + driverEarning;
+    if (planApplied && planBonus > 0) {
+      wallet.totalPlanBonusEarned = (wallet.totalPlanBonusEarned || 0) + planBonus;
+    }
+
+    await wallet.save({ session });
+
+    console.log(
+      `✅ Wallet updated | Earning: ₹${driverEarning.toFixed(2)} | Commission: ₹${commission.toFixed(2)} | PlanBonus: ₹${planBonus.toFixed(2)}`
+    );
 
     return {
       success: true,
-      fareBreakdown: { tripFare: fareAmount, commission, commissionPercentage, driverEarning },
+      planApplied,
+      fareBreakdown: {
+        tripFare: fareAmount,
+        commission,
+        commissionPercentage,
+        planBonus,
+        driverEarning,
+        planName: appliedPlanDetails?.planName || null,
+      },
       wallet: {
         totalEarnings: currentEarnings + driverEarning,
         totalCommission: currentCommission + commission,
-        pendingAmount: currentPending + driverEarning
-      }
+        pendingAmount: currentPending + driverEarning,
+      },
     };
   } catch (error) {
     console.error('❌ Wallet error:', error);

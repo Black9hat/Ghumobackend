@@ -39,6 +39,7 @@ import {
   getPlanById,
   updatePlan,
   deletePlan,
+  togglePlanStatus,
 
   // ── Driver plan management (admin) ──
   assignPlanToDriver,
@@ -89,6 +90,9 @@ router
   .get(verifyAdminToken, getPlanById)
   .put(verifyAdminToken, updatePlan)
   .delete(verifyAdminToken, deletePlan);
+
+// PATCH /api/admin/plans/:planId/toggle — Enable/Disable plan
+router.patch('/admin/plans/:planId/toggle', verifyAdminToken, togglePlanStatus);
 
 // ════════════════════════════════════════════════════════════════════════════
 // ✨ NEW: ADMIN — Plan Purchase Analytics

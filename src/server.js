@@ -52,6 +52,7 @@ import adminHelpRoutes from './routes/adminHelpRoutes.js';
 
 // Cron / Reassignment
 import standbyReassignCron from './cron/standbyReassignCron.js';
+import { startPlanExpiryJob } from './cron/planExpiryJob.js';
 
 // Sockets
 import { initSocket } from './socket/socketHandler.js';
@@ -229,6 +230,11 @@ setInterval(() => {
     console.error('❌ Unhandled cron error:', err)
   );
 }, 2 * 60 * 1000);
+
+/**
+ * PLAN EXPIRY CRON — deactivate expired driver plans every 15 minutes
+ */
+startPlanExpiryJob();
 
 /**
  * DRIVER STUCK CLEANUP EVERY 5 MINUTES
