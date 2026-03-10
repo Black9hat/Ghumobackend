@@ -1,29 +1,27 @@
-// src/routes/zoneRoutes.js
+// zoneRoutes.js
 import express from 'express';
 import {
-  createZone,
   getZones,
+  createZone,
   updateZone,
   deleteZone,
-  checkServiceAvailability,
   addExclusionZone,
   removeExclusionZone,
-} from '../controllers/zoneController.js';
+  checkServiceAvailability,
+  autoGenerateClusters,
+} from './zoneController.js';
 
 const router = express.Router();
 
-// ── Zone CRUD ────────────────────────────────────────────────
-router.post('/create', createZone);             // Create zone with polygon
-router.get('/', getZones);                      // Get all zones (with exclusions)
-router.put('/:id', updateZone);                 // Update zone (polygon, settings, exclusions)
-router.delete('/:id', deleteZone);              // Delete zone
+// Must be before /:id routes
+router.post('/check',          checkServiceAvailability);
+router.post('/auto-generate',  autoGenerateClusters);
 
-// ── Exclusion Zones (Holes) ──────────────────────────────────
-router.post('/:id/exclusion', addExclusionZone);              // Add a hole to a zone
-router.delete('/:id/exclusion/:exclusionId', removeExclusionZone); // Remove a hole
-
-// ── Customer-facing check ────────────────────────────────────
-// IMPORTANT: /check must be BEFORE /:id to avoid conflict
-router.post('/check', checkServiceAvailability); // Check if lat/lng is in service
+router.get  ('/',                          getZones);
+router.post ('/create',                    createZone);
+router.put  ('/:id',                       updateZone);
+router.delete('/:id',                      deleteZone);
+router.post ('/:id/exclusion',             addExclusionZone);
+router.delete('/:id/exclusion/:exclusionId', removeExclusionZone);
 
 export default router;
