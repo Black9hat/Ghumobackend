@@ -3,6 +3,7 @@
 import Trip from '../models/Trip.js';
 import Wallet from '../models/Wallet.js';
 import User from '../models/User.js';
+import DriverPlan from '../models/DriverPlan.js';
 import mongoose from 'mongoose';
 import { startTripRetry, stopTripRetry } from '../utils/tripRetryBroadcaster.js';
 import { confirmCashReceipt as processCashCollection } from './paymentController.js';
@@ -92,10 +93,63 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
     const db = mongoose.connection.db;
     const CommissionSettings = db.collection('commissionSettings');
     const commissionSettings = await CommissionSettings.findOne({ type: 'global' });
-    const commissionPercentage = commissionSettings?.percentage || 15;
+    const defaultCommissionPercentage = commissionSettings?.percentage || 15;
 
-    const commission = (fareAmount * commissionPercentage) / 100;
-    const driverEarning = fareAmount - commission;
+    // ── Check for active driver plan (broader query to also catch just-expired plans) ──
+    const candidatePlan = await DriverPlan.findOne({
+      driver: driverId,
+      isActive: true,
+      paymentStatus: 'completed',
+    });
+
+    let commission;
+    let planBonus = 0;
+    let finalDriverEarning;
+    let planApplied = false;
+    let appliedPlanId = null;
+    let appliedPlanName = null;
+    let commissionRate = defaultCommissionPercentage;
+
+    if (candidatePlan && candidatePlan.isValidNow()) {
+      // Plan is active and within valid time window / not expired
+      const activePlan = candidatePlan;
+      planApplied = true;
+      appliedPlanId = activePlan._id;
+      appliedPlanName = activePlan.planName;
+
+      if (activePlan.noCommission) {
+        commission = 0;
+        commissionRate = 0;
+        finalDriverEarning = fareAmount;
+      } else {
+        commissionRate = activePlan.commissionRate;
+        commission = (fareAmount * activePlan.commissionRate) / 100;
+        finalDriverEarning = fareAmount - commission;
+      }
+
+      if (activePlan.bonusMultiplier > 1) {
+        planBonus = finalDriverEarning * (activePlan.bonusMultiplier - 1);
+        finalDriverEarning = finalDriverEarning * activePlan.bonusMultiplier;
+      }
+
+      console.log(`🎯 Plan applied: ${activePlan.planName} | Commission: ${commissionRate}% | Bonus: x${activePlan.bonusMultiplier}`);
+    } else {
+      // Default commission logic
+      commission = (fareAmount * defaultCommissionPercentage) / 100;
+      commissionRate = defaultCommissionPercentage;
+      finalDriverEarning = fareAmount - commission;
+
+      // Auto-expire plan if it exists but has passed its expiry date
+      if (candidatePlan && candidatePlan.expiryDate && candidatePlan.expiryDate < new Date()) {
+        candidatePlan.markAsExpired().catch((err) =>
+          console.error('❌ Failed to mark plan as expired:', err)
+        );
+      }
+    }
+
+    finalDriverEarning = Math.round(finalDriverEarning * 100) / 100;
+    commission = Math.round(commission * 100) / 100;
+    planBonus = Math.round(planBonus * 100) / 100;
 
     const driver = await User.findById(driverId).session(session);
     if (!driver) throw new Error('Driver not found for wallet update');
@@ -106,22 +160,68 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
 
     await User.findByIdAndUpdate(driverId, {
       $set: {
-        totalEarnings: currentEarnings + driverEarning,
+        totalEarnings: currentEarnings + finalDriverEarning,
         totalCommissionPaid: currentCommission + commission,
-        pendingAmount: currentPending + driverEarning,
+        pendingAmount: currentPending + finalDriverEarning,
         lastEarningAt: new Date()
       }
     }, { session });
 
-    console.log(`✅ Wallet updated: Earning ₹${driverEarning.toFixed(2)}, Commission ₹${commission.toFixed(2)}`);
+    // ── Push transaction to Wallet model with plan breakdown ──
+    const description = planApplied
+      ? `Ride ₹${fareAmount} | Commission: ₹${commission} | Plan Bonus: +₹${planBonus.toFixed(2)}`
+      : `Ride ₹${fareAmount} | Commission: ₹${commission}`;
+
+    await Wallet.findOneAndUpdate(
+      { driverId },
+      {
+        $inc: {
+          totalEarnings: finalDriverEarning,
+          totalCommission: commission,
+          availableBalance: finalDriverEarning,
+        },
+        $push: {
+          transactions: {
+            type: 'credit',
+            amount: finalDriverEarning,
+            tripId: tripId || null,
+            description,
+            originalFare: fareAmount,
+            commissionDeducted: commission,
+            planBonus,
+            finalEarning: finalDriverEarning,
+            planApplied,
+            planId: (planApplied ? candidatePlan?.plan : null) || null,
+            driverPlanId: appliedPlanId,
+            planName: appliedPlanName,
+            planCommissionRate: commissionRate,
+            planBonusMultiplier: (planApplied ? candidatePlan?.bonusMultiplier : null) || 1,
+            status: 'completed',
+            createdAt: new Date(),
+          },
+        },
+        $set: { lastUpdated: new Date() },
+      },
+      { upsert: true, session }
+    );
+
+    console.log(`✅ Wallet updated: Earning ₹${finalDriverEarning.toFixed(2)}, Commission ₹${commission.toFixed(2)}${planApplied ? `, Plan Bonus ₹${planBonus.toFixed(2)}` : ''}`);
 
     return {
       success: true,
-      fareBreakdown: { tripFare: fareAmount, commission, commissionPercentage, driverEarning },
+      fareBreakdown: {
+        tripFare: fareAmount,
+        commission,
+        commissionPercentage: commissionRate,
+        driverEarning: finalDriverEarning,
+        planBonus,
+        planApplied,
+        planName: appliedPlanName,
+      },
       wallet: {
-        totalEarnings: currentEarnings + driverEarning,
+        totalEarnings: currentEarnings + finalDriverEarning,
         totalCommission: currentCommission + commission,
-        pendingAmount: currentPending + driverEarning
+        pendingAmount: currentPending + finalDriverEarning
       }
     };
   } catch (error) {

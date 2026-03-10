@@ -103,11 +103,17 @@ const plan = new Plan({
  */
 export const getPlans = async (req, res) => {
   try {
-    const { active } = req.query;
+    const { active, planType, isActive } = req.query;
     let query = {};
 
-    if (active === 'true') {
+    if (active === 'true' || isActive === 'true') {
       query.isActive = true;
+    } else if (isActive === 'false') {
+      query.isActive = false;
+    }
+
+    if (planType) {
+      query.planType = planType;
     }
 
     const plans = await Plan.find(query)
@@ -227,16 +233,19 @@ export const deletePlan = async (req, res) => {
   try {
     const { planId } = req.params;
 
-    // Check if any drivers are using this plan
-    const activeDriverPlans = await DriverPlan.countDocuments({
-      plan: planId,
-      isActive: true
-    });
+    const plan = await Plan.findById(planId);
+    if (!plan) {
+      return res.status(404).json({
+        success: false,
+        message: 'Plan not found'
+      });
+    }
 
-    if (activeDriverPlans > 0) {
+    // Block deletion if plan has ever been purchased
+    if (plan.totalPurchases > 0) {
       return res.status(400).json({
         success: false,
-        message: `Cannot delete plan. ${activeDriverPlans} drivers are currently using it.`
+        message: `Cannot delete plan. It has been purchased ${plan.totalPurchases} time(s). Deactivate it instead.`
       });
     }
 
@@ -499,10 +508,28 @@ export const getCurrentPlan = async (req, res) => {
 /**
  * GET AVAILABLE PLANS (for driver to subscribe)
  * GET /api/driver/plans/available
+ * Excludes plans where the driver already has an active subscription.
  */
 export const getAvailablePlans = async (req, res) => {
   try {
-    const plans = await Plan.find({ isActive: true }).sort({ planType: 1 });
+    const driverId = req.user._id;
+
+    // Find plan IDs the driver currently has an active subscription for
+    const activeDriverPlans = await DriverPlan.find({
+      driver: driverId,
+      isActive: true,
+      paymentStatus: 'completed',
+      $or: [{ expiryDate: null }, { expiryDate: { $gt: new Date() } }],
+    }).select('plan').lean();
+
+    const activePlanIds = activeDriverPlans.map((dp) => dp.plan).filter(Boolean);
+
+    const query = { isActive: true };
+    if (activePlanIds.length > 0) {
+      query._id = { $nin: activePlanIds };
+    }
+
+    const plans = await Plan.find(query).sort({ planType: 1 });
 
     res.json({
       success: true,
@@ -793,6 +820,51 @@ export const getDriversWithPlans = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to fetch drivers',
+      error: error.message
+    });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// TOGGLE PLAN STATUS (ADMIN)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * TOGGLE PLAN STATUS (enable/disable)
+ * PATCH /api/admin/plans/:planId/toggle
+ */
+export const togglePlanStatus = async (req, res) => {
+  try {
+    const { planId } = req.params;
+
+    const plan = await Plan.findById(planId);
+    if (!plan) {
+      return res.status(404).json({
+        success: false,
+        message: 'Plan not found'
+      });
+    }
+
+    plan.isActive = !plan.isActive;
+    plan.updatedBy = req.admin?._id || req.admin?.id;
+    await plan.save();
+
+    console.log(`✅ Plan ${plan.isActive ? 'enabled' : 'disabled'}: ${planId}`);
+
+    res.json({
+      success: true,
+      message: `Plan ${plan.isActive ? 'enabled' : 'disabled'} successfully`,
+      data: {
+        _id: plan._id,
+        planName: plan.planName,
+        isActive: plan.isActive
+      }
+    });
+  } catch (error) {
+    console.error('❌ togglePlanStatus error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to toggle plan status',
       error: error.message
     });
   }
