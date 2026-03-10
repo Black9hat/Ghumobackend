@@ -2,6 +2,11 @@ import admin from "../utils/firebase.js";
 import User from "../models/User.js";
 // ✅ Correct path: authController.js is in "controllers", documentController.js is also in "controllers"
 import { recomputeDriverDocumentStatus } from "./documentController.js";
+import {
+  assignWelcomeCoupon,
+  ensureReferralCode,
+  recordReferralSignup,
+} from "../services/rewardService.js";
 
 /* ────────────── Firebase Sync (New Endpoint) ────────────── */
 export const firebaseSync = async (req, res) => {
@@ -40,6 +45,27 @@ export const firebaseSync = async (req, res) => {
       });
       await user.save();
       console.log(`✅ New user created with role '${role}': ${user._id}`);
+
+      // ── Post-registration rewards (non-blocking) ──────────────────────────
+      if (user.role === 'customer') {
+        // 1. Generate referral code for the new customer
+        ensureReferralCode(user._id).catch((e) =>
+          console.warn('⚠️ Referral code generation failed:', e.message)
+        );
+
+        // 2. Assign welcome coupon
+        assignWelcomeCoupon(user._id).catch((e) =>
+          console.warn('⚠️ Welcome coupon assignment failed:', e.message)
+        );
+
+        // 3. Record referral if user signed up with someone's code
+        const { referralCode } = req.body;
+        if (referralCode) {
+          recordReferralSignup(user._id, referralCode).catch((e) =>
+            console.warn('⚠️ Referral signup recording failed:', e.message)
+          );
+        }
+      }
     } else {
       // Update Firebase UID if not set
       if (!user.firebaseUid) {
@@ -102,6 +128,11 @@ export const firebaseSync = async (req, res) => {
     const profileComplete = user.name !== "New User";
     const docsApproved = user.documentStatus === "approved";
 
+    // Ensure referral code exists for all customers (lazy generation)
+    if (user.role === 'customer' && !user.referralCode) {
+      ensureReferralCode(user._id).catch(() => {});
+    }
+
     return res.status(200).json({
       message: isNewUser ? "Registration successful" : "Login successful",
       newUser: isNewUser,
@@ -118,6 +149,9 @@ export const firebaseSync = async (req, res) => {
         vehicleType: user.vehicleType,
         documentStatus: user.documentStatus,
         memberSince: formatMemberSince(user.createdAt),
+        referralCode: user.referralCode || null,
+        coins: user.coins || 0,
+        welcomeCouponAssigned: user.welcomeCouponAssigned || false,
       },
       firebaseToken: firebaseToken,
     });
