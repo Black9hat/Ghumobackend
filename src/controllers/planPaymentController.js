@@ -91,19 +91,20 @@ export const createRazorpayPlanOrder = async (req, res) => {
     const activeDriverPlan = await DriverPlan.findOne({
       driver: driverId,
       isActive: true,
-      expiryDate: { $gte: new Date() },
+      paymentStatus: 'completed',
+      $or: [{ expiryDate: null }, { expiryDate: { $gte: new Date() } }],
     }).session(session);
 
-    // ⚠️ Optional: Prevent multiple simultaneous plans
-    // Uncomment if business requirement is "one plan per driver at a time"
-    // if (activeDriverPlan) {
-    //   await session.abortTransaction();
-    //   return res.status(400).json({
-    //     success: false,
-    //     message: 'You already have an active plan. Please wait for it to expire.',
-    //     activePlanExpiry: activeDriverPlan.expiryDate
-    //   });
-    // }
+    if (activeDriverPlan) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'You already have an active plan. Wait for it to expire.',
+        activePlanExpiry: activeDriverPlan.expiryDate,
+        planName: activeDriverPlan.planName,
+        daysRemaining: activeDriverPlan.daysRemaining,
+      });
+    }
 
     // ── Check for recent duplicate orders (prevent accidental duplicates) ──
     const recentOrder = await PaymentPlan.findOne({
@@ -567,9 +568,28 @@ export const getPlanRevenueStats = async (req, res) => {
       },
     ]);
 
+    // Active plans count
+    const activePlansCount = await Plan.countDocuments({ isActive: true });
+
+    // Most popular plan
+    const mostPopularPlanData = await Plan.findOne({ isActive: true })
+      .sort({ totalPurchases: -1 })
+      .select('planName totalPurchases')
+      .lean();
+
+    const mostPopularPlan = mostPopularPlanData
+      ? { planName: mostPopularPlanData.planName, totalPurchases: mostPopularPlanData.totalPurchases }
+      : null;
+
     res.json({
       success: true,
       data: {
+        // Top-level summary fields (required format)
+        totalRevenue: totalRevenue[0]?.total || 0,
+        totalPurchases: totalRevenue[0]?.count || 0,
+        activePlansCount,
+        mostPopularPlan,
+        // Detailed breakdown
         period: { from: fromDate, to: toDate },
         totalStats: {
           totalRevenue: totalRevenue[0]?.total || 0,

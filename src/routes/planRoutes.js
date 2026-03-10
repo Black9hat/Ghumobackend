@@ -53,6 +53,9 @@ import {
 
   // ── Analytics ──
   getPlanAnalytics,
+
+  // ── Toggle ──
+  togglePlanStatus,
 } from '../controllers/planController.js';
 
 // ✨ NEW: Plan payment handlers
@@ -89,6 +92,9 @@ router
   .get(verifyAdminToken, getPlanById)
   .put(verifyAdminToken, updatePlan)
   .delete(verifyAdminToken, deletePlan);
+
+// PATCH /api/admin/plans/:planId/toggle
+router.patch('/admin/plans/:planId/toggle', verifyAdminToken, togglePlanStatus);
 
 // ════════════════════════════════════════════════════════════════════════════
 // ✨ NEW: ADMIN — Plan Purchase Analytics
