@@ -1,214 +1,290 @@
-// src/controllers/zoneController.js
-import Zone from '../models/zone.js';
+// zoneController.js
+// All zone operations: CRUD, exclusion management, auto-generate from OSM, /check endpoint
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Ray-casting point-in-polygon
-// Returns true if (lat, lng) is inside the polygon
-// ─────────────────────────────────────────────────────────────────────────────
-const isPointInPolygon = (lat, lng, polygon) => {
+import Zone from './zone.js';
+import axios from 'axios';
+
+/* ─────────────────────────────────────────────────────────────
+   HELPERS
+───────────────────────────────────────────────────────────── */
+
+/** Ray-casting point-in-polygon */
+function pointInPolygon(lat, lng, polygon) {
   let inside = false;
-  const n = polygon.length;
-  for (let i = 0, j = n - 1; i < n; j = i++) {
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
     const xi = polygon[i].lng, yi = polygon[i].lat;
     const xj = polygon[j].lng, yj = polygon[j].lat;
-    const intersects = (yi > lat) !== (yj > lat) &&
-      lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi;
-    if (intersects) inside = !inside;
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
   }
   return inside;
-};
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/zones/create
-// ─────────────────────────────────────────────────────────────────────────────
-export const createZone = async (req, res) => {
+/** Overpass API — fetch sub-areas of a place by name */
+async function fetchOSMSubAreas(placeName) {
+  // Step 1: geocode the place name with Nominatim
+  const nomRes = await axios.get('https://nominatim.openstreetmap.org/search', {
+    params: {
+      q: placeName,
+      format: 'json',
+      limit: 1,
+      addressdetails: 1,
+      polygon_geojson: 0,
+    },
+    headers: { 'User-Agent': 'RideshareAdminPanel/1.0' },
+    timeout: 10000,
+  });
+
+  if (!nomRes.data?.length) throw new Error(`Place not found: "${placeName}"`);
+
+  const place = nomRes.data[0];
+  const osmId   = place.osm_id;
+  const osmType = place.osm_type; // node|way|relation
+
+  // Step 2: fetch boundary polygon for the city/state itself
+  const boundaryGeoJSON = await fetchBoundaryGeoJSON(osmType, osmId);
+
+  // Step 3: fetch sub-areas (districts / suburbs) via Overpass
+  // relation type=boundary admin_level 6–10 inside the parent area
+  const overpassQuery = `
+    [out:json][timeout:30];
+    area(${osmType === 'relation' ? 3600000000 + parseInt(osmId) : parseInt(osmId)})->.parent;
+    (
+      relation["boundary"="administrative"]["admin_level"~"^[7-9]$"](area.parent);
+      relation["place"~"suburb|quarter|neighbourhood|district"](area.parent);
+    );
+    out tags;
+  `;
+
+  let subAreas = [];
   try {
-    const {
-      name, type, polygon, exclusionZones,
-      serviceEnabled, surgeMultiplier, driverIncentive, vehicleTypes,
-    } = req.body;
+    const ovRes = await axios.post(
+      'https://overpass-api.de/api/interpreter',
+      `data=${encodeURIComponent(overpassQuery)}`,
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 25000 }
+    );
+    subAreas = ovRes.data?.elements ?? [];
+  } catch (e) {
+    console.warn('Overpass sub-area fetch failed:', e.message);
+  }
 
-    const zone = await Zone.create({
-      name, type, polygon,
-      exclusionZones: exclusionZones || [],
-      serviceEnabled,
-      surgeMultiplier,
-      driverIncentive,
-      vehicleTypes,
+  return { place, osmId, osmType, boundaryGeoJSON, subAreas };
+}
+
+/** Fetch GeoJSON boundary polygon from Nominatim */
+async function fetchBoundaryGeoJSON(osmType, osmId) {
+  try {
+    const res = await axios.get('https://nominatim.openstreetmap.org/lookup', {
+      params: {
+        osm_ids: `${osmType[0].toUpperCase()}${osmId}`,
+        format: 'geojson',
+        polygon_geojson: 1,
+      },
+      headers: { 'User-Agent': 'RideshareAdminPanel/1.0' },
+      timeout: 12000,
     });
+    return res.data?.features?.[0]?.geometry ?? null;
+  } catch { return null; }
+}
 
-    return res.status(201).json({ success: true, data: zone });
-  } catch (error) {
-    console.error('❌ createZone error:', error);
-    return res.status(400).json({ success: false, message: error.message });
+/** Convert GeoJSON geometry → our Coord[] format */
+function geojsonToCoords(geometry) {
+  if (!geometry) return null;
+  let ring = null;
+  if (geometry.type === 'Polygon') {
+    ring = geometry.coordinates[0];
+  } else if (geometry.type === 'MultiPolygon') {
+    // Pick the largest ring
+    ring = geometry.coordinates.reduce((best, poly) =>
+      poly[0].length > (best?.length ?? 0) ? poly[0] : best, null);
   }
-};
+  if (!ring?.length) return null;
+  // GeoJSON is [lng, lat]
+  return ring.map(([lng, lat]) => ({ lat: +lat.toFixed(6), lng: +lng.toFixed(6) }));
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/zones/
-// ─────────────────────────────────────────────────────────────────────────────
-export const getZones = async (_req, res) => {
+/** Fetch polygon for a single OSM relation */
+async function fetchRelationPolygon(osmRelationId) {
+  const geo = await fetchBoundaryGeoJSON('relation', osmRelationId);
+  return geojsonToCoords(geo);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   AUTO-GENERATE CLUSTERS
+───────────────────────────────────────────────────────────── */
+export const autoGenerateClusters = async (req, res) => {
+  const { placeName } = req.body;
+  if (!placeName?.trim()) return res.status(400).json({ message: 'placeName is required' });
+
   try {
-    const zones = await Zone.find().sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, data: zones });
-  } catch (error) {
-    console.error('❌ getZones error:', error);
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
+    const { place, osmId, osmType, boundaryGeoJSON, subAreas } = await fetchOSMSubAreas(placeName.trim());
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PUT /api/zones/:id
-// Supports updating: serviceEnabled, surgeMultiplier, driverIncentive,
-//                    vehicleTypes, polygon (resize/reshape), exclusionZones
-// ─────────────────────────────────────────────────────────────────────────────
-export const updateZone = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const {
-      serviceEnabled, surgeMultiplier, driverIncentive,
-      vehicleTypes, polygon, exclusionZones, name, type,
-    } = req.body;
+    const cityName    = place.display_name.split(',')[0].trim();
+    const cityCoords  = geojsonToCoords(boundaryGeoJSON);
 
-    const allowedUpdates = {};
-    if (serviceEnabled !== undefined) allowedUpdates.serviceEnabled = serviceEnabled;
-    if (surgeMultiplier !== undefined) allowedUpdates.surgeMultiplier = surgeMultiplier;
-    if (driverIncentive !== undefined) allowedUpdates.driverIncentive = driverIncentive;
-    if (vehicleTypes !== undefined) allowedUpdates.vehicleTypes = vehicleTypes;
-    if (polygon !== undefined) allowedUpdates.polygon = polygon;           // ✅ reshape/extend
-    if (exclusionZones !== undefined) allowedUpdates.exclusionZones = exclusionZones; // ✅ add/remove holes
-    if (name !== undefined) allowedUpdates.name = name;
-    if (type !== undefined) allowedUpdates.type = type;
+    // Check if a city zone already exists
+    let cityZone = await Zone.findOne({ osmId: String(osmId), type: 'city' });
 
-    const zone = await Zone.findByIdAndUpdate(
-      id,
-      { $set: allowedUpdates },
-      { new: true, runValidators: true }
-    );
-
-    if (!zone) return res.status(404).json({ success: false, message: 'Zone not found.' });
-    return res.status(200).json({ success: true, data: zone });
-  } catch (error) {
-    console.error('❌ updateZone error:', error);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/zones/:id/exclusion  — add a new exclusion zone (hole)
-// Body: { name: string, polygon: [{lat,lng}...] }
-// ─────────────────────────────────────────────────────────────────────────────
-export const addExclusionZone = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, polygon } = req.body;
-
-    if (!polygon || polygon.length < 3) {
-      return res.status(400).json({ success: false, message: 'Exclusion polygon needs at least 3 points.' });
-    }
-
-    const zone = await Zone.findByIdAndUpdate(
-      id,
-      { $push: { exclusionZones: { name: name || 'Excluded Area', polygon } } },
-      { new: true, runValidators: true }
-    );
-
-    if (!zone) return res.status(404).json({ success: false, message: 'Zone not found.' });
-    return res.status(200).json({ success: true, data: zone });
-  } catch (error) {
-    console.error('❌ addExclusionZone error:', error);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/zones/:id/exclusion/:exclusionId  — remove a hole
-// ─────────────────────────────────────────────────────────────────────────────
-export const removeExclusionZone = async (req, res) => {
-  try {
-    const { id, exclusionId } = req.params;
-
-    const zone = await Zone.findByIdAndUpdate(
-      id,
-      { $pull: { exclusionZones: { _id: exclusionId } } },
-      { new: true }
-    );
-
-    if (!zone) return res.status(404).json({ success: false, message: 'Zone not found.' });
-    return res.status(200).json({ success: true, data: zone });
-  } catch (error) {
-    console.error('❌ removeExclusionZone error:', error);
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/zones/:id
-// ─────────────────────────────────────────────────────────────────────────────
-export const deleteZone = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const zone = await Zone.findByIdAndDelete(id);
-    if (!zone) return res.status(404).json({ success: false, message: 'Zone not found.' });
-    return res.status(200).json({ success: true, message: 'Zone deleted successfully.' });
-  } catch (error) {
-    console.error('❌ deleteZone error:', error);
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/zones/check
-// Body: { lat: number, lng: number }
-//
-// Logic:
-//   1. Find all enabled zones
-//   2. For each zone: check if point is inside main polygon
-//   3. If yes: check if point is inside ANY exclusion zone → if so, BLOCKED
-//   4. If inside main polygon and NOT in any exclusion → serviceAvailable: true
-// ─────────────────────────────────────────────────────────────────────────────
-export const checkServiceAvailability = async (req, res) => {
-  try {
-    const { lat, lng } = req.body;
-
-    if (lat === undefined || lng === undefined) {
-      return res.status(400).json({ success: false, message: '`lat` and `lng` are required.' });
-    }
-
-    const enabledZones = await Zone.find({ serviceEnabled: true });
-
-    for (const zone of enabledZones) {
-      // Step 1: Is the point inside the main polygon?
-      const inMainZone = isPointInPolygon(lat, lng, zone.polygon);
-      if (!inMainZone) continue;
-
-      // Step 2: Is the point inside any exclusion zone (hole)?
-      const inExclusionZone = (zone.exclusionZones || []).some(ex =>
-        isPointInPolygon(lat, lng, ex.polygon)
-      );
-
-      if (inExclusionZone) {
-        // Point is in a hole — keep checking other zones
-        // (another zone might still cover this point without a hole here)
-        continue;
-      }
-
-      // ✅ Inside main zone, not in any hole — service available!
-      return res.status(200).json({
-        serviceAvailable: true,
-        zoneName: zone.name,
-        surgeMultiplier: zone.surgeMultiplier,
-        vehicleTypes: zone.vehicleTypes,
-        driverIncentive: zone.driverIncentive,
+    if (!cityZone && cityCoords) {
+      cityZone = await Zone.create({
+        name: cityName,
+        type: 'city',
+        polygon: cityCoords,
+        osmId: String(osmId),
+        osmType,
+        serviceEnabled: true,
       });
     }
 
-    return res.status(200).json({
-      serviceAvailable: false,
-      message: "We don't service this area yet. Please select a location within our coverage zone.",
+    // Build sub-area clusters in parallel (max 20 to avoid rate-limits)
+    const topSubAreas = subAreas.slice(0, 20);
+    const clusterResults = [];
+    const existingNames = new Set();
+
+    for (const sub of topSubAreas) {
+      const subName = sub.tags?.['name:en'] || sub.tags?.name;
+      if (!subName || existingNames.has(subName)) continue;
+      existingNames.add(subName);
+
+      // Skip if cluster already exists
+      const exists = await Zone.findOne({ name: subName, type: 'cluster', parentId: cityZone?._id });
+      if (exists) { clusterResults.push(exists); continue; }
+
+      // Fetch polygon for this sub-area relation
+      const coords = await fetchRelationPolygon(sub.id);
+      if (!coords || coords.length < 3) continue;
+
+      const cluster = await Zone.create({
+        name: subName,
+        type: 'cluster',
+        parentId: cityZone?._id ?? null,
+        polygon: coords,
+        osmId: String(sub.id),
+        osmType: 'relation',
+        serviceEnabled: true,
+      });
+      clusterResults.push(cluster);
+
+      // Small delay to be polite to OSM servers
+      await new Promise(r => setTimeout(r, 350));
+    }
+
+    res.json({
+      success: true,
+      city: cityZone,
+      clusters: clusterResults,
+      message: `Generated ${clusterResults.length} cluster(s) for ${cityName}`,
     });
-  } catch (error) {
-    console.error('❌ checkServiceAvailability error:', error);
-    return res.status(500).json({ success: false, message: error.message });
+  } catch (e) {
+    console.error('autoGenerateClusters error:', e.message);
+    res.status(500).json({ message: e.message || 'Failed to generate clusters' });
   }
+};
+
+/* ─────────────────────────────────────────────────────────────
+   STANDARD CRUD
+───────────────────────────────────────────────────────────── */
+export const getZones = async (req, res) => {
+  try {
+    const zones = await Zone.find().sort({ createdAt: -1 });
+    res.json({ success: true, data: zones });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+export const createZone = async (req, res) => {
+  try {
+    const zone = await Zone.create(req.body);
+    res.status(201).json({ success: true, data: zone });
+  } catch (e) { res.status(400).json({ message: e.message }); }
+};
+
+export const updateZone = async (req, res) => {
+  try {
+    const zone = await Zone.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!zone) return res.status(404).json({ message: 'Zone not found' });
+    res.json({ success: true, data: zone });
+  } catch (e) { res.status(400).json({ message: e.message }); }
+};
+
+export const deleteZone = async (req, res) => {
+  try {
+    const zone = await Zone.findByIdAndDelete(req.params.id);
+    if (!zone) return res.status(404).json({ message: 'Zone not found' });
+    // Also delete child clusters/areas
+    await Zone.deleteMany({ parentId: req.params.id });
+    res.json({ success: true, message: 'Deleted' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+/* ─────────────────────────────────────────────────────────────
+   EXCLUSION ZONES
+───────────────────────────────────────────────────────────── */
+export const addExclusionZone = async (req, res) => {
+  try {
+    const zone = await Zone.findByIdAndUpdate(
+      req.params.id,
+      { $push: { exclusionZones: req.body } },
+      { new: true }
+    );
+    if (!zone) return res.status(404).json({ message: 'Zone not found' });
+    res.json({ success: true, data: zone });
+  } catch (e) { res.status(400).json({ message: e.message }); }
+};
+
+export const removeExclusionZone = async (req, res) => {
+  try {
+    const zone = await Zone.findByIdAndUpdate(
+      req.params.id,
+      { $pull: { exclusionZones: { _id: req.params.exclusionId } } },
+      { new: true }
+    );
+    if (!zone) return res.status(404).json({ message: 'Zone not found' });
+    res.json({ success: true, data: zone });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+/* ─────────────────────────────────────────────────────────────
+   /check — Customer app service availability
+   Priority: exclusion > cluster > city
+───────────────────────────────────────────────────────────── */
+export const checkServiceAvailability = async (req, res) => {
+  const { lat, lng } = req.body;
+  if (lat == null || lng == null) return res.status(400).json({ message: 'lat and lng required' });
+
+  try {
+    const zones = await Zone.find({ serviceEnabled: true });
+
+    let matchedZone = null;
+    let priority = 0; // higher = better match
+
+    for (const zone of zones) {
+      if (!pointInPolygon(lat, lng, zone.polygon)) continue;
+
+      // Check if inside any exclusion zone → blocked
+      const inExclusion = (zone.exclusionZones ?? []).some(ex =>
+        pointInPolygon(lat, lng, ex.polygon)
+      );
+      if (inExclusion) {
+        return res.json({ serviceAvailable: false, reason: 'exclusion_zone', zoneName: zone.name });
+      }
+
+      // Priority: cluster (2) > city (1) > area (0)
+      const p = zone.type === 'cluster' ? 2 : zone.type === 'city' ? 1 : 0;
+      if (p > priority) { priority = p; matchedZone = zone; }
+    }
+
+    if (!matchedZone) {
+      return res.json({ serviceAvailable: false, reason: 'outside_coverage' });
+    }
+
+    res.json({
+      serviceAvailable: true,
+      zoneName:         matchedZone.name,
+      zoneType:         matchedZone.type,
+      surgeMultiplier:  matchedZone.surgeMultiplier,
+      driverIncentive:  matchedZone.driverIncentive,
+      vehicleTypes:     matchedZone.vehicleTypes,
+    });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 };
