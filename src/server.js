@@ -19,7 +19,7 @@ import privacyRoutes from './routes/privacyRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';  // ← NEW
 import webhookRoutes from './routes/webhookRoutes.js';  // ← Razorpay webhook
 import planRoutes from './routes/planRoutes.js';
-
+import zoneRoutes from './routes/zoneRoutes.js';
 // Routes
 import userRoutes from './routes/userRoutes.js';
 import authRoutes from './routes/authRoutes.js';
@@ -52,6 +52,7 @@ import adminHelpRoutes from './routes/adminHelpRoutes.js';
 
 // Cron / Reassignment
 import standbyReassignCron from './cron/standbyReassignCron.js';
+import { startExpirePlansCron } from './cron/expirePlans.js';
 
 // Sockets
 import { initSocket } from './socket/socketHandler.js';
@@ -122,7 +123,7 @@ app.use('/api/support', supportRoutes);
 app.use('/api', adminIncentiveRoutes);
 app.use('/api/driver/incentives', driverIncentiveRoutes);
 app.use('/api', planRoutes);
-
+app.use('/api/zones', zoneRoutes);
 // Static file serving for uploaded images
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 app.use("/api/customer/banners", customerBannerRoutes);
@@ -229,6 +230,11 @@ setInterval(() => {
     console.error('❌ Unhandled cron error:', err)
   );
 }, 2 * 60 * 1000);
+
+/**
+ * PLAN EXPIRY CRON (every hour)
+ */
+startExpirePlansCron();
 
 /**
  * DRIVER STUCK CLEANUP EVERY 5 MINUTES
