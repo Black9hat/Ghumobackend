@@ -5,6 +5,7 @@ import Coupon from '../models/Coupon.js';
 import CouponUsage from '../models/CouponUsage.js';
 import Customer from '../models/User.js';
 import Trip from '../models/Trip.js';
+import AppSettings from '../models/AppSettings.js';
 
 const router = express.Router();
 
@@ -370,10 +371,29 @@ router.post('/validate', verifyToken, async (req, res) => {
       discountAmount = coupon.discountValue;
     }
 
-    // Ensure discount doesn't exceed fare
-    discountAmount = Math.min(discountAmount, estimatedFare);
+    // 🎁 Welcome coupon: add internal fare adjustment before applying discount
+    // This is loaded from admin settings so it stays configurable.
+    let fareAdjustment = 0;
+    let adjustedFare = estimatedFare;
+    try {
+      const appSettings = await AppSettings.getSettings();
+      const welcomeCode = appSettings.welcomeCoupon.code?.toUpperCase();
+      if (
+        welcomeCode &&
+        coupon.code === welcomeCode &&
+        appSettings.welcomeCoupon.fareAdjustment > 0
+      ) {
+        fareAdjustment = appSettings.welcomeCoupon.fareAdjustment;
+        adjustedFare = estimatedFare + fareAdjustment;
+        console.log(`🎁 Welcome coupon: fare adjusted ₹${estimatedFare} → ₹${adjustedFare}`);
+      }
+    } catch (e) {
+      console.warn('⚠️ Could not load AppSettings for fare adjustment:', e.message);
+    }
 
-    const finalFare = Math.max(0, estimatedFare - discountAmount);
+    // Ensure discount doesn't exceed adjusted fare
+    discountAmount = Math.min(discountAmount, adjustedFare);
+    const finalFare = Math.max(0, adjustedFare - discountAmount);
 
     console.log(`✅ Coupon validated: ${couponCode}, discount: ₹${discountAmount}`);
 
@@ -390,6 +410,8 @@ router.post('/validate', verifyToken, async (req, res) => {
       },
       discountAmount,
       originalFare: estimatedFare,
+      adjustedFare: fareAdjustment > 0 ? adjustedFare : undefined,
+      fareAdjustment: fareAdjustment > 0 ? fareAdjustment : undefined,
       finalFare,
       message: `Coupon applied! You saved ₹${discountAmount.toFixed(2)}`,
     });
