@@ -1,7 +1,7 @@
 // zoneController.js
 // All zone operations: CRUD, exclusion management, auto-generate from OSM, /check endpoint
 
-import Zone from './zone.js';
+import Zone from "../models/zone.js";
 import axios from 'axios';
 
 /* ─────────────────────────────────────────────────────────────
