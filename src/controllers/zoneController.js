@@ -246,39 +246,82 @@ export const removeExclusionZone = async (req, res) => {
 
 /* ─────────────────────────────────────────────────────────────
    /check — Customer app service availability
-   Priority: exclusion > cluster > city
-───────────────────────────────────────────────────────────── */
+   
+   CORRECT PRIORITY LOGIC:
+   ─────────────────────────────────────────────────────────────
+   1. Load ALL zones (enabled + disabled) so we can detect
+      disabled clusters and block them — not fall through to city.
+   
+   2. Walk every zone the point falls inside:
+        a. Exclusion zone hit  → blocked immediately
+        b. Disabled zone hit   → blocked immediately
+           (a disabled cluster must block, not fall back to city)
+   
+   3. Among the remaining (enabled, non-excluded) zones pick the
+      highest-priority match:
+        cluster (2) > city (1) > area (0)
+   
+   4. No match at all → outside_coverage
+   ─────────────────────────────────────────────────────────────
+*/
 export const checkServiceAvailability = async (req, res) => {
   const { lat, lng } = req.body;
-  if (lat == null || lng == null) return res.status(400).json({ message: 'lat and lng required' });
+  if (lat == null || lng == null)
+    return res.status(400).json({ message: 'lat and lng required' });
 
   try {
-    const zones = await Zone.find({ serviceEnabled: true });
+    // Load ALL zones — we need disabled ones too so we can block them
+    const allZones = await Zone.find();
 
-    let matchedZone = null;
-    let priority = 0; // higher = better match
+    let matchedZone = null;   // best enabled zone found so far
+    let priority    = 0;      // cluster=2, city=1, area=0
 
-    for (const zone of zones) {
+    for (const zone of allZones) {
+      // Skip zones whose polygon doesn't contain the point
       if (!pointInPolygon(lat, lng, zone.polygon)) continue;
 
-      // Check if inside any exclusion zone → blocked
+      // ── 1. Exclusion zone check ──────────────────────────────────────────
+      // A cut-out inside ANY zone (enabled or not) blocks the point.
       const inExclusion = (zone.exclusionZones ?? []).some(ex =>
         pointInPolygon(lat, lng, ex.polygon)
       );
       if (inExclusion) {
-        return res.json({ serviceAvailable: false, reason: 'exclusion_zone', zoneName: zone.name });
+        return res.json({
+          serviceAvailable: false,
+          reason:           'exclusion_zone',
+          message:          'This area has been excluded from service.',
+          zoneName:         zone.name,
+        });
       }
 
-      // Priority: cluster (2) > city (1) > area (0)
+      // ── 2. Disabled zone check ───────────────────────────────────────────
+      // If the point is inside a DISABLED zone, block immediately.
+      // This prevents city-zone fallback when a cluster is turned off.
+      if (!zone.serviceEnabled) {
+        return res.json({
+          serviceAvailable: false,
+          reason:           'zone_disabled',
+          message:          'Service is currently not available in this area.',
+          zoneName:         zone.name,
+        });
+      }
+
+      // ── 3. Track best enabled match by priority ──────────────────────────
       const p = zone.type === 'cluster' ? 2 : zone.type === 'city' ? 1 : 0;
       if (p > priority) { priority = p; matchedZone = zone; }
     }
 
+    // ── 4. No zone matched at all → outside coverage ─────────────────────
     if (!matchedZone) {
-      return res.json({ serviceAvailable: false, reason: 'outside_coverage' });
+      return res.json({
+        serviceAvailable: false,
+        reason:           'outside_coverage',
+        message:          'Service is not available in this area yet.',
+      });
     }
 
-    res.json({
+    // ── 5. Valid zone — return settings ──────────────────────────────────
+    return res.json({
       serviceAvailable: true,
       zoneName:         matchedZone.name,
       zoneType:         matchedZone.type,
@@ -286,5 +329,9 @@ export const checkServiceAvailability = async (req, res) => {
       driverIncentive:  matchedZone.driverIncentive,
       vehicleTypes:     matchedZone.vehicleTypes,
     });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+
+  } catch (e) {
+    console.error('checkServiceAvailability error:', e.message);
+    res.status(500).json({ message: e.message });
+  }
 };
