@@ -9,7 +9,7 @@ import {
   removeExclusionZone,
   checkServiceAvailability,
   autoGenerateClusters,
-} from './zoneController.js';
+}from '../controllers/zoneController.js';
 
 const router = express.Router();
 
