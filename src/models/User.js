@@ -185,6 +185,29 @@ const userSchema = new mongoose.Schema(
     profilePhotoUrl: String,
 
     /* ================================
+       🚫 DRIVER STATUS / MODERATION
+    ================================= */
+    isBlocked: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    isSuspended: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    strikes: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    deviceId: {
+      type: String,
+      default: null,
+    },
+
+    /* ================================
        📄 VERIFICATION DOCUMENTS
     ================================= */
     documentStatus: {

@@ -35,6 +35,9 @@ import {
   unblockCustomer,
   blockDriver,
   unblockDriver,
+  suspendDriver,
+  approveDriver,
+  rejectDriver,
 
   // Push Notification
   sendPushToUsers,
@@ -184,6 +187,9 @@ router.get("/driver-trips/:driverId", async (req, res) => {
 router.get("/drivers", verifyAdminToken, getAllDrivers);
 router.put("/driver/block/:driverId", verifyAdminToken, blockDriver);
 router.put("/driver/unblock/:driverId", verifyAdminToken, unblockDriver);
+router.put("/driver/suspend/:driverId", verifyAdminToken, suspendDriver);
+router.put("/driver/approve/:driverId", verifyAdminToken, approveDriver);
+router.put("/driver/reject/:driverId", verifyAdminToken, rejectDriver);
 
 /* ================================
    🚘 TRIPS MGMT

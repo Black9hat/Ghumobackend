@@ -144,6 +144,20 @@ const planSchema = new mongoose.Schema(
     },
 
     // ════════════════════════════════════════════════════════════════════
+    // OFFER WINDOW (Admin sets when plan is available to buy)
+    // ════════════════════════════════════════════════════════════════════
+    planActivationDate: {
+      type: Date,
+      default: null,
+      description: 'Date from which this plan becomes available for purchase (null = always available)',
+    },
+    planExpiryDate: {
+      type: Date,
+      default: null,
+      description: 'Date after which this plan can no longer be purchased (null = never expires)',
+    },
+
+    // ════════════════════════════════════════════════════════════════════
     // STATS (For admin dashboard)
     // ════════════════════════════════════════════════════════════════════
     totalPurchases: {
@@ -230,6 +244,16 @@ planSchema.methods.isInTimeWindow = function () {
 };
 
 /**
+ * Check if plan is currently available for purchase (offer window)
+ */
+planSchema.methods.isAvailableForPurchase = function () {
+  const now = new Date();
+  if (this.planActivationDate && now < this.planActivationDate) return false;
+  if (this.planExpiryDate && now > this.planExpiryDate) return false;
+  return this.isActive;
+};
+
+/**
  * Get plan display info for driver app
  */
 planSchema.methods.getDriverInfo = function () {
@@ -245,6 +269,9 @@ planSchema.methods.getDriverInfo = function () {
     isTimeBasedPlan: this.isTimeBasedPlan,
     timeWindow: this.isTimeBasedPlan ? `${this.planStartTime} - ${this.planEndTime}` : null,
     description: this.description,
+    planActivationDate: this.planActivationDate,
+    planExpiryDate: this.planExpiryDate,
+    availableForPurchase: this.isAvailableForPurchase(),
   };
 };
 
