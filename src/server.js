@@ -19,7 +19,7 @@ import privacyRoutes from './routes/privacyRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';  // ← NEW
 import webhookRoutes from './routes/webhookRoutes.js';  // ← Razorpay webhook
 import planRoutes from './routes/planRoutes.js';
-import zoneRoutes from './routes/zoneroutes.js';
+import zoneRoutes from './routes/zoneRoutes.js';
 // Routes
 import userRoutes from './routes/userRoutes.js';
 import authRoutes from './routes/authRoutes.js';
