@@ -60,7 +60,7 @@ import {
   deleteDriverDocumentImage,
   getDriversWithDocStatus,
   getActionableDriverDocuments,
-
+suspendDriver, approveDriver, rejectDriver,
   // TEST
   testImageAccess,
 } from "../controllers/adminController.js";
@@ -132,7 +132,9 @@ router.get("/document-image-base64/:docId", verifyAdminToken, getDocumentImageBa
    🟡 ADMIN AUTH
 ================================ */
 router.post("/login", adminLogin);
-
+router.put("/driver/suspend/:driverId", verifyAdminToken, suspendDriver);
+router.put("/driver/approve/:driverId", verifyAdminToken, approveDriver);
+router.put("/driver/reject/:driverId", verifyAdminToken, rejectDriver);
 /* ================================
    🟢 DASHBOARD
 ================================ */

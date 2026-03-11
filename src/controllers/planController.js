@@ -28,7 +28,12 @@ const {
   planPrice,      // ← ADD
   durationDays,   // ← ADD
   description,
-  benefits
+  benefits,
+  isTimeBasedPlan,     // ← ADD
+  planStartTime,       // ← ADD
+  planEndTime,         // ← ADD
+  planActivationDate,  // ← ADD
+  planExpiryDate,      // ← ADD
 } = req.body;
 
     // Validation
@@ -53,6 +58,20 @@ const {
       });
     }
 
+    // ── Validate offer window dates ──
+    if (planActivationDate && isNaN(new Date(planActivationDate).getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid planActivationDate'
+      });
+    }
+    if (planExpiryDate && isNaN(new Date(planExpiryDate).getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid planExpiryDate'
+      });
+    }
+
     // Check if plan already exists
     const existing = await Plan.findOne({ planName });
     if (existing) {
@@ -74,6 +93,11 @@ const plan = new Plan({
   durationDays: durationDays || 30,          // ← ADD
   description: description || '',
   benefits: benefits || [],
+  isTimeBasedPlan: isTimeBasedPlan || false,
+  planStartTime: planStartTime || '00:00',
+  planEndTime: planEndTime || '23:59',
+  planActivationDate: planActivationDate ? new Date(planActivationDate) : null,
+  planExpiryDate: planExpiryDate ? new Date(planExpiryDate) : null,
   createdBy: req.admin?._id || req.admin?.id,
   isActive: true
 });
@@ -195,6 +219,26 @@ export const updatePlan = async (req, res) => {
           message: 'bonusMultiplier must be >= 1.0'
         });
       }
+    }
+
+    // ── Validate offer window dates ──
+    if (updates.planActivationDate !== undefined) {
+      if (updates.planActivationDate && isNaN(new Date(updates.planActivationDate).getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid planActivationDate'
+        });
+      }
+      updates.planActivationDate = updates.planActivationDate ? new Date(updates.planActivationDate) : null;
+    }
+    if (updates.planExpiryDate !== undefined) {
+      if (updates.planExpiryDate && isNaN(new Date(updates.planExpiryDate).getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid planExpiryDate'
+        });
+      }
+      updates.planExpiryDate = updates.planExpiryDate ? new Date(updates.planExpiryDate) : null;
     }
 
     updates.updatedBy = req.admin?._id || req.admin?.id;
@@ -506,6 +550,7 @@ export const getCurrentPlan = async (req, res) => {
 export const getAvailablePlans = async (req, res) => {
   try {
     const driverId = req.user._id;
+    const now = new Date();
 
     // Find plan IDs the driver currently has an active subscription for
     const activeDriverPlans = await DriverPlan.find({
@@ -517,7 +562,14 @@ export const getAvailablePlans = async (req, res) => {
 
     const activePlanIds = activeDriverPlans.map((dp) => dp.plan).filter(Boolean);
 
-    const query = { isActive: true };
+    // ── Filter by offer window ──
+    const query = {
+      isActive: true,
+      $and: [
+        { $or: [{ planActivationDate: null }, { planActivationDate: { $lte: now } }] },
+        { $or: [{ planExpiryDate: null }, { planExpiryDate: { $gte: now } }] },
+      ],
+    };
     if (activePlanIds.length > 0) {
       query._id = { $nin: activePlanIds };
     }
@@ -526,7 +578,7 @@ export const getAvailablePlans = async (req, res) => {
 
     res.json({
       success: true,
-      data: plans
+      data: plans.map((p) => p.getDriverInfo())
     });
   } catch (error) {
     console.error('❌ getAvailablePlans error:', error);

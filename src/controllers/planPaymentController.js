@@ -87,12 +87,28 @@ export const createRazorpayPlanOrder = async (req, res) => {
       });
     }
 
-    // ── Check if driver already has active plan ──
+    // ── Check plan offer window ──
+    if (plan.planActivationDate && new Date() < plan.planActivationDate) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'This plan is not yet available for purchase.',
+        availableFrom: plan.planActivationDate,
+      });
+    }
+    if (plan.planExpiryDate && new Date() > plan.planExpiryDate) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'This plan offer has expired and is no longer available for purchase.',
+      });
+    }
+
+    // ── Check if driver already has active plan (ONE PLAN AT A TIME) ──
     const activeDriverPlan = await DriverPlan.findOne({
       driver: driverId,
       isActive: true,
-      paymentStatus: 'completed',
-      $or: [{ expiryDate: null }, { expiryDate: { $gte: new Date() } }],
+      expiryDate: { $gte: new Date() },
     }).session(session);
 
     if (activeDriverPlan) {
@@ -100,13 +116,12 @@ export const createRazorpayPlanOrder = async (req, res) => {
       await session.endSession();
       return res.status(400).json({
         success: false,
-        message: 'You already have an active plan. Wait for it to expire.',
-        activePlanExpiry: activeDriverPlan.expiryDate,
-        daysRemaining: activeDriverPlan.expiryDate
-          ? Math.ceil(
-              (new Date(activeDriverPlan.expiryDate) - new Date()) / (1000 * 60 * 60 * 24)
-            )
-          : null,
+        message: 'You already have an active plan. Please wait for it to expire before purchasing a new one.',
+        activePlan: {
+          planName: activeDriverPlan.planName,
+          expiryDate: activeDriverPlan.expiryDate,
+          daysRemaining: Math.ceil((activeDriverPlan.expiryDate - new Date()) / (24 * 60 * 60 * 1000)),
+        },
       });
     }
 
@@ -292,6 +307,19 @@ export const verifyPlanPayment = async (req, res) => {
     const now = new Date();
     const expiryDate = new Date();
     expiryDate.setDate(expiryDate.getDate() + plan.durationDays);
+
+    // ── Deactivate any old active plans (one plan at a time) ──
+    await DriverPlan.updateMany(
+      { driver: driverId, isActive: true },
+      {
+        $set: {
+          isActive: false,
+          deactivatedDate: now,
+          deactivationReason: 'manual_deactivation',
+        },
+      },
+      { session }
+    );
 
     const driverPlan = new DriverPlan({
       driver: driverId,

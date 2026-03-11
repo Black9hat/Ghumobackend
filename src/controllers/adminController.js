@@ -291,10 +291,9 @@ export const getDashboardStats = async (req, res) => {
 // ======================================================================
 export const getAllDrivers = async (req, res) => {
   try {
+    // ──── UPDATED getAllDrivers select ────
     const drivers = await User.find({ isDriver: true })
-      .select(
-        "name email phone vehicleType profilePhotoUrl photo profilePic driverPhoto avatar isBlocked"
-      );
+      .select("name email phone vehicleType profilePhotoUrl photo profilePic driverPhoto avatar isBlocked isSuspended isOnline strikes vehicleNumber vehicleBrand rating deviceId documentStatus isVerified createdAt");
 
     const baseUrl = `${req.protocol}://${req.get("host")}`;
 
@@ -317,14 +316,25 @@ export const getAllDrivers = async (req, res) => {
         }
       }
 
+      // ──── UPDATED driver map return object ────
       return {
         _id: d._id,
         name: d.name,
         email: d.email,
         phone: d.phone,
         vehicleType: d.vehicleType,
+        vehicleNumber: d.vehicleNumber,
+        vehicleBrand: d.vehicleBrand,
         profilePhotoUrl: finalPhotoUrl,
-        isBlocked: d.isBlocked,
+        isBlocked: d.isBlocked || false,
+        isSuspended: d.isSuspended || false,
+        isOnline: d.isOnline || false,
+        strikes: d.strikes || 0,
+        rating: d.rating,
+        deviceId: d.deviceId,
+        documentStatus: d.documentStatus,
+        isVerified: d.isVerified,
+        createdAt: d.createdAt,
       };
     });
 
@@ -364,6 +374,57 @@ export const unblockDriver = async (req, res) => {
   } catch (err) {
     console.error("❌ Error unblocking driver:", err);
     res.status(500).json({ message: "Error unblocking driver." });
+  }
+};
+
+// ──── NEW: suspendDriver ────
+export const suspendDriver = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    const driver = await User.findByIdAndUpdate(
+      driverId,
+      { isSuspended: true, $inc: { strikes: 1 } },
+      { new: true }
+    );
+    if (!driver) return res.status(404).json({ success: false, message: 'Driver not found' });
+    res.status(200).json({ success: true, message: 'Driver suspended successfully.', strikes: driver.strikes });
+  } catch (err) {
+    console.error('❌ Error suspending driver:', err);
+    res.status(500).json({ success: false, message: 'Error suspending driver.' });
+  }
+};
+
+// ──── NEW: approveDriver ────
+export const approveDriver = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    const driver = await User.findByIdAndUpdate(
+      driverId,
+      { isSuspended: false, isBlocked: false, documentStatus: 'approved', isVerified: true },
+      { new: true }
+    );
+    if (!driver) return res.status(404).json({ success: false, message: 'Driver not found' });
+    res.status(200).json({ success: true, message: 'Driver approved successfully.' });
+  } catch (err) {
+    console.error('❌ Error approving driver:', err);
+    res.status(500).json({ success: false, message: 'Error approving driver.' });
+  }
+};
+
+// ──── NEW: rejectDriver ────
+export const rejectDriver = async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    const driver = await User.findByIdAndUpdate(
+      driverId,
+      { isSuspended: false, isBlocked: true, documentStatus: 'rejected', isVerified: false },
+      { new: true }
+    );
+    if (!driver) return res.status(404).json({ success: false, message: 'Driver not found' });
+    res.status(200).json({ success: true, message: 'Driver rejected successfully.' });
+  } catch (err) {
+    console.error('❌ Error rejecting driver:', err);
+    res.status(500).json({ success: false, message: 'Error rejecting driver.' });
   }
 };
 

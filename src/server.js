@@ -35,7 +35,8 @@ import walletRoutes from './routes/walletRoutes.js';
 import chatRoutes from './routes/chatRoutes.js';
 import rideHistoryRoutes from './routes/rideHistory.js';
 import driverIncentiveRoutes from './routes/driverIncentiveRoutes.js';
-
+import driverEarningsRoutes from './routes/driverEarningsRoutes.js';
+import { startPlanExpiryJob } from './cron/planExpiryJob.js';
 // Coupon Routes
 import couponRoutes from './routes/coupons.routes.js';
 import adminCouponRoutes from './routes/admin.coupons.routes.js';
@@ -159,6 +160,9 @@ app.use('/api/admin/service-areas', adminServiceAreaRoutes);
 app.use('/api/help', helpRoutes);
 app.use('/api/admin', adminHelpRoutes);
 
+// ──── ADD route registration for driver earnings ────
+app.use('/api', driverEarningsRoutes);
+
 // Legacy ride history route
 app.use(rideHistoryRoutes);
 
@@ -220,7 +224,35 @@ console.log('    POST /api/auth/firebase-sync');
 console.log('    POST /api/auth/logout');
 console.log('    POST /api/auth/refresh-fcm-token');
 console.log('    GET  /api/auth/session-status/:phone');
-console.log('    GET  /api/auth/session-history/:phone\n');
+console.log('    GET  /api/auth/session-history/:phone');
+console.log('');
+console.log('  💰 Plan Management Routes (Driver):');
+console.log('    GET  /api/driver/plans/available');
+console.log('    POST /api/driver/plans/:planId/create-order');
+console.log('    POST /api/driver/plans/:planId/verify-payment');
+console.log('    GET  /api/driver/plan/current');
+console.log('    POST /api/driver/plan/current/deactivate');
+console.log('');
+console.log('  💰 Plan Management Routes (Admin):');
+console.log('    POST   /api/admin/plans');
+console.log('    GET    /api/admin/plans');
+console.log('    GET    /api/admin/plans/:planId');
+console.log('    PUT    /api/admin/plans/:planId');
+console.log('    DELETE /api/admin/plans/:planId');
+console.log('    PATCH  /api/admin/plans/:planId/toggle');
+console.log('');
+console.log('  👥 Driver Management Routes (Admin):');
+console.log('    GET    /api/admin/drivers');
+console.log('    POST   /api/admin/drivers/:driverId/approve');
+console.log('    POST   /api/admin/drivers/:driverId/reject');
+console.log('    POST   /api/admin/drivers/:driverId/suspend');
+console.log('    POST   /api/admin/drivers/:driverId/block');
+console.log('    POST   /api/admin/drivers/:driverId/unblock');
+console.log('');
+console.log('  💹 Driver Earnings Routes:');
+console.log('    GET  /api/driver/earnings/summary/:driverId');
+console.log('    GET  /api/driver/earnings/breakdown/:driverId');
+console.log('    GET  /api/driver/earnings/transactions/:driverId\n');
 
 /**
  * STANDBY DRIVER REASSIGN CRON
@@ -235,6 +267,9 @@ setInterval(() => {
  * PLAN EXPIRY CRON (every hour)
  */
 startExpirePlansCron();
+
+// ──── ADD plan expiry job (handles time-window and offer window expiration) ────
+startPlanExpiryJob();
 
 /**
  * DRIVER STUCK CLEANUP EVERY 5 MINUTES
@@ -340,6 +375,24 @@ httpServer.listen(PORT, () => {
   console.log('🆘 Help/Support system enabled');
   console.log('   - Customer: /api/help/*');
   console.log('   - Admin Panel: /api/admin/help/*');
+  console.log('');
+  console.log('💰 Plan Management system enabled');
+  console.log('   - Plan Types: Basic, Standard, Premium');
+  console.log('   - Offer Windows: Time-limited promotions');
+  console.log('   - Time-Windows: Hour-based benefits (e.g., 6AM-11PM)');
+  console.log('   - One Plan Per Driver: Enforced');
+  console.log('   - Plan-Aware Earnings: Commission & bonus tracking');
+  console.log('   - Auto-Expiration: Plans expire automatically');
+  console.log('   - Customer Routes: /api/driver/plans/*');
+  console.log('   - Admin Routes: /api/admin/plans/*');
+  console.log('   - Driver Earnings: /api/driver/earnings/*');
+  console.log('   - Driver Moderation: /api/admin/drivers/:id/*');
+  console.log('');
+  console.log('⏰ Cron Jobs enabled');
+  console.log('   - Plan Expiry Check: Every hour');
+  console.log('   - Plan Cleanup: Every minute');
+  console.log('   - Driver Stuck Cleanup: Every 5 minutes');
+  console.log('   - Standby Reassign: Every 2 minutes');
   console.log('='.repeat(70));
   console.log('');
 });

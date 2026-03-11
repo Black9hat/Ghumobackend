@@ -109,7 +109,6 @@ router.get('/admin/plans/:planId/purchases', verifyAdminToken, getPlanPurchaseHi
 // ════════════════════════════════════════════════════════════════════════════
 // ADMIN — Drivers with plans
 // ════════════════════════════════════════════════════════════════════════════
-
 router.get('/admin/drivers/plans', verifyAdminToken, getDriversWithPlans);
 
 router.post('/admin/drivers/:driverId/assign-plan', verifyAdminToken, assignPlanToDriver);
