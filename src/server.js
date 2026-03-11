@@ -43,6 +43,11 @@ import adminCouponRoutes from './routes/admin.coupons.routes.js';
 
 import promotionRoutes from './routes/promotionRoutes.js';
 
+// Referral & Reward Config Routes (NEW)
+import referralRoutes from './routes/referralRoutes.js';
+import rewardRoutes from './routes/rewards.routes.js';
+import adminRewardConfigRoutes from './routes/adminRewardConfigRoutes.js';
+
 // Service Area Routes
 import serviceAreaRoutes from './routes/service_area_routes.js';
 import adminServiceAreaRoutes from './routes/admin_service_area_routes.js';
@@ -151,6 +156,13 @@ app.use('/api/admin', adminCouponRoutes);
 
 // Promotions
 app.use('/api', promotionRoutes);
+
+// Referral Routes (Customer)
+app.use('/api/referral', referralRoutes);
+app.use('/api/rewards', rewardRoutes);
+
+// Admin Reward Config + Referral Stats
+app.use('/api/admin', adminRewardConfigRoutes);
 
 // Service Area Routes
 app.use('/api/service-areas', serviceAreaRoutes);

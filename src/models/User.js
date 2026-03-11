@@ -49,6 +49,40 @@ const userSchema = new mongoose.Schema(
     },
 
     /* ================================
+       🎟️ REFERRAL SYSTEM
+    ================================= */
+    referralCode: {
+      type: String,
+      unique: true,
+      sparse: true,       // allows null without unique-conflict
+      uppercase: true,
+    },
+    referredBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    // How many of this user's referrals have completed their first ride
+    successfulReferrals: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    // Set to true once the 5-referral reward has been issued
+    referralRewardClaimed: {
+      type: Boolean,
+      default: false,
+    },
+
+    /* ================================
+       🎁 WELCOME COUPON
+    ================================= */
+    welcomeCouponAssigned: {
+      type: Boolean,
+      default: false,
+    },
+
+    /* ================================
        🚗 DRIVER FIELDS
     ================================= */
     isDriver: {

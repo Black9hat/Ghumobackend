@@ -14,7 +14,9 @@ import { generateOTP } from '../utils/otpGeneration.js';
 import RideHistory from '../models/RideHistory.js';
 
 import RewardSettings from '../models/RewardSettings.js';
+import AppSettings from '../models/AppSettings.js';
 import Reward from '../models/Reward.js';
+import { awardCoins, handleFirstRideReferral } from '../services/rewardService.js';
 
 // ✅ LEGAL STATUS TRANSITIONS
 const ALLOWED_TRANSITIONS = {
@@ -375,7 +377,7 @@ const createShortTrip = async (req, res) => {
   let discountCustomerId = null;
 
   try {
-    const { customerId, pickup, drop, vehicleType, fare } = req.body;
+    const { customerId, pickup, drop, vehicleType, fare, useCoins } = req.body;
 
     if (!fare || fare <= 0) {
       return res.status(400).json({ success: false, message: 'Valid fare required' });
@@ -401,35 +403,36 @@ const createShortTrip = async (req, res) => {
       drop.coordinates[1], drop.coordinates[0]
     );
 
-    // Discount logic
+    // Coin discount logic — only applies when useCoins === true (user opted in)
     try {
-      const settings = await RewardSettings.findOne();
-      if (settings?.getTierByDistance) {
-        const tier = settings.getTierByDistance(distance);
+      const appSettings = await AppSettings.getSettings();
+      const { coinsRequiredForDiscount, discountAmount, enabled } = appSettings.coins;
+
+      if (enabled && useCoins === true && coinsRequiredForDiscount > 0) {
         const CustomerModel = await getCustomerModel();
         const customerRecord = await CustomerModel.findById(customerId);
 
-        if (customerRecord && (customerRecord.coins || 0) >= tier.coinsRequiredForDiscount) {
+        if (customerRecord && (customerRecord.coins || 0) >= coinsRequiredForDiscount) {
           const updatedCustomer = await CustomerModel.findOneAndUpdate(
-            { _id: customerId, coins: { $gte: tier.coinsRequiredForDiscount } },
-            { $inc: { coins: -tier.coinsRequiredForDiscount }, $set: { lastDiscountUsedAt: new Date() } },
+            { _id: customerId, coins: { $gte: coinsRequiredForDiscount } },
+            { $inc: { coins: -coinsRequiredForDiscount, totalCoinsRedeemed: coinsRequiredForDiscount }, $set: { lastDiscountUsedAt: new Date() } },
             { new: true }
           );
 
           if (updatedCustomer) {
-            finalFare = Math.max(0, fare - tier.discountAmount);
-            discountApplied = tier.discountAmount;
-            coinsDeducted = tier.coinsRequiredForDiscount;
+            finalFare = Math.max(0, fare - discountAmount);
+            discountApplied = discountAmount;
+            coinsDeducted = coinsRequiredForDiscount;
 
             await Reward.create({
               customerId, coins: -coinsDeducted, type: 'redeemed',
-              description: `₹${tier.discountAmount} discount applied`, createdAt: new Date()
+              description: `₹${discountAmount} discount applied (${coinsDeducted} coins)`, createdAt: new Date()
             });
 
             const customerUser = await User.findById(customerId).select('socketId').lean();
             if (customerUser?.socketId && io) {
               io.to(customerUser.socketId).emit('coins:redeemed', {
-                coinsUsed: coinsDeducted, discountAmount: tier.discountAmount,
+                coinsUsed: coinsDeducted, discountAmount,
                 remainingCoins: updatedCustomer.coins || 0
               });
             }
@@ -1359,7 +1362,23 @@ const completeRideWithVerification = async (req, res) => {
         trip.drop.coordinates[1], trip.drop.coordinates[0]
       );
 
-      coinReward = await awardCoinsToCustomer(trip.customerId, tripId, tripDistance, session);
+      coinReward = await awardCoins(trip.customerId, tripId, 'ride_reward', {
+        distanceKm: tripDistance,
+        vehicleType: trip.vehicleType,
+      });
+
+      // Check first ride for referral
+      const completedCount = await Trip.countDocuments({
+        customerId: trip.customerId,
+        status: 'completed',
+        paymentStatus: 'completed',
+      });
+      if (completedCount === 1) {
+        handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
+          console.warn('⚠️ handleFirstRideReferral failed:', e.message)
+        );
+      }
+
       driverIncentives = await awardIncentivesToDriver(driverId, tripId, session);
 
       await User.findByIdAndUpdate(driverId, {
@@ -1573,11 +1592,31 @@ const confirmCashCollection = async (req, res) => {
 
     console.log('✅ Cash collection complete');
 
-    // ── 6. Award coins to customer (non-critical) ────────────────────
+    // ── 6. Award coins to customer + handle first-ride referral (non-critical) ─
     let coinReward = null;
     try {
       if (trip.customerId) {
-        coinReward = await awardCoinsToCustomer(trip.customerId, tripId, null);
+        // Use the new rewardService for consistent coin logic
+        const cashTripDistance = calculateDistanceFromCoords(
+          trip.pickup.coordinates[1], trip.pickup.coordinates[0],
+          trip.drop.coordinates[1], trip.drop.coordinates[0]
+        );
+        coinReward = await awardCoins(trip.customerId, tripId, 'ride_reward', {
+          distanceKm: cashTripDistance,
+          vehicleType: trip.vehicleType,
+        });
+
+        // Check if this is their first completed ride → trigger referral chain
+        const completedCount = await Trip.countDocuments({
+          customerId: trip.customerId,
+          status: 'completed',
+          paymentCollected: true,
+        });
+        if (completedCount === 1) {
+          handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
+            console.warn('⚠️ handleFirstRideReferral failed:', e.message)
+          );
+        }
       }
     } catch (coinErr) {
       console.warn('⚠️ Coin award failed (non-critical):', coinErr.message);
