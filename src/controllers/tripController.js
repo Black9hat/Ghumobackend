@@ -1352,9 +1352,37 @@ const completeRideWithVerification = async (req, res) => {
       await trip.save({ session });
       console.log('✅ Trip completed + payment marked collected');
 
-      walletResult = await processWalletTransaction(driverId, tripId, fareAmount, session);
-      if (!walletResult.success) {
-        throw new Error('Wallet processing failed: ' + walletResult.error);
+      // ──── FIX: Only process wallet for non-cash payments ────
+      // For cash rides, wallet will be processed separately in confirmCashCollection()
+      // to prevent duplicate transaction recording
+      const paymentMethod = trip.payment?.method || trip.paymentMethod || 'unknown';
+      
+      if (paymentMethod?.toLowerCase() === 'cash') {
+        console.log('💰 Cash payment detected - wallet will be processed in confirmCashCollection()');
+        walletResult = {
+          success: true,
+          fareBreakdown: {
+            tripFare: fareAmount,
+            commission: 0,
+            commissionPercentage: 0,
+            driverEarning: fareAmount,
+            planBonus: 0,
+            planApplied: false,
+            planName: null,
+          },
+          wallet: {
+            totalEarnings: 0,
+            totalCommission: 0,
+            pendingAmount: 0,
+          }
+        };
+      } else {
+        // Online payment (Razorpay, etc.) - process wallet now
+        console.log('💳 Online payment detected - processing wallet transaction');
+        walletResult = await processWalletTransaction(driverId, tripId, fareAmount, session);
+        if (!walletResult.success) {
+          throw new Error('Wallet processing failed: ' + walletResult.error);
+        }
       }
 
       const tripDistance = calculateDistanceFromCoords(
@@ -1496,18 +1524,58 @@ const confirmCashCollection = async (req, res) => {
       return res.json({ success: true, message: 'Cash already collected', alreadyProcessed: true });
     }
 
-    // ── 2. Calculate fare & commission ───────────────────────────────
+    // ── 2. Calculate fare & commission (check for active plan) ────────
     const COMMISSION_RATE = 0.20;
     const fareAmount = Number(fare) || trip.finalFare || trip.fare || 0;
     if (fareAmount <= 0) {
       await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Invalid fare amount' });
+           return res.status(400).json({ success: false, message: 'Invalid fare amount' });
     }
 
-    const commission    = Math.round(fareAmount * COMMISSION_RATE * 100) / 100;
-    const driverEarning = Math.round((fareAmount - commission) * 100) / 100;
+    // ──── FIX: Check for active plan to apply benefits ────
+    const now = new Date();
+    const activePlan = await DriverPlan.findOne({
+      driver: driverId,
+      isActive: true,
+      expiryDate: { $gt: now },
+      $or: [
+        { paymentStatus: 'completed' },
+        { purchaseMethod: 'admin_assigned' },
+      ]
+    }).session(session);
 
-    console.log(`   Fare: ₹${fareAmount} | Commission: ₹${commission} | Driver: ₹${driverEarning}`);
+    let planApplied = false;
+    let finalCommissionRate = COMMISSION_RATE;
+    let planBonus = 0;
+    let appliedPlanDetails = null;
+
+    if (activePlan) {
+      const isInTimeWindow = activePlan.isValidNow ? activePlan.isValidNow() : true;
+      if (isInTimeWindow) {
+        planApplied = true;
+        finalCommissionRate = activePlan.noCommission ? 0 : activePlan.commissionRate;
+        appliedPlanDetails = {
+          planId: activePlan.plan,
+          planName: activePlan.planName,
+          commissionRate: finalCommissionRate,
+          bonusMultiplier: activePlan.bonusMultiplier || 1.0
+        };
+
+        const commission = Math.round(fareAmount * finalCommissionRate * 100) / 100;
+        const baseEarning = Math.round((fareAmount - commission) * 100) / 100;
+        const bonus = Math.round(baseEarning * (activePlan.bonusMultiplier - 1) * 100) / 100;
+        planBonus = bonus;
+
+        console.log(`📋 Plan applied: "${activePlan.planName}" | Commission: ${finalCommissionRate * 100}% | Bonus: x${activePlan.bonusMultiplier}`);
+      }
+    }
+
+    // Use calculated commission rate with plan (not hardcoded 20%)
+    const commission = Math.round(fareAmount * finalCommissionRate * 100) / 100;
+    const baseEarning = Math.round((fareAmount - commission) * 100) / 100;
+    const driverEarning = Math.round((baseEarning + planBonus) * 100) / 100;
+
+    console.log(`   Fare: ₹${fareAmount} | Commission: ₹${commission} | Plan Bonus: ₹${planBonus} | Driver: ₹${driverEarning}`);
 
     // ── 3. Update wallet directly ────────────────────────────────────
     let wallet = await Wallet.findOne({ driverId }).session(session);
@@ -1522,31 +1590,34 @@ const confirmCashCollection = async (req, res) => {
       });
     }
 
-    // Record credit transaction (full cash collected)
+    // Record ride earning with plan details (single comprehensive transaction)
     wallet.transactions.push({
       tripId,
       type: 'credit',
-      amount: fareAmount,
-      description: 'Cash collected from customer',
-      paymentMethod: 'cash',
-      status: 'completed',
-      createdAt: new Date()
-    });
-
-    // Record commission transaction (owed to platform)
-    wallet.transactions.push({
-      tripId,
-      type: 'commission',
-      amount: commission,
-      description: `Platform commission (${COMMISSION_RATE * 100}%)`,
+      amount: driverEarning,
+      originalFare: fareAmount,
+      commissionDeducted: commission,
+      planBonus: planBonus,
+      finalEarning: driverEarning,
+      description: planApplied
+        ? `Ride earnings: ₹${fareAmount} (Plan: ${appliedPlanDetails.planName})`
+        : `Ride earnings: ₹${fareAmount}`,
+      planApplied,
+      planId: appliedPlanDetails?.planId,
+      planName: appliedPlanDetails?.planName,
+      planCommissionRate: finalCommissionRate,
+      planBonusMultiplier: appliedPlanDetails?.bonusMultiplier || 1.0,
       paymentMethod: 'cash',
       status: 'completed',
       createdAt: new Date()
     });
 
     // Update totals
-    wallet.totalEarnings    += fareAmount;
+    wallet.totalEarnings    += driverEarning;
     wallet.totalCommission  += commission;
+    if (planApplied && planBonus > 0) {
+      wallet.totalPlanBonusEarned = (wallet.totalPlanBonusEarned || 0) + planBonus;
+    }
 
     // Cash flow: driver physically has the cash, owes commission to platform
     // Commission is DEBT — add to pendingAmount directly
@@ -1557,7 +1628,7 @@ const confirmCashCollection = async (req, res) => {
 
     await wallet.save({ session });
 
-    console.log(`   Wallet saved: pendingAmount=₹${wallet.pendingAmount}, totalCommission=₹${wallet.totalCommission}`);
+    console.log(`   Wallet saved: earning=₹${driverEarning}, commission=₹${commission}, pending=₹${wallet.pendingAmount}`);
 
     // ── 4. Mark trip as payment collected ───────────────────────────
     trip.paymentCollected  = true;
