@@ -2,6 +2,10 @@ import asyncHandler from "express-async-handler";
 import Rate from "../models/Rate.js";
 import { calcFare } from "../utils/fareCalc.js";
 import { getGoogleRouteDuration } from "../utils/getGoogleRouteDuration.js";
+import User from "../models/User.js";
+import AppSettings from "../models/AppSettings.js";
+// 🪙 Coins: preview how many coins the customer will earn for this ride
+import { calculateCoinsForRide, getCoinsConfig } from "../services/coinService.js";
 
 /**
  * POST /api/fares/calc
@@ -21,6 +25,7 @@ export const createFare = asyncHandler(async (req, res) => {
     returnTrip,
     surge,
     weight,
+    customerId,   // 🎁 needed for welcome coupon eligibility check
   } = req.body;
 
   const vType = vehicleType?.toLowerCase?.();
@@ -120,6 +125,43 @@ if (req.__profile) {
   });
 
   /* ---------------------------------------------------------
+   * 3️⃣b 🎁 Welcome Coupon Eligibility Check
+   * --------------------------------------------------------- */
+  let applyWelcomeCoupon = false;
+  let welcomeFareAdjustment = 0;
+  let welcomeDiscountAmount = 0;
+  let welcomeCouponCode = "";
+
+  if (customerId) {
+    try {
+      const [customer, appSettings] = await Promise.all([
+        User.findById(customerId).select("welcomeCouponUsed").lean(),
+        AppSettings.findOne().lean(),
+      ]);
+
+      const wc = appSettings?.welcomeCoupon;
+      const netSaving = (Number(wc?.discountAmount) || 0) - (Number(wc?.fareAdjustment) || 0);
+
+      if (
+        wc?.enabled === true &&
+        customer?.welcomeCouponUsed === false &&
+        netSaving > 0  // only apply if customer actually saves money
+      ) {
+        applyWelcomeCoupon = true;
+        welcomeFareAdjustment = Number(wc.fareAdjustment) || 0;
+        welcomeDiscountAmount = Number(wc.discountAmount) || 0;
+        welcomeCouponCode = wc.code || "WELCOME";
+        console.log(`🎁 Welcome coupon eligible for customer ${customerId}: adj=₹${welcomeFareAdjustment}, discount=₹${welcomeDiscountAmount}, netSaving=₹${netSaving}`);
+      } else if (wc?.enabled === true && netSaving <= 0) {
+        console.warn(`⚠️ Welcome coupon NOT applied: fareAdjustment (₹${wc.fareAdjustment}) >= discountAmount (₹${wc.discountAmount}). Fix in admin Reward Config.`);
+      }
+    } catch (err) {
+      // Non-blocking — if check fails, just calculate fare normally
+      console.warn("⚠️ Welcome coupon eligibility check failed:", err.message);
+    }
+  }
+
+  /* ---------------------------------------------------------
    * 4️⃣ Calculate fare
    * --------------------------------------------------------- */
   let result;
@@ -134,6 +176,10 @@ if (req.__profile) {
       weight,
       startTime,
       dropTime,
+      // 🎁 Welcome coupon
+      applyWelcomeCoupon,
+      welcomeFareAdjustment,
+      welcomeDiscountAmount,
     });
   } catch (err) {
     console.error("❌ Fare calculation error:", err);
@@ -141,12 +187,50 @@ if (req.__profile) {
   }
 
   /* ---------------------------------------------------------
-   * 5️⃣ Respond
+   * 5️⃣ 🪙 Calculate coins preview (non-blocking)
+   * All bonus values come from AppSettings (admin-controlled).
+   * applyRandom=false → preview only; random bonus shown after ride.
+   * --------------------------------------------------------- */
+  let coinsEarn = 0;
+  let coinsBreakdown = null;
+  try {
+    const coinConfig = await getCoinsConfig();
+    if (coinConfig.enabled) {
+      const coinPreview = calculateCoinsForRide({
+        distanceKm:  liveDistanceKm,
+        vehicleType: vType,
+        coinConfig,
+        applyRandom: false,   // No random bonus in preview — surprise on completion
+      });
+      coinsEarn      = coinPreview.total;
+      coinsBreakdown = coinPreview.breakdown;
+    }
+  } catch (err) {
+    console.warn("⚠️ Coins preview failed (non-blocking):", err.message);
+  }
+
+  /* ---------------------------------------------------------
+   * 6️⃣ Respond
    * --------------------------------------------------------- */
   res.json({
     ok: true,
     rateSource: dbRate ? "db" : "internal",
     usedGoogleData: !!(origin && destination),
     ...result,
+    // 🪙 Coins the user will earn for completing this ride (shown under fare in Flutter)
+    coinsEarn,
+    coinsBreakdown,   // base/distanceBonus/vehicleBonus breakdown for Flutter display
+    // 🎁 Welcome coupon block (Flutter app uses this to show discount banner)
+    welcomeCoupon: applyWelcomeCoupon
+      ? {
+          applied: true,
+          code: welcomeCouponCode,
+          discountAmount: welcomeDiscountAmount,
+          fareAdjustment: welcomeFareAdjustment,
+          // netSaving = what the customer actually saves vs. original base fare
+          netSaving: welcomeDiscountAmount - welcomeFareAdjustment,
+          message: `🎉 Welcome discount of ₹${welcomeDiscountAmount - welcomeFareAdjustment} applied on your first ride!`,
+        }
+      : { applied: false },
   });
 });
