@@ -123,23 +123,23 @@ couponSchema.methods.isValid = function() {
   );
 };
 
-// 🚗 FIXED: Method to check if coupon is applicable for a vehicle
+// 🚗 Method to check if coupon is applicable for a vehicle
 couponSchema.methods.isApplicableForVehicle = function(vehicleType) {
+  // Empty array OR ['all'] both mean "applies to all vehicles"
   if (!this.applicableVehicles || this.applicableVehicles.length === 0) {
-    return false;  // empty = no match
+    return true;  // no restriction = all vehicles
   }
 
-  // If 'all' is in the array, coupon applies to all vehicle types
   if (this.applicableVehicles.includes('all')) {
     return true;
   }
 
-  // If no vehicle type specified, return false (can't match specific vehicles)
-  if (!vehicleType) {
-    return false;
+  // If no vehicleType specified by caller, treat coupon as applicable
+  // (vehicle hasn't been selected yet — don't block the coupon from showing)
+  if (!vehicleType || vehicleType === 'all') {
+    return true;
   }
 
-  // Otherwise check if the specific vehicle type is included
   return this.applicableVehicles.includes(vehicleType.toLowerCase());
 };
 
