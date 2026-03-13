@@ -31,9 +31,48 @@ router.put('/reward-config', verifyAdminToken, async (req, res) => {
 
     const settings = await AppSettings.getSettings();
 
-    if (welcomeCoupon) Object.assign(settings.welcomeCoupon, welcomeCoupon);
-    if (coins) Object.assign(settings.coins, coins);
-    if (referral) Object.assign(settings.referral, referral);
+    if (welcomeCoupon) {
+      Object.assign(settings.welcomeCoupon, welcomeCoupon);
+      settings.markModified('welcomeCoupon');
+    }
+    if (coins) {
+      // Scalar fields — safe with direct assignment
+      const scalarFields = [
+        'enabled','coinsPerRide','conversionRate',
+        'maxDiscountPerRide','coinsRequiredForMaxDiscount',
+        'randomBonusCoins','randomBonusChance',
+      ];
+      for (const key of scalarFields) {
+        if (coins[key] !== undefined) settings.coins[key] = coins[key];
+      }
+
+      // distanceBonuses: array of subdocs — must replace fully + markModified
+      if (Array.isArray(coins.distanceBonuses) && coins.distanceBonuses.length) {
+        settings.coins.distanceBonuses = coins.distanceBonuses.map(t => ({
+          label: t.label ?? '',
+          maxKm: t.maxKm ?? null,
+          bonus: Number(t.bonus) || 0,
+        }));
+        settings.markModified('coins.distanceBonuses');
+      }
+
+      // vehicleBonuses: typed nested subdoc — set each key individually
+      if (coins.vehicleBonuses && typeof coins.vehicleBonuses === 'object') {
+        const vb = coins.vehicleBonuses;
+        if (vb.bike    !== undefined) settings.coins.vehicleBonuses.bike    = Number(vb.bike)    || 0;
+        if (vb.auto    !== undefined) settings.coins.vehicleBonuses.auto    = Number(vb.auto)    || 0;
+        if (vb.car     !== undefined) settings.coins.vehicleBonuses.car     = Number(vb.car)     || 0;
+        if (vb.premium !== undefined) settings.coins.vehicleBonuses.premium = Number(vb.premium) || 0;
+        if (vb.xl      !== undefined) settings.coins.vehicleBonuses.xl      = Number(vb.xl)      || 0;
+        settings.markModified('coins.vehicleBonuses');
+      }
+
+      settings.markModified('coins');
+    }
+    if (referral) {
+      Object.assign(settings.referral, referral);
+      settings.markModified('referral');
+    }
 
     settings.updatedAt = new Date();
     settings.updatedBy = req.admin?.email || 'admin';
