@@ -1990,7 +1990,7 @@ export const requestTripSupport = async (req, res) => {
   }
 };
 
-// ========== EXPORTS ==========//
+// ========== EXPORTS ==========
 
 export {
   createShortTrip,

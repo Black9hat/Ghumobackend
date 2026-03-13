@@ -10,9 +10,9 @@
     "seed": "node src/seed/seedRates.js"
   },
   "repository": {
-    "type": "git",
-    "url": "git+https://github.com/sonalika127/Go_India.git"
-  },
+  "type": "git",
+  "url": "https://github.com/Black9hat/Ghumobackend.git"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
