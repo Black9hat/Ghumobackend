@@ -13,6 +13,10 @@ export function calcFare({
   durationMin = 0,
   startTime = null,
   dropTime = null,
+  // 🎁 Welcome coupon params (passed from fareController when eligible)
+  applyWelcomeCoupon = false,
+  welcomeFareAdjustment = 0,
+  welcomeDiscountAmount = 0,
 }) {
   // ─────────────────────────────────────────────────────
   // 1️⃣ VALIDATION
@@ -108,6 +112,23 @@ export function calcFare({
   }
 
   // ─────────────────────────────────────────────────────
+  // 8️⃣b 🎁 WELCOME COUPON ADJUSTMENT (First Ride Only)
+  // ─────────────────────────────────────────────────────
+  let welcomeCouponApplied = false;
+  let appliedFareAdjustment = 0;
+  let appliedDiscountAmount = 0;
+
+  if (applyWelcomeCoupon && welcomeDiscountAmount > 0) {
+    // Add internal adjustment first, then subtract discount
+    finalFare = finalFare + welcomeFareAdjustment - welcomeDiscountAmount;
+    finalFare = Math.max(finalFare, minFare); // never go below minimum fare
+    welcomeCouponApplied = true;
+    appliedFareAdjustment = welcomeFareAdjustment;
+    appliedDiscountAmount = welcomeDiscountAmount;
+    console.log(`🎁 Welcome Coupon Applied: +₹${welcomeFareAdjustment} adj, -₹${welcomeDiscountAmount} discount → ₹${finalFare}`);
+  }
+
+  // ─────────────────────────────────────────────────────
   // 9️⃣ GST & FINAL TOTAL
   // ─────────────────────────────────────────────────────
   const gstAmount   = (finalFare * gstPercent) / 100;
@@ -165,6 +186,11 @@ export function calcFare({
       platformCommissionPercent: platformCommission * 100,
       platformEarning: roundOff(platformCut),
       driverEarning: roundOff(driverGets),
+
+      // 🎁 Welcome coupon info
+      welcomeCouponApplied,
+      welcomeFareAdjustment: welcomeCouponApplied ? appliedFareAdjustment : 0,
+      welcomeDiscountAmount: welcomeCouponApplied ? appliedDiscountAmount : 0,
     },
   };
 }
