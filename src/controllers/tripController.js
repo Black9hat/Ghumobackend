@@ -1481,8 +1481,9 @@ const completeRideWithVerification = async (req, res) => {
     });
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
+    // withTransaction() auto-aborts on error — do NOT call abortTransaction() again
+    // or MongoDB throws "Cannot call abortTransaction twice"
+    try { session.endSession(); } catch (_) {}
     console.error('🔥 completeRideWithVerification error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1767,8 +1768,8 @@ const completeTrip = async (req, res) => {
     session.endSession();
     res.status(200).json({ success: true, message: 'Trip completed' });
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
+    // withTransaction() auto-aborts on error — do NOT call abortTransaction() again
+    try { session.endSession(); } catch (_) {}
     console.error('🔥 completeTrip error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
