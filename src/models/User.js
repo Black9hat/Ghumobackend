@@ -81,6 +81,11 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Prevents welcome coupon from being used more than once
+    welcomeCouponUsed: {
+      type: Boolean,
+      default: false,
+    },
 
     /* ================================
        🚗 DRIVER FIELDS
