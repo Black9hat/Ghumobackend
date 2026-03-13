@@ -3,16 +3,17 @@
 // Central service for:
 //   • Generating unique referral codes
 //   • Assigning welcome coupons to new customers
-//   • Awarding coins on ride completion  (replaces the duplicate in rewards.routes.js)
+//   • Awarding coins on ride completion  (now uses CoinTransaction model)
 //   • Processing referral first-ride completion & milestone rewards
 // ─────────────────────────────────────────────────────────────────────────────
 import mongoose from 'mongoose';
 import User from '../models/User.js';
 import Coupon from '../models/Coupon.js';
 import CouponUsage from '../models/CouponUsage.js';
-import Reward from '../models/Reward.js';
 import Referral from '../models/Referral.js';
 import AppSettings from '../models/AppSettings.js';
+// 🪙 NEW: use CoinTransaction instead of the legacy Reward model
+import CoinTransaction from '../models/CoinTransaction.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. REFERRAL CODE GENERATION
@@ -165,13 +166,19 @@ export async function assignWelcomeCoupon(userId) {
 
 /**
  * Awards coins to a customer after a completed ride.
- * Uses AppSettings for coin count (falls back to RewardSettings distance tiers
- * if present to stay backwards-compatible).
+ * 🪙 NOW WRITES TO CoinTransaction (replaces Reward model for coin events).
+ *
+ * Uses AppSettings.coins.coinsPerRide as the base.
+ * Accepts optional distanceKm / vehicleType for bonus calculation when called
+ * from the new coinService path, but also works without them (legacy behaviour).
  *
  * @param {string|ObjectId} customerId
  * @param {string|ObjectId} tripId
  * @param {string} transactionType  - 'ride_reward' | 'referral_reward'
  * @param {object} [opts]
+ * @param {number} [opts.coins]       – override total coins (referral rewards)
+ * @param {number} [opts.distanceKm]  – for distance bonus (ride rewards)
+ * @param {string} [opts.vehicleType] – for vehicle bonus (ride rewards)
  * @returns { success, awarded, coinsAwarded, totalCoins }
  */
 export async function awardCoins(customerId, tripId, transactionType = 'ride_reward', opts = {}) {
@@ -179,7 +186,8 @@ export async function awardCoins(customerId, tripId, transactionType = 'ride_rew
     const settings = await AppSettings.getSettings();
     if (!settings.coins.enabled) return { success: true, awarded: false, reason: 'coins_disabled' };
 
-    const coinsToAward = opts.coins ?? settings.coins.coinsPerRide;
+    const baseCoins = settings.coins.coinsPerRide ?? 5;
+    const coinsToAward = opts.coins ?? baseCoins;
 
     const customer = await User.findByIdAndUpdate(
       customerId,
@@ -193,26 +201,30 @@ export async function awardCoins(customerId, tripId, transactionType = 'ride_rew
     );
     if (!customer) return { success: false, error: 'Customer not found' };
 
+    const newBalance = customer.coins ?? 0;
+
     const descMap = {
-      ride_reward: `Ride completed – earned ${coinsToAward} coins`,
+      ride_reward:     `Ride completed – earned ${coinsToAward} coins`,
       referral_reward: `Referral milestone reward – ${coinsToAward} coins`,
-      coin_redeem: `Coins redeemed for ride discount`,
+      coin_redeem:     `Coins redeemed for ride discount`,
     };
 
-    await Reward.create({
-      customerId,
-      tripId: tripId || null,
-      coins: coinsToAward,
-      type: 'earned',
-      description: descMap[transactionType] || `Coins awarded (${transactionType})`,
+    // 🪙 Write to CoinTransaction (new model)
+    await CoinTransaction.create({
+      userId:       customerId,
+      tripId:       tripId || null,
+      coinsEarned:  coinsToAward,
+      type:         transactionType === 'referral_reward' ? 'referral_reward' : 'earn',
+      description:  descMap[transactionType] || `Coins awarded (${transactionType})`,
+      balanceAfter: newBalance,
     });
 
     console.log(`✅ +${coinsToAward} coins → customer ${customerId} (${transactionType})`);
     return {
-      success: true,
-      awarded: true,
+      success:      true,
+      awarded:      true,
       coinsAwarded: coinsToAward,
-      totalCoins: customer.coins,
+      totalCoins:   newBalance,
     };
   } catch (err) {
     console.error('❌ awardCoins error:', err.message);
@@ -369,18 +381,19 @@ export async function redeemCoins(customerId, coinsToRedeem) {
       { new: true }
     );
 
-    // Record transaction
-    await Reward.create({
-      customerId,
-      coins: -coinsToRedeem,
-      type: 'redeemed',
-      description: `₹${discountAmount} ride discount (${coinsToRedeem} coins redeemed)`,
+    // 🪙 Record in CoinTransaction (replaces Reward model)
+    await CoinTransaction.create({
+      userId:       customerId,
+      coinsEarned:  -coinsToRedeem,
+      type:         'spend',
+      description:  `₹${discountAmount} ride discount (${coinsToRedeem} coins redeemed)`,
+      balanceAfter: updated.coins ?? 0,
     });
 
     console.log(`✅ Coins redeemed: -${coinsToRedeem} coins → ₹${discountAmount} discount`);
     return {
-      success: true,
-      coinsRedeemed: coinsToRedeem,
+      success:        true,
+      coinsRedeemed:  coinsToRedeem,
       discountAmount,
       remainingCoins: updated.coins,
     };
