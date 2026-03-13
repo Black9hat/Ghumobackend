@@ -66,12 +66,21 @@ router.get('/available/:customerId', verifyToken, async (req, res) => {
         let isEligible = true;
         let reason = '';
 
-        // 🚗 NEW: Check vehicle applicability
-        const isVehicleApplicable = coupon.isApplicableForVehicle(vehicleType);
-        if (!isVehicleApplicable) {
-          isEligible = false;
-          const applicableList = coupon.applicableVehicles.filter(v => v !== 'all').join(', ');
-          reason = `Only applicable for: ${applicableList || 'specific vehicles'}`;
+        // 🚗 Vehicle applicability check
+        // Only mark ineligible if caller passed a specific vehicle AND
+        // the coupon is restricted to specific vehicles that don't match.
+        // Empty applicableVehicles or ['all'] always passes.
+        const hasVehicleFilter = vehicleType && vehicleType !== 'all';
+        const couponIsVehicleSpecific =
+          coupon.applicableVehicles &&
+          coupon.applicableVehicles.length > 0 &&
+          !coupon.applicableVehicles.includes('all');
+
+        if (hasVehicleFilter && couponIsVehicleSpecific) {
+          if (!coupon.isApplicableForVehicle(vehicleType)) {
+            isEligible = false;
+            reason = `Only for: ${coupon.applicableVehicles.join(', ')}`;
+          }
         }
 
         // 1. Check max usage per user
@@ -232,8 +241,14 @@ router.post('/validate', verifyToken, async (req, res) => {
       });
     }
 
-    // 🚗 NEW: Check vehicle applicability
-    if (vehicleType && !coupon.isApplicableForVehicle(vehicleType)) {
+    // 🚗 Vehicle applicability check (only if specific vehicle passed and coupon is vehicle-restricted)
+    const hasVehicleFilter = vehicleType && vehicleType !== 'all';
+    const couponIsVehicleSpecific =
+      coupon.applicableVehicles &&
+      coupon.applicableVehicles.length > 0 &&
+      !coupon.applicableVehicles.includes('all');
+
+    if (hasVehicleFilter && couponIsVehicleSpecific && !coupon.isApplicableForVehicle(vehicleType)) {
       const applicableList = coupon.applicableVehicles.filter(v => v !== 'all');
       return res.status(400).json({
         success: false,
@@ -445,8 +460,14 @@ router.post('/apply', verifyToken, async (req, res) => {
       });
     }
 
-    // 🚗 NEW: Check vehicle applicability before applying
-    if (vehicleType && !coupon.isApplicableForVehicle(vehicleType)) {
+    // 🚗 Vehicle applicability check before applying
+    const applyHasVehicleFilter = vehicleType && vehicleType !== 'all';
+    const applyCouponIsVehicleSpecific =
+      coupon.applicableVehicles &&
+      coupon.applicableVehicles.length > 0 &&
+      !coupon.applicableVehicles.includes('all');
+
+    if (applyHasVehicleFilter && applyCouponIsVehicleSpecific && !coupon.isApplicableForVehicle(vehicleType)) {
       const applicableList = coupon.applicableVehicles.filter(v => v !== 'all');
       return res.status(400).json({
         success: false,
@@ -528,6 +549,50 @@ router.get('/history/:customerId', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('❌ Error fetching coupon history:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/coupons/welcome-stats  (admin dashboard uses this)
+// Returns aggregate stats for the welcome coupon feature
+router.get('/welcome-stats', async (req, res) => {
+  try {
+    // Total users who have signed up (all customers)
+    const totalUsers = await Customer.countDocuments();
+
+    // Users who have already used their welcome coupon
+    const totalUsed = await Customer.countDocuments({ welcomeCouponUsed: true });
+
+    // Users still eligible (0 rides completed, coupon not yet used)
+    const totalEligible = await Customer.countDocuments({
+      welcomeCouponUsed: false,
+      totalRidesCompleted: 0,
+    });
+
+    // Pending = signed up, hasn't used it yet but may have rides
+    const totalPending = totalUsers - totalUsed;
+
+    // Total net savings given = sum of (discountAmount - fareAdjustment) across all first-ride trips
+    // We approximate by reading AppSettings for the configured net saving per ride
+    const appSettings = await AppSettings.getSettings();
+    const netSavingPerRide = Math.max(
+      0,
+      (appSettings.welcomeCoupon.discountAmount || 0) -
+        (appSettings.welcomeCoupon.fareAdjustment || 0)
+    );
+    const totalSavingsGiven = totalUsed * netSavingPerRide;
+
+    res.json({
+      success: true,
+      stats: {
+        totalEligible,
+        totalUsed,
+        totalPending,
+        totalSavingsGiven,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Error fetching welcome stats:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
