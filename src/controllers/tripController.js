@@ -17,6 +17,8 @@ import RewardSettings from '../models/RewardSettings.js';
 import AppSettings from '../models/AppSettings.js';
 import Reward from '../models/Reward.js';
 import { awardCoins, handleFirstRideReferral } from '../services/rewardService.js';
+// 🪙 NEW: enhanced coin award with distance + vehicle bonuses
+import { awardRideCoins } from '../services/coinService.js';
 
 // ✅ LEGAL STATUS TRANSITIONS
 const ALLOWED_TRANSITIONS = {
@@ -1390,7 +1392,7 @@ const completeRideWithVerification = async (req, res) => {
         trip.drop.coordinates[1], trip.drop.coordinates[0]
       );
 
-      coinReward = await awardCoins(trip.customerId, tripId, 'ride_reward', {
+      coinReward = await awardRideCoins(trip.customerId, tripId, {
         distanceKm: tripDistance,
         vehicleType: trip.vehicleType,
       });
@@ -1405,6 +1407,9 @@ const completeRideWithVerification = async (req, res) => {
         handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
           console.warn('⚠️ handleFirstRideReferral failed:', e.message)
         );
+        // 🎁 Lock welcome coupon — first ride done, never apply again
+        User.findByIdAndUpdate(trip.customerId, { $set: { welcomeCouponUsed: true } })
+          .catch((e) => console.warn('⚠️ welcomeCouponUsed update failed:', e.message));
       }
 
       driverIncentives = await awardIncentivesToDriver(driverId, tripId, session);
@@ -1442,6 +1447,8 @@ const completeRideWithVerification = async (req, res) => {
         io.to(customerSocketId).emit('coins:awarded', {
           coins: coinReward.coinsAwarded,
           totalCoins: coinReward.totalCoins,
+          coinsRequired: coinReward.coinsRequired,
+          couponUnlocked: coinReward.couponUnlocked ?? false,
           message: `You earned ${coinReward.coinsAwarded} coins! 🎉`
         });
       }
@@ -1474,8 +1481,9 @@ const completeRideWithVerification = async (req, res) => {
     });
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
+    // withTransaction() auto-aborts on error — do NOT call abortTransaction() again
+    // or MongoDB throws "Cannot call abortTransaction twice"
+    try { session.endSession(); } catch (_) {}
     console.error('🔥 completeRideWithVerification error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1672,7 +1680,7 @@ const confirmCashCollection = async (req, res) => {
           trip.pickup.coordinates[1], trip.pickup.coordinates[0],
           trip.drop.coordinates[1], trip.drop.coordinates[0]
         );
-        coinReward = await awardCoins(trip.customerId, tripId, 'ride_reward', {
+        coinReward = await awardRideCoins(trip.customerId, tripId, {
           distanceKm: cashTripDistance,
           vehicleType: trip.vehicleType,
         });
@@ -1687,6 +1695,9 @@ const confirmCashCollection = async (req, res) => {
           handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
             console.warn('⚠️ handleFirstRideReferral failed:', e.message)
           );
+          // 🎁 Lock welcome coupon — first ride done, never apply again
+          User.findByIdAndUpdate(trip.customerId, { $set: { welcomeCouponUsed: true } })
+            .catch((e) => console.warn('⚠️ welcomeCouponUsed update failed:', e.message));
         }
       }
     } catch (coinErr) {
@@ -1757,8 +1768,8 @@ const completeTrip = async (req, res) => {
     session.endSession();
     res.status(200).json({ success: true, message: 'Trip completed' });
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
+    // withTransaction() auto-aborts on error — do NOT call abortTransaction() again
+    try { session.endSession(); } catch (_) {}
     console.error('🔥 completeTrip error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
