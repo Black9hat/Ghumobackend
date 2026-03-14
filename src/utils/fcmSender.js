@@ -10,12 +10,10 @@ const getFullImageUrl = (url) => {
   if (!url) return null;
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
   
-  // Railway uses RAILWAY_PUBLIC_DOMAIN or you can use BACKEND_URL
   const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN 
     ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
     : process.env.BACKEND_URL || "https://api.example.com";
   
-  // Ensure proper URL construction
   const cleanUrl = url.startsWith("/") ? url : `/${url}`;
   const fullUrl = `${baseUrl}${cleanUrl}`;
   
@@ -33,19 +31,23 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
   }
 
   try {
-    // Extract pickup and drop
     const pickup = dataPayload.pickup || {};
     const drop = dataPayload.drop || {};
     
-    // ✅ Get full image URL if provided
     const fullImageUrl = getFullImageUrl(dataPayload.imageUrl);
 
     const message = {
       token: fcmToken,
-      
-      // DATA-ONLY payload for trip requests
+
+      // ✅ Notification payload (required for banner + image)
+      notification: {
+        title: dataPayload.title || "New Trip Request",
+        body: dataPayload.body || "You have a new ride request",
+        ...(fullImageUrl && { image: fullImageUrl }),
+      },
+
+      // DATA payload
       data: {
-        // Core trip data
         tripId: String(dataPayload.tripId || ''),
         type: String(dataPayload.type || 'TRIP_REQUEST'),
         fare: String(dataPayload.fare || 0),
@@ -55,22 +57,23 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
         isDestinationMatch: String(dataPayload.isDestinationMatch || false),
         timestamp: new Date().toISOString(),
         
-        // FLAT structure for pickup
         pickupAddress: String(pickup.address || 'Pickup Location'),
         pickupLat: String(pickup.lat || 0),
         pickupLng: String(pickup.lng || 0),
         
-        // FLAT structure for drop
         dropAddress: String(drop.address || 'Drop Location'),
         dropLat: String(drop.lat || 0),
         dropLng: String(drop.lng || 0),
-        
-        // ✅ Image URL if provided (MUST be full URL)
+
         imageUrl: fullImageUrl || '',
       },
 
       android: {
         priority: 'high',
+        notification: {
+          channel_id: 'high_importance_channel',
+          ...(fullImageUrl && { image: fullImageUrl }),
+        }
       },
 
       apns: {
@@ -79,9 +82,18 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
         },
         payload: {
           aps: {
-            'content-available': 1,
+            alert: {
+              title: dataPayload.title || "New Trip Request",
+              body: dataPayload.body || "You have a new ride request",
+            },
+            sound: 'default',
+            badge: 1,
+            'mutable-content': 1,
           }
-        }
+        },
+        fcm_options: {
+          ...(fullImageUrl && { image: fullImageUrl }),
+        },
       },
     };
 
@@ -110,7 +122,6 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
     console.error(`   Token: ${fcmToken.substring(0, 20)}...`);
     console.error('═'.repeat(70));
     
-    // Handle invalid tokens
     if (error.code === 'messaging/registration-token-not-registered' ||
         error.code === 'messaging/invalid-registration-token') {
       
@@ -145,7 +156,6 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
   }
 
   try {
-    // ✅ Get full absolute image URL
     const fullImageUrl = getFullImageUrl(data.imageUrl);
 
     console.log('');
@@ -161,44 +171,33 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
 
     const message = {
       token: fcmToken,
-      
-      // ✅ NOTIFICATION payload with image
-      notification: { 
-        title, 
+
+      notification: {
+        title,
         body,
-        // ⚠️ imageUrl at root notification level (FCM spec)
-        ...(fullImageUrl && { imageUrl: fullImageUrl }),
+        ...(fullImageUrl && { image: fullImageUrl }),
       },
-      
-      // ✅ DATA payload - all values must be strings
+
       data: { 
         type: String(data.type || 'customer'),
         imageUrl: String(fullImageUrl || ''),
         tripId: String(data.tripId || ''),
         timestamp: new Date().toISOString(),
-        // Include any other data as strings
         ...Object.fromEntries(
           Object.entries(data)
             .filter(([k]) => k !== 'imageUrl' && k !== 'type' && k !== 'tripId')
             .map(([k, v]) => [k, String(v)])
         ),
       },
-      
-      // ✅ ANDROID specific config
+
       android: { 
         priority: 'high',
         notification: {
-          channelId: 'high_importance_channel', // MUST match Flutter app
-          priority: 'high',
-          defaultSound: true,
-          defaultVibrateTimings: true,
-          defaultLightSettings: true,
-          // ⚠️ Android image at this level
-          ...(fullImageUrl && { imageUrl: fullImageUrl }),
+          channel_id: 'high_importance_channel',
+          ...(fullImageUrl && { image: fullImageUrl }),
         }
       },
-      
-      // ✅ iOS specific config
+
       apns: {
         headers: {
           'apns-priority': '10',
@@ -206,17 +205,12 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
         },
         payload: {
           aps: {
-            alert: { 
-              title, 
-              body 
-            },
+            alert: { title, body },
             sound: 'default',
             badge: 1,
-            'mutable-content': 1,  // Required for rich notifications
-            'content-available': 1,
+            'mutable-content': 1,
           }
         },
-        // ⚠️ iOS image in fcm_options
         fcm_options: {
           ...(fullImageUrl && { image: fullImageUrl }),
         },
@@ -253,7 +247,6 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
     console.error('═'.repeat(70));
     console.error('');
     
-    // Remove invalid token from database
     if (error.code === 'messaging/registration-token-not-registered' ||
         error.code === 'messaging/invalid-registration-token') {
       try {
