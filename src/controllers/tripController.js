@@ -1392,8 +1392,10 @@ const completeRideWithVerification = async (req, res) => {
         trip.drop.coordinates[1], trip.drop.coordinates[0]
       );
 
-      coinReward = await awardRideCoins(trip.customerId, tripId, {
-        distanceKm: tripDistance,
+      coinReward = await awardRideCoins({
+        userId:      trip.customerId,
+        tripId,
+        distanceKm:  tripDistance,
         vehicleType: trip.vehicleType,
       });
 
@@ -1680,8 +1682,10 @@ const confirmCashCollection = async (req, res) => {
           trip.pickup.coordinates[1], trip.pickup.coordinates[0],
           trip.drop.coordinates[1], trip.drop.coordinates[0]
         );
-        coinReward = await awardRideCoins(trip.customerId, tripId, {
-          distanceKm: cashTripDistance,
+        coinReward = await awardRideCoins({
+          userId:      trip.customerId,
+          tripId,
+          distanceKm:  cashTripDistance,
           vehicleType: trip.vehicleType,
         });
 
