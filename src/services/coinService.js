@@ -5,6 +5,7 @@
  * No hardcoded values except safe fallbacks when DB is unavailable.
  */
 
+import mongoose        from 'mongoose';
 import User            from '../models/User.js';
 import AppSettings     from '../models/AppSettings.js';
 import CoinTransaction from '../models/CoinTransaction.js';
@@ -16,14 +17,11 @@ const DEFAULT_COINS = {
   conversionRate:              0.10,
   maxDiscountPerRide:          20,
   coinsRequiredForMaxDiscount: 100,
-  // Distance bonus tiers — each tier: { maxKm, bonus }
-  // maxKm: null means "everything above previous tier"
   distanceBonuses: [
     { label: '0–3 km',  maxKm: 3,    bonus: 1 },
     { label: '3–8 km',  maxKm: 8,    bonus: 2 },
     { label: '8+ km',   maxKm: null, bonus: 4 },
   ],
-  // Vehicle bonus map
   vehicleBonuses: {
     bike:    1,
     auto:    2,
@@ -31,10 +29,21 @@ const DEFAULT_COINS = {
     premium: 3,
     xl:      4,
   },
-  // Lucky / random bonus
   randomBonusCoins:   10,
-  randomBonusChance:  0.20,   // 0–1 fraction
+  randomBonusChance:  0.20,
 };
+
+/**
+ * Resolve the correct customer model.
+ * Customers may be in a separate 'Customer' collection or fall back to 'User'.
+ */
+function getCustomerModel() {
+  try {
+    return mongoose.models.Customer || mongoose.model('Customer');
+  } catch {
+    return User;
+  }
+}
 
 /**
  * Merge DB coins config with defaults — every key falls back safely.
@@ -62,14 +71,8 @@ function mergeConfig(dbCoins = {}) {
 }
 
 /**
- * calculateCoinsForRide({ distanceKm, vehicleType, coinConfig })
- * ─────────────────────────────────────────────────────────────
+ * calculateCoinsForRide({ distanceKm, vehicleType, coinConfig, applyRandom })
  * Pure function — no DB access.
- * coinConfig = merged config object from mergeConfig().
- * Returns { base, distanceBonus, vehicleBonus, randomBonus, total, breakdown }
- *
- * randomBonus: pass applyRandom=true only when the ride actually completes
- *              (in awardRideCoins). For fare preview pass applyRandom=false.
  */
 export function calculateCoinsForRide({
   distanceKm   = 0,
@@ -80,10 +83,8 @@ export function calculateCoinsForRide({
   const vType = vehicleType?.toLowerCase?.() ?? 'bike';
   const cfg   = coinConfig;
 
-  // ── Base ──────────────────────────────────────────────────────────────────
   const base = cfg.coinsPerRide ?? 5;
 
-  // ── Distance bonus ────────────────────────────────────────────────────────
   let distanceBonus = 0;
   const tiers = [...(cfg.distanceBonuses ?? DEFAULT_COINS.distanceBonuses)]
     .sort((a, b) => (a.maxKm ?? Infinity) - (b.maxKm ?? Infinity));
@@ -95,11 +96,9 @@ export function calculateCoinsForRide({
     }
   }
 
-  // ── Vehicle bonus ─────────────────────────────────────────────────────────
   const vehicleBonuses = cfg.vehicleBonuses ?? DEFAULT_COINS.vehicleBonuses;
   const vehicleBonus   = vehicleBonuses[vType] ?? 0;
 
-  // ── Random bonus (only when completing a ride) ────────────────────────────
   let randomBonus = 0;
   if (applyRandom) {
     const chance = cfg.randomBonusChance ?? DEFAULT_COINS.randomBonusChance;
@@ -116,13 +115,7 @@ export function calculateCoinsForRide({
     vehicleBonus,
     randomBonus,
     total,
-    breakdown: {
-      base,
-      distanceBonus,
-      vehicleBonus,
-      randomBonus,
-      total,
-    },
+    breakdown: { base, distanceBonus, vehicleBonus, randomBonus, total },
   };
 }
 
@@ -133,10 +126,7 @@ export function calculateCoinsForRide({
  */
 export async function getCoinsConfig() {
   try {
-    const settings = await AppSettings.getSettings();
-    // .toObject() converts the Mongoose subdocument to a plain JS object so that
-    // spreading ({ ...dbCoins.vehicleBonuses }) and Object.keys() work correctly.
-    // Without this, spreading a Mongoose subdoc gives Mongoose internals, not values.
+    const settings   = await AppSettings.getSettings();
     const coinsPlain = settings?.coins?.toObject
       ? settings.coins.toObject()
       : (settings?.coins ?? {});
@@ -147,11 +137,30 @@ export async function getCoinsConfig() {
 }
 
 /**
- * awardRideCoins({ userId, tripId, distanceKm, vehicleType })
- * Awards coins to a user after a completed ride. Applies random bonus.
+ * awardRideCoins(customerId, tripId, { distanceKm, vehicleType })
+ * ──────────────────────────────────────────────────────────────
+ * Awards coins to a customer after a completed ride.
+ *
+ * Accepts BOTH call signatures for backwards compatibility:
+ *   • awardRideCoins(customerId, tripId, { distanceKm, vehicleType })   ← tripController style
+ *   • awardRideCoins({ userId, tripId, distanceKm, vehicleType })        ← named-arg style
  */
-export async function awardRideCoins({ userId, tripId, distanceKm, vehicleType }) {
-  const cfg    = await getCoinsConfig();
+export async function awardRideCoins(customerIdOrOpts, tripIdArg, optsArg) {
+  // ── Normalise arguments ────────────────────────────────────────────────────
+  let customerId, tripId, distanceKm, vehicleType;
+
+  if (customerIdOrOpts && typeof customerIdOrOpts === 'object' && !customerIdOrOpts.toHexString) {
+    // Named-arg style: awardRideCoins({ userId, tripId, distanceKm, vehicleType })
+    ({ userId: customerId, tripId, distanceKm = 0, vehicleType = 'bike' } = customerIdOrOpts);
+  } else {
+    // Positional style: awardRideCoins(customerId, tripId, { distanceKm, vehicleType })
+    customerId  = customerIdOrOpts;
+    tripId      = tripIdArg;
+    distanceKm  = optsArg?.distanceKm  ?? 0;
+    vehicleType = optsArg?.vehicleType ?? 'bike';
+  }
+
+  const cfg = await getCoinsConfig();
   if (!cfg.enabled) return null;
 
   const result = calculateCoinsForRide({
@@ -161,30 +170,37 @@ export async function awardRideCoins({ userId, tripId, distanceKm, vehicleType }
     applyRandom: true,
   });
 
-  const user = await User.findById(userId);
-  if (!user) throw new Error('User not found');
+  // ── Resolve customer model (Customer collection or User fallback) ──────────
+  const CustomerModel = getCustomerModel();
+  const user = await CustomerModel.findById(customerId);
+  if (!user) {
+    console.warn(`⚠️ awardRideCoins: customer ${customerId} not found in ${CustomerModel.modelName}`);
+    throw new Error('User not found');
+  }
 
-  user.coins              = (user.coins ?? 0) + result.total;
-  user.totalCoinsEarned   = (user.totalCoinsEarned ?? 0) + result.total;
+  user.coins            = (user.coins ?? 0) + result.total;
+  user.totalCoinsEarned = (user.totalCoinsEarned ?? 0) + result.total;
 
-  const coinsRequired     = cfg.coinsRequiredForMaxDiscount;
-  const couponUnlocked    = user.coins >= coinsRequired;
+  const coinsRequired  = cfg.coinsRequiredForMaxDiscount;
+  const couponUnlocked = user.coins >= coinsRequired;
 
   await user.save();
 
   // Log the transaction
   await CoinTransaction.create({
-    userId,
+    userId:      customerId,
     tripId,
-    coinsEarned:  result.total,
-    type:         'earn',
-    description:  `Ride completed (+${result.distanceBonus} dist, +${result.vehicleBonus} vehicle${result.randomBonus ? `, +${result.randomBonus} lucky!` : ''})`,
+    coinsEarned: result.total,
+    type:        'earn',
+    description: `Ride completed (+${result.distanceBonus} dist, +${result.vehicleBonus} vehicle${result.randomBonus ? `, +${result.randomBonus} lucky!` : ''})`,
     balanceAfter: user.coins,
-    breakdown:    result.breakdown,
+    breakdown:   result.breakdown,
   });
 
   return {
+    awarded:        true,         // ✅ tripController checks coinReward?.awarded
     coinsAwarded:   result.total,
+    totalCoins:     user.coins,   // ✅ tripController reads coinReward.totalCoins
     newBalance:     user.coins,
     coinsRequired,
     couponUnlocked,
@@ -197,8 +213,9 @@ export async function awardRideCoins({ userId, tripId, distanceKm, vehicleType }
  * Returns wallet data for the Flutter coins_wallet_page.
  */
 export async function getCustomerCoinSummary(customerId) {
+  const CustomerModel = getCustomerModel();
   const [user, cfg] = await Promise.all([
-    User.findById(customerId).lean(),
+    CustomerModel.findById(customerId).lean(),
     getCoinsConfig(),
   ]);
 
@@ -216,7 +233,6 @@ export async function getCustomerCoinSummary(customerId) {
 
   return {
     success: true,
-    // New fields
     coins,
     coinsRequired,
     maxDiscountPerRide:          cfg.maxDiscountPerRide,
@@ -224,15 +240,12 @@ export async function getCustomerCoinSummary(customerId) {
     isDiscountEnabled:           cfg.enabled,
     coinDiscountActive:          coins >= coinsRequired && cfg.enabled,
     progress,
-    // Bonus config (for wallet page display)
     distanceBonuses:             cfg.distanceBonuses,
     vehicleBonuses:              cfg.vehicleBonuses,
     randomBonusCoins:            cfg.randomBonusCoins,
     randomBonusChance:           cfg.randomBonusChance,
-    // Stats
     totalCoinsEarned:            user.totalCoinsEarned ?? 0,
     totalCoinsRedeemed:          user.totalCoinsRedeemed ?? 0,
-    // History
     transactions: transactions.map(tx => ({
       type:        tx.coinsEarned > 0 ? 'earn' : 'spend',
       isEarned:    tx.coinsEarned > 0,
@@ -241,13 +254,13 @@ export async function getCustomerCoinSummary(customerId) {
       createdAt:   tx.createdAt,
       breakdown:   tx.breakdown,
     })),
-    // Legacy fields (Flutter fallback)
-    totalCoins:   coins,
+    // Legacy fields
+    totalCoins:    coins,
     distanceTiers: cfg.distanceBonuses.map(d => ({
-      label:                  d.label,
+      label:                    d.label,
       coinsRequiredForDiscount: coinsRequired,
-      discountAmount:         cfg.maxDiscountPerRide,
-      bonus:                  d.bonus,
+      discountAmount:           cfg.maxDiscountPerRide,
+      bonus:                    d.bonus,
     })),
   };
 }
@@ -257,14 +270,15 @@ export async function getCustomerCoinSummary(customerId) {
  * Used by short_trip_page to check if coin discount is available.
  */
 export async function getDiscountEligibility(customerId) {
+  const CustomerModel = getCustomerModel();
   const [user, cfg] = await Promise.all([
-    User.findById(customerId).select('coins').lean(),
+    CustomerModel.findById(customerId).select('coins').lean(),
     getCoinsConfig(),
   ]);
   if (!user) throw new Error('User not found');
 
-  const coins             = user.coins ?? 0;
-  const coinsRequired     = cfg.coinsRequiredForMaxDiscount;
+  const coins              = user.coins ?? 0;
+  const coinsRequired      = cfg.coinsRequiredForMaxDiscount;
   const coinDiscountActive = coins >= coinsRequired && cfg.enabled;
 
   return {
@@ -272,10 +286,9 @@ export async function getDiscountEligibility(customerId) {
     coinDiscountActive,
     coins,
     coinsRequired,
-    discountAmount:  cfg.maxDiscountPerRide,
-    coinsLeft:       Math.max(0, coinsRequired - coins),
-    // Legacy
-    hasDiscount:      coinDiscountActive,
+    discountAmount:    cfg.maxDiscountPerRide,
+    coinsLeft:         Math.max(0, coinsRequired - coins),
+    hasDiscount:       coinDiscountActive,
     isDiscountEnabled: cfg.enabled,
   };
 }
@@ -285,8 +298,9 @@ export async function getDiscountEligibility(customerId) {
  * Deducts coins and returns discount amount.
  */
 export async function redeemCoinsForDiscount(customerId) {
-  const cfg  = await getCoinsConfig();
-  const user = await User.findById(customerId);
+  const cfg          = await getCoinsConfig();
+  const CustomerModel = getCustomerModel();
+  const user         = await CustomerModel.findById(customerId);
   if (!user) throw new Error('User not found');
 
   const coins         = user.coins ?? 0;
