@@ -163,11 +163,32 @@ export async function awardRideCoins(customerIdOrOpts, tripIdArg, optsArg) {
   const cfg = await getCoinsConfig();
   if (!cfg.enabled) return null;
 
+  // ── Dedup guard: skip if coins already awarded for this trip ──────────────
+  // Prevents triple-award: completeRideWithVerification + confirmCashCollection
+  // + /api/rewards/award all calling this for the same tripId.
+  if (tripId) {
+    const already = await CoinTransaction.findOne({ tripId, type: 'earn' }).lean();
+    if (already) {
+      console.log(`⚠️  awardRideCoins: already awarded for trip ${tripId} — skipping`);
+      const existingUser = await getCustomerModel().findById(customerId).select('coins').lean();
+      return {
+        awarded:        false,
+        alreadyAwarded: true,
+        coinsAwarded:   0,
+        totalCoins:     existingUser?.coins ?? 0,
+        newBalance:     existingUser?.coins ?? 0,
+        coinsRequired:  cfg.coinsRequiredForMaxDiscount,
+        couponUnlocked: (existingUser?.coins ?? 0) >= cfg.coinsRequiredForMaxDiscount,
+        breakdown:      null,
+      };
+    }
+  }
+
   const result = calculateCoinsForRide({
     distanceKm,
     vehicleType,
     coinConfig:  cfg,
-    applyRandom: true,
+    applyRandom: false,  // ✅ Matches fare card preview exactly — no surprise mismatch
   });
 
   // ── Resolve customer model (Customer collection or User fallback) ──────────
