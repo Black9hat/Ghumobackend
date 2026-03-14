@@ -1392,12 +1392,20 @@ const completeRideWithVerification = async (req, res) => {
         trip.drop.coordinates[1], trip.drop.coordinates[0]
       );
 
-      coinReward = await awardRideCoins({
-        userId:      trip.customerId,
-        tripId,
-        distanceKm:  tripDistance,
-        vehicleType: trip.vehicleType,
-      });
+      // ✅ Only award coins here for ONLINE payments.
+      // For CASH rides, coins are awarded in confirmCashCollection() after the
+      // driver confirms cash received — prevents double-award (this fn + confirmCash).
+      const paymentMethodForCoins = trip.payment?.method || trip.paymentMethod || 'unknown';
+      if (paymentMethodForCoins?.toLowerCase() !== 'cash') {
+        coinReward = await awardRideCoins({
+          userId:      trip.customerId,
+          tripId,
+          distanceKm:  tripDistance,
+          vehicleType: trip.vehicleType,
+        });
+      } else {
+        console.log('🪙 Cash ride — coin award deferred to confirmCashCollection()');
+      }
 
       // Check first ride for referral
       const completedCount = await Trip.countDocuments({
