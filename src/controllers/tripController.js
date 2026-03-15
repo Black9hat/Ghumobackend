@@ -1551,7 +1551,7 @@ const completeRideWithVerification = async (req, res) => {
 // src/controllers/tripController.js - confirmCashCollection COMPLETE VERSION
 // Replace your entire confirmCashCollection function with this
 
-export const confirmCashCollection = async (req, res) => {
+ const confirmCashCollection = async (req, res) => {
   try {
     const { tripId, driverId, fare: fareAmount } = req.body;
 
