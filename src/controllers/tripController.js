@@ -1548,224 +1548,269 @@ const completeRideWithVerification = async (req, res) => {
   }
 };
 
-// src/controllers/tripController.js - confirmCashCollection COMPLETE VERSION
-// Replace your entire confirmCashCollection function with this
+const confirmCashCollection = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
 
- const confirmCashCollection = async (req, res) => {
   try {
-    const { tripId, driverId, fare: fareAmount } = req.body;
+    const { tripId, driverId, fare } = req.body;
 
-    console.log('\n' + '='.repeat(80));
-    console.log('💰 CONFIRM CASH COLLECTION STARTED');
-    console.log(`   Trip ID: ${tripId}`);
-    console.log(`   Driver ID: ${driverId}`);
-    console.log(`   Fare: ₹${fareAmount}`);
-    console.log('='.repeat(80));
+    console.log('');
+    console.log('💰 ═══════════════════════════════════════════════════════════════');
+    console.log('💰 CONFIRM CASH COLLECTION');
+    console.log(`   Trip: ${tripId} | Driver: ${driverId} | Fare: ₹${fare}`);
+    console.log('💰 ═══════════════════════════════════════════════════════════════');
 
-    // Validate input
-    if (!tripId || !driverId || !fareAmount) {
-      console.log('❌ MISSING REQUIRED FIELDS');
-      console.log(`   tripId: ${tripId}`);
-      console.log(`   driverId: ${driverId}`);
-      console.log(`   fareAmount: ${fareAmount}`);
-      return res.status(400).json({
-        success: false,
-        message: 'Missing required fields: tripId, driverId, fare'
-      });
+    if (!tripId || !driverId) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'tripId and driverId are required' });
     }
 
-    // Find trip
-    console.log('📍 Finding trip in database...');
-    const trip = await Trip.findById(tripId);
-    
+    const trip = await Trip.findById(tripId).session(session);
     if (!trip) {
-      console.log('❌ TRIP NOT FOUND in database');
-      return res.status(404).json({
-        success: false,
-        message: 'Trip not found'
-      });
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: 'Trip not found' });
     }
 
-    console.log(`✅ Trip found`);
-    console.log(`   Status: ${trip.status}`);
-    console.log(`   Customer ID: ${trip.customerId}`);
-    console.log(`   Assigned Driver: ${trip.assignedDriver}`);
-    console.log(`   Payment Collected: ${trip.paymentCollected}`);
-
-    // Verify trip belongs to this driver
     if (trip.assignedDriver?.toString() !== driverId) {
-      console.log('❌ DRIVER MISMATCH');
-      console.log(`   Expected: ${trip.assignedDriver}`);
-      console.log(`   Got: ${driverId}`);
-      return res.status(403).json({
-        success: false,
-        message: 'This trip is not assigned to you'
-      });
+      await session.abortTransaction();
+      return res.status(403).json({ success: false, message: 'Not authorized' });
     }
 
-    // Check if already collected
-    if (trip.paymentCollected) {
-      console.log('⚠️ PAYMENT ALREADY COLLECTED');
-      console.log('   Returning success (idempotent)');
-      return res.status(200).json({
-        success: true,
-        message: 'Payment already collected',
-        alreadyCollected: true,
-        tripId: tripId.toString()
-      });
+    if (trip.status !== 'completed') {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Trip must be completed before collecting cash' });
     }
 
-    // Update trip - mark payment as collected
-    console.log('📝 Updating trip in database...');
-    const updatedTrip = await Trip.findByIdAndUpdate(
-      tripId,
-      {
-        $set: {
-          paymentCollected: true,
-          paymentMethod: 'cash',
-          paymentCollectedAt: new Date(),
-          paymentConfirmedAt: new Date(),
-          status: 'completed'
-        }
-      },
-      { new: true }
-    );
-
-    if (!updatedTrip) {
-      console.log('❌ FAILED TO UPDATE TRIP');
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to update trip status'
-      });
+    if (trip.paymentCollected === true) {
+      await session.abortTransaction();
+      return res.json({ success: true, message: 'Cash already collected', alreadyProcessed: true });
     }
 
-    console.log('✅ Trip updated successfully');
-    console.log(`   New status: ${updatedTrip.status}`);
-    console.log(`   Payment collected: ${updatedTrip.paymentCollected}`);
+    const COMMISSION_RATE = 0.20;
+    const fareAmount = Number(fare) || trip.finalFare || trip.fare || 0;
+    if (fareAmount <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid fare amount' });
+    }
 
-    // Update driver - mark as available
-    console.log('📝 Updating driver in database...');
-    await User.findByIdAndUpdate(
-      driverId,
-      {
-        $set: {
-          isBusy: false,
-          currentTripId: null,
-          canReceiveNewRequests: true,
-          awaitingCashCollection: false,
-          lastPaymentCollectedAt: new Date()
-        }
+    // Check for active plan
+    const now = new Date();
+    const activePlan = await DriverPlan.findOne({
+      driver: driverId,
+      isActive: true,
+      expiryDate: { $gt: now },
+      $or: [
+        { paymentStatus: 'completed' },
+        { purchaseMethod: 'admin_assigned' },
+      ]
+    }).session(session);
+
+    let planApplied = false;
+    let finalCommissionRate = COMMISSION_RATE;
+    let planBonus = 0;
+    let appliedPlanDetails = null;
+
+    if (activePlan) {
+      const isInTimeWindow = activePlan.isValidNow ? activePlan.isValidNow() : true;
+      if (isInTimeWindow) {
+        planApplied = true;
+        finalCommissionRate = activePlan.noCommission ? 0 : activePlan.commissionRate;
+        appliedPlanDetails = {
+          planId: activePlan.plan,
+          planName: activePlan.planName,
+          commissionRate: finalCommissionRate,
+          bonusMultiplier: activePlan.bonusMultiplier || 1.0
+        };
+
+        const commission = Math.round(fareAmount * finalCommissionRate * 100) / 100;
+        const baseEarning = Math.round((fareAmount - commission) * 100) / 100;
+        const bonus = Math.round(baseEarning * (activePlan.bonusMultiplier - 1) * 100) / 100;
+        planBonus = bonus;
+
+        console.log(`📋 Plan applied: "${activePlan.planName}" | Commission: ${finalCommissionRate * 100}% | Bonus: x${activePlan.bonusMultiplier}`);
       }
-    );
+    }
 
-    console.log('✅ Driver marked as available');
+    const commission = Math.round(fareAmount * finalCommissionRate * 100) / 100;
+    const baseEarning = Math.round((fareAmount - commission) * 100) / 100;
+    const driverEarning = Math.round((baseEarning + planBonus) * 100) / 100;
 
-    // ✅ CRITICAL: EMIT SOCKET EVENTS
-    console.log('\n' + '-'.repeat(80));
-    console.log('📡 SOCKET EMISSION PHASE');
-    console.log(`   io object exists: ${!!req.io}`);
-    console.log(`   trip.customerId: ${trip.customerId}`);
-    console.log(`   driverId: ${driverId}`);
-    console.log('-'.repeat(80));
+    console.log(`   Fare: ₹${fareAmount} | Commission: ₹${commission} | Plan Bonus: ₹${planBonus} | Driver: ₹${driverEarning}`);
 
-    if (!req.io) {
-      console.error('');
-      console.error('❌❌❌ CRITICAL ERROR: req.io IS NULL ❌❌❌');
-      console.error('');
-      console.error('This means Socket.IO is NOT attached to the request!');
-      console.error('');
-      console.error('FIX: Add this middleware to your server.js BEFORE socket handler:');
-      console.error('');
-      console.error('  app.use((req, res, next) => {');
-      console.error('    req.io = io;');
-      console.error('    next();');
-      console.error('  });');
-      console.error('');
-      console.error('WITHOUT THIS, SOCKET EVENTS WILL NEVER EMIT!');
-      console.error('');
-    } else {
+    // Update wallet
+    let wallet = await Wallet.findOne({ driverId }).session(session);
+    if (!wallet) {
+      wallet = new Wallet({
+        driverId,
+        availableBalance: 0,
+        totalEarnings: 0,
+        totalCommission: 0,
+        pendingAmount: 0,
+        transactions: []
+      });
+    }
+
+    wallet.transactions.push({
+      tripId,
+      type: 'credit',
+      amount: driverEarning,
+      originalFare: fareAmount,
+      commissionDeducted: commission,
+      planBonus: planBonus,
+      finalEarning: driverEarning,
+      description: planApplied
+        ? `Ride earnings: ₹${fareAmount} (Plan: ${appliedPlanDetails.planName})`
+        : `Ride earnings: ₹${fareAmount}`,
+      planApplied,
+      planId: appliedPlanDetails?.planId,
+      planName: appliedPlanDetails?.planName,
+      planCommissionRate: finalCommissionRate,
+      planBonusMultiplier: appliedPlanDetails?.bonusMultiplier || 1.0,
+      paymentMethod: 'cash',
+      status: 'completed',
+      createdAt: new Date()
+    });
+
+    wallet.totalEarnings    += driverEarning;
+    wallet.totalCommission  += commission;
+    if (planApplied && planBonus > 0) {
+      wallet.totalPlanBonusEarned = (wallet.totalPlanBonusEarned || 0) + planBonus;
+    }
+
+    wallet.pendingAmount = Math.round((wallet.pendingAmount + commission) * 100) / 100;
+
+    await wallet.save({ session });
+
+    console.log(`   Wallet saved: earning=₹${driverEarning}, commission=₹${commission}, pending=₹${wallet.pendingAmount}`);
+
+    // Mark trip as payment collected
+    trip.paymentCollected  = true;
+    trip.paymentStatus     = 'completed';
+    trip.paymentMethod     = 'cash';
+    trip.paidAmount        = fareAmount;
+    trip.paymentCompletedAt = new Date();
+    await trip.save({ session });
+
+    await session.commitTransaction();
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // ✅ EMIT SOCKET EVENTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    if (req.io) {
       const customerId = trip.customerId.toString();
-      const driverIdStr = driverId.toString();
       const customerRoom = `customer_${customerId}`;
-      const driverRoom = `driver_${driverIdStr}`;
 
-      // Emit to customer room
-      console.log(`\n📢 Emitting trip:cash_collected to: ${customerRoom}`);
-      console.log(`   Message: Driver confirmed cash payment`);
-      console.log(`   Trip ID: ${tripId}`);
-      console.log(`   Amount: ₹${fareAmount}`);
+      console.log(`📢 Emitting trip:cash_collected to room: ${customerRoom}`);
 
       req.io.to(customerRoom).emit('trip:cash_collected', {
         tripId: tripId.toString(),
         customerId: customerId,
-        driverId: driverIdStr,
+        driverId: driverId.toString(),
         amount: fareAmount,
         message: 'Driver confirmed cash payment',
         timestamp: new Date().toISOString(),
         paymentCollected: true,
-        success: true,
-        status: 'completed'
+        success: true
       });
 
-      console.log(`✅ Successfully emitted to customer room: ${customerRoom}`);
-
-      // Emit to driver room
-      console.log(`\n📢 Emitting payment:confirmed to: ${driverRoom}`);
-      req.io.to(driverRoom).emit('payment:confirmed', {
+      // Also emit to driver
+      req.io.to(`driver_${driverId.toString()}`).emit('payment:confirmed', {
         tripId: tripId.toString(),
         amount: fareAmount,
         customerId: customerId,
-        driverId: driverIdStr,
         message: 'Payment collected successfully',
-        timestamp: new Date().toISOString(),
-        success: true,
-        paymentCollected: true
-      });
-
-      console.log(`✅ Successfully emitted to driver room: ${driverRoom}`);
-
-      // Also broadcast to trip room as fallback
-      const tripRoom = `trip_${tripId}`;
-      console.log(`\n📢 Broadcasting trip:completed to: ${tripRoom}`);
-      req.io.to(tripRoom).emit('trip:completed', {
-        tripId: tripId.toString(),
-        status: 'completed',
-        message: 'Trip completed and payment collected',
         timestamp: new Date().toISOString()
       });
 
-      console.log(`✅ Successfully broadcasted to trip room: ${tripRoom}`);
+      console.log(`✅ Socket events emitted successfully`);
+    } else {
+      console.warn('⚠️ req.io not available - socket events not emitted');
     }
 
-    console.log('\n' + '='.repeat(80));
-    console.log('✅ CONFIRM CASH COLLECTION COMPLETED SUCCESSFULLY');
-    console.log('='.repeat(80) + '\n');
+    console.log('✅ Cash collection complete');
 
-    // Send success response
-    res.status(200).json({
+    // Award coins
+    let coinReward = null;
+    try {
+      if (trip.customerId) {
+        const cashTripDistance = calculateDistanceFromCoords(
+          trip.pickup.coordinates[1], trip.pickup.coordinates[0],
+          trip.drop.coordinates[1], trip.drop.coordinates[0]
+        );
+        coinReward = await awardRideCoins({
+          userId:      trip.customerId,
+          tripId,
+          distanceKm:  cashTripDistance,
+          vehicleType: trip.vehicleType,
+        });
+
+        const completedCount = await Trip.countDocuments({
+          customerId: trip.customerId,
+          status: 'completed',
+          paymentCollected: true,
+        });
+        if (completedCount === 1) {
+          handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
+            console.warn('⚠️ handleFirstRideReferral failed:', e.message)
+          );
+          User.findByIdAndUpdate(trip.customerId, { $set: { welcomeCouponUsed: true } })
+            .catch((e) => console.warn('⚠️ welcomeCouponUsed update failed:', e.message));
+        }
+      }
+    } catch (coinErr) {
+      console.warn('⚠️ Coin award failed (non-critical):', coinErr.message);
+    }
+
+    console.log('');
+    console.log('✅ ═══════════════════════════════════════════════════════════════');
+    console.log('✅ CASH COLLECTION SUCCESS');
+    console.log(`   Driver earned: ₹${driverEarning.toFixed(2)}`);
+    console.log(`   Commission deducted: ₹${commission.toFixed(2)}`);
+    if (planApplied) {
+      console.log(`   Plan bonus: ₹${planBonus.toFixed(2)}`);
+    }
+    console.log('✅ ═══════════════════════════════════════════════════════════════');
+    console.log('');
+
+    return res.status(200).json({
       success: true,
-      message: 'Cash collection confirmed successfully',
-      tripId: tripId.toString(),
+      message: 'Cash collected successfully',
       amount: fareAmount,
-      driverAmount: fareAmount,
-      paymentCollected: true,
-      timestamp: new Date().toISOString()
+      fareBreakdown: {
+        tripFare: fareAmount,
+        commission,
+        commissionPercentage: finalCommissionRate * 100,
+        driverEarning,
+        planBonus,
+        planApplied
+      },
+      wallet: {
+        totalEarnings:    wallet.totalEarnings,
+        totalCommission:  wallet.totalCommission,
+        pendingAmount:    wallet.pendingAmount,
+        availableBalance: wallet.availableBalance
+      },
+      coinReward: coinReward?.awarded ? {
+        coinsAwarded: coinReward.coinsAwarded,
+        totalCoins: coinReward.totalCoins
+      } : null,
+      socketEmitted: !!req.io
     });
 
-  } catch (error) {
-    console.error('\n' + '='.repeat(80));
-    console.error('❌ CONFIRM CASH COLLECTION ERROR');
-    console.error('='.repeat(80));
-    console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
-    console.error('='.repeat(80) + '\n');
-
-    res.status(500).json({
-      success: false,
-      message: 'Error confirming cash collection',
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
+  } catch (err) {
+    await session.abortTransaction();
+    console.error('🔥 confirmCashCollection error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        success: false, 
+        message: 'Failed to confirm cash collection',
+        error: err.message 
+      });
+    }
+  } finally {
+    session.endSession();
   }
 };
 
