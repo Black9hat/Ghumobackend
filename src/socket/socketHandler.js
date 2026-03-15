@@ -1,4 +1,5 @@
-// sockets/socketHandler.js
+// sockets/socketHandler.js - COMPLETE WITH ROOM JOINING SUPPORT
+// This is the FULL file with room joining handlers integrated
 
 import User from '../models/User.js';
 import Trip from '../models/Trip.js';
@@ -219,10 +220,6 @@ async function sendActiveTripToDriver(socket, driverId) {
 // 📡 SESSION MANAGEMENT HELPER FUNCTIONS
 // ============================================================================
 
-/**
- * 📡 FORCE LOGOUT USER VIA SOCKET.IO
- * (Called by SessionManager when multi-device login detected)
- */
 export const emitForceLogout = (io, phone, data) => {
   try {
     const roomName = `user:${phone}`;
@@ -243,9 +240,6 @@ export const emitForceLogout = (io, phone, data) => {
   }
 };
 
-/**
- * 📡 EMIT TO SPECIFIC USER
- */
 export const emitToUser = (io, phone, event, data) => {
   try {
     const roomName = `user:${phone}`;
@@ -318,7 +312,69 @@ export const initSocket = (ioInstance) => {
     }
 
     // =========================================================================
-    // 🔐 USER JOIN ROOM (for force_logout events) - NEW!
+    // ✅ NEW: ROOM JOINING FOR PAYMENT EVENTS
+    // =========================================================================
+    socket.on('join_room', async (data) => {
+      try {
+        const { room } = data;
+        
+        if (!room) {
+          console.log('⚠️ join_room - no room provided');
+          socket.emit('join_room:error', { success: false, message: 'Room name required' });
+          return;
+        }
+
+        socket.join(room);
+        console.log(`✅ Socket ${socket.id} joined room: ${room}`);
+        
+        // Log room members for debugging
+        const roomSockets = await io.in(room).allSockets();
+        console.log(`   Room "${room}" now has ${roomSockets.size} member(s)`);
+        
+        socket.emit('join_room:success', {
+          success: true,
+          room: room,
+          socketId: socket.id,
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error('❌ join_room error:', error);
+        socket.emit('join_room:error', { success: false, message: error.message });
+      }
+    });
+
+    // =========================================================================
+    // ✅ NEW: ROOM LEAVING FOR CLEANUP
+    // =========================================================================
+    socket.on('leave_room', async (data) => {
+      try {
+        const { room } = data;
+        
+        if (!room) {
+          console.log('⚠️ leave_room - no room provided');
+          return;
+        }
+
+        socket.leave(room);
+        console.log(`✅ Socket ${socket.id} left room: ${room}`);
+        
+        // Log room members for debugging
+        const roomSockets = await io.in(room).allSockets();
+        console.log(`   Room "${room}" now has ${roomSockets.size} member(s)`);
+        
+        socket.emit('leave_room:success', {
+          success: true,
+          room: room,
+          socketId: socket.id,
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error('❌ leave_room error:', error);
+      }
+    });
+
+    // =========================================================================
+    // 🔐 USER JOIN ROOM (for force_logout events)
     // =========================================================================
     socket.on('user:join', async (data) => {
       try {
@@ -351,7 +407,7 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
-    // 🔐 USER LEAVE ROOM (for cleanup) - NEW!
+    // 🔐 USER LEAVE ROOM (for cleanup)
     // =========================================================================
     socket.on('user:leave', async (data) => {
       try {
@@ -739,7 +795,7 @@ export const initSocket = (ioInstance) => {
     // =========================================================================
     // CUSTOMER REGISTER
     // =========================================================================
-    socket.on('customer:register', async ({ customerId }) => {
+    socket.on('customer:register', async ({ customerId, isReconnect }) => {
       try {
         if (!customerId) {
           socket.emit('customer:registered', { success: false, error: 'customerId missing' });
@@ -1297,15 +1353,10 @@ export const initSocket = (ioInstance) => {
         });
 
         const customerIdStr = trip.customerId.toString();
-        let customerSocketId = null;
-        for (const [socketId, custId] of connectedCustomers.entries()) {
-          if (custId === customerIdStr) {
-            customerSocketId = socketId;
-            break;
-          }
-        }
-
-        const rideCompletedPayload = {
+        
+        // ✅ EMIT TO CUSTOMER ROOM
+        console.log(`📢 Emitting trip:completed to customer_${customerIdStr} room`);
+        io.to(`customer_${customerIdStr}`).emit('trip:completed', {
           tripId: tripId.toString(),
           fare,
           originalFare: trip.originalFare || null,
@@ -1314,19 +1365,17 @@ export const initSocket = (ioInstance) => {
           message: 'Ride completed',
           timestamp: new Date().toISOString(),
           awaitingPayment: true
-        };
-
-        if (customerSocketId) {
-          io.to(customerSocketId).emit('trip:completed', rideCompletedPayload);
-        }
-
-        socket.emit('trip:completed', {
-          ...rideCompletedPayload,
-          message: 'Ride completed. Please collect ₹' + fare.toFixed(2) + ' from customer.',
-          awaitingCashCollection: true
         });
 
-        console.log(`✅ Ride ${tripId} completed`);
+        socket.emit('trip:completed', {
+          tripId: tripId.toString(),
+          fare,
+          message: 'Ride completed. Please collect ₹' + fare.toFixed(2) + ' from customer.',
+          awaitingCashCollection: true,
+          timestamp: new Date().toISOString()
+        });
+
+        console.log(`✅ Ride ${tripId} completed, waiting for cash collection`);
       } catch (e) {
         console.error('❌ driver:complete_ride error:', e);
         socket.emit('trip:complete_error', { message: 'Failed to complete ride: ' + e.message });
@@ -1428,8 +1477,7 @@ export const initSocket = (ioInstance) => {
           await User.findByIdAndUpdate(driverId, { $set: { canReceiveNewRequests: true } });
         }
 
-        // ✅ FIX 5a: Try connectedCustomers map first, then fall back to DB socketId
-        // This fixes the case where customer reconnected but didn't re-call customer:register
+        const customerIdStr = trip.customerId.toString();
         let customerSocketId = null;
         for (const [socketId, custId] of connectedCustomers.entries()) {
           if (custId === customerIdStr) {
@@ -1439,7 +1487,6 @@ export const initSocket = (ioInstance) => {
         }
 
         if (!customerSocketId) {
-          // Fallback: look up current socketId from DB
           const customer = await User.findById(customerIdStr).select('socketId').lean();
           if (customer?.socketId) {
             customerSocketId = customer.socketId;
@@ -1453,7 +1500,7 @@ export const initSocket = (ioInstance) => {
             latitude,
             longitude,
             distanceToDestination: Math.round(distanceInMeters),
-            sequence: typeof sequence === 'number' ? sequence : Date.now(), // ✅ FIX 5b: Always include sequence
+            sequence: typeof sequence === 'number' ? sequence : Date.now(),
             timestamp: new Date().toISOString()
           });
           console.log(`📡 Emitted driver:locationUpdate to customer ${customerIdStr}`);
@@ -1498,7 +1545,7 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
-    // DRIVER HEARTBEAT - Critical for background mode
+    // DRIVER HEARTBEAT
     // =========================================================================
     socket.on('driver:heartbeat', async ({ tripId, driverId, timestamp, location }) => {
       try {
@@ -1639,7 +1686,7 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
-    // DRIVER GO OFFLINE (Explicit - Only way to go offline)
+    // DRIVER GO OFFLINE (Explicit)
     // =========================================================================
     socket.on('driver:go_offline', async ({ driverId }) => {
       try {
@@ -1732,7 +1779,7 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
-    // ✅ DISCONNECT HANDLER - UPDATED FOR SESSION MANAGEMENT
+    // DISCONNECT HANDLER
     // =========================================================================
     socket.on('disconnect', async () => {
       try {
@@ -1742,7 +1789,6 @@ export const initSocket = (ioInstance) => {
         if (driverId) {
           console.log(`⚠️ Driver ${driverId} socket disconnected - STAYING ONLINE`);
 
-          // Only clear socketId - Driver STAYS ONLINE
           await User.findByIdAndUpdate(driverId, {
             $set: {
               socketId: null,
@@ -1761,10 +1807,6 @@ export const initSocket = (ioInstance) => {
             $set: { socketId: null, lastDisconnectedAt: new Date() }
           });
         }
-
-        // Note: We don't automatically logout on disconnect
-        // User might just lose connection temporarily
-        // Session remains active until explicit logout or new login on another device
       } catch (e) {
         console.error('❌ disconnect cleanup error:', e);
       }
@@ -1832,7 +1874,7 @@ export const initSocket = (ioInstance) => {
   console.log('⏰ Trip cleanup job started');
   startNotificationRetryJob();
   startStaleTripCleanup();
-  console.log('🚀 Socket.IO initialized with session management');
+  console.log('🚀 Socket.IO initialized with room joining support');
 
 };
 
