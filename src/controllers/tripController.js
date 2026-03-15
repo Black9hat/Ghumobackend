@@ -1697,51 +1697,34 @@ const confirmCashCollection = async (req, res) => {
     // ════════════════════════════════════════════════════════════════════════════
     // ✅ EMIT SOCKET EVENTS
     // ════════════════════════════════════════════════════════════════════════════
-    
+
     if (req.io) {
-      const customerId = trip.customerId?.toString();
-      
-      console.log(`📡 Emitting socket events...`);
+      const customerId = trip.customerId.toString();
+      const customerRoom = `customer_${customerId}`;
 
-      // To customer
-      if (customerId) {
-        console.log(`📢 Emitting trip:cash_collected to customer_${customerId}`);
-        req.io.to(`customer_${customerId}`).emit('trip:cash_collected', {
-          tripId: tripId.toString(),
-          message: 'Driver confirmed cash received. Thank you!',
-          timestamp: new Date().toISOString(),
-          paymentCollected: true,
-          fareAmount: fareAmount,
-          driverConfirmed: true,
-          status: 'completed'
-        });
-      }
+      console.log(`📢 Emitting trip:cash_collected to room: ${customerRoom}`);
 
-      // To driver
-      console.log(`📢 Emitting payment:confirmed to driver_${driverId}`);
-      req.io.to(`driver_${driverId}`).emit('payment:confirmed', {
+      req.io.to(customerRoom).emit('trip:cash_collected', {
         tripId: tripId.toString(),
+        customerId: customerId,
+        driverId: driverId.toString(),
         amount: fareAmount,
-        driverAmount: driverEarning,
-        commission: commission,
-        pendingAmount: wallet.pendingAmount,
-        method: 'cash',
+        message: 'Driver confirmed cash payment',
         timestamp: new Date().toISOString(),
-        planApplied: planApplied,
-        planBonus: planBonus,
-        planName: appliedPlanDetails?.planName || null
+        paymentCollected: true,
+        success: true
       });
 
-      // Fallback to customer
-      if (customerId) {
-        console.log(`📢 Emitting payment:confirmed to customer_${customerId} (fallback)`);
-        req.io.to(`customer_${customerId}`).emit('payment:confirmed', {
-          tripId: tripId.toString(),
-          message: 'Payment confirmed by driver',
-          status: 'completed',
-          timestamp: new Date().toISOString()
-        });
-      }
+      // Also emit to driver
+      req.io.to(`driver_${driverId.toString()}`).emit('payment:confirmed', {
+        tripId: tripId.toString(),
+        amount: fareAmount,
+        customerId: customerId,
+        message: 'Payment collected successfully',
+        timestamp: new Date().toISOString()
+      });
+
+      console.log(`✅ Socket events emitted successfully`);
     } else {
       console.warn('⚠️ req.io not available - socket events not emitted');
     }
