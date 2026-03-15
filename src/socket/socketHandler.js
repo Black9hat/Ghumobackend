@@ -312,7 +312,7 @@ export const initSocket = (ioInstance) => {
     }
 
     // =========================================================================
-    // ✅ NEW: ROOM JOINING FOR PAYMENT EVENTS
+    // ✅ ROOM JOINING FOR PAYMENT EVENTS
     // =========================================================================
     socket.on('join_room', async (data) => {
       try {
@@ -327,7 +327,6 @@ export const initSocket = (ioInstance) => {
         socket.join(room);
         console.log(`✅ Socket ${socket.id} joined room: ${room}`);
         
-        // Log room members for debugging
         const roomSockets = await io.in(room).allSockets();
         console.log(`   Room "${room}" now has ${roomSockets.size} member(s)`);
         
@@ -344,7 +343,7 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
-    // ✅ NEW: ROOM LEAVING FOR CLEANUP
+    // ✅ ROOM LEAVING FOR CLEANUP
     // =========================================================================
     socket.on('leave_room', async (data) => {
       try {
@@ -358,7 +357,6 @@ export const initSocket = (ioInstance) => {
         socket.leave(room);
         console.log(`✅ Socket ${socket.id} left room: ${room}`);
         
-        // Log room members for debugging
         const roomSockets = await io.in(room).allSockets();
         console.log(`   Room "${room}" now has ${roomSockets.size} member(s)`);
         
@@ -389,12 +387,10 @@ export const initSocket = (ioInstance) => {
         socket.join(roomName);
         socket.data.phone = phone;
 
-        // Log room members for debugging
         const roomMembers = await io.in(roomName).allSockets();
         console.log(`✅ User joined room ${roomName} (socket: ${socket.id})`);
         console.log(`   Room ${roomName} now has ${roomMembers.size} member(s)`);
 
-        // Acknowledge join
         socket.emit('user:joined', {
           success: true,
           room: roomName,
@@ -407,7 +403,7 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
-    // 🔐 USER LEAVE ROOM (for cleanup)
+    // 🔐 USER LEAVE ROOM
     // =========================================================================
     socket.on('user:leave', async (data) => {
       try {
@@ -437,28 +433,23 @@ export const initSocket = (ioInstance) => {
           return;
         }
 
-        // Join room based on phone number (for multi-device detection)
         const roomName = `user:${phone}`;
         socket.join(roomName);
 
-        // Also join by customer ID (for existing functionality)
         if (customerId) {
           socket.join(`customer:${customerId}`);
         }
 
-        // Join role-specific room
         if (role === 'driver') {
           socket.join(`driver:${customerId}`);
         }
 
         console.log(`✅ User ${phone} joined room ${roomName}`);
 
-        // Store phone in socket data for cleanup
         socket.data.phone = phone;
         socket.data.customerId = customerId;
         socket.data.role = role;
 
-        // Emit connection success
         socket.emit('connection:success', {
           message: 'Connected to server',
           timestamp: new Date().toISOString(),
@@ -471,7 +462,7 @@ export const initSocket = (ioInstance) => {
     });
 
     // =========================================================================
-    // 📤 CLIENT LOGOUT REQUEST (SESSION MANAGEMENT)
+    // 📤 CLIENT LOGOUT REQUEST
     // =========================================================================
     socket.on('user:logout', async (data) => {
       try {
@@ -484,20 +475,16 @@ export const initSocket = (ioInstance) => {
 
         console.log(`👋 User ${phone} requesting logout, reason: ${reason || 'user_initiated'}`);
 
-        // Import SessionManager dynamically
         const SessionManager = (await import('../services/SessionManager.js')).default;
 
-        // Handle logout through SessionManager
         const result = await SessionManager.handleLogout(phone, reason || 'user_logout');
 
         if (result.success) {
-          // Confirm logout to client
           socket.emit('logout:success', {
             message: 'Logged out successfully',
             timestamp: new Date().toISOString(),
           });
 
-          // Leave all rooms
           const rooms = Array.from(socket.rooms);
           rooms.forEach((room) => {
             if (room !== socket.id) {
@@ -634,7 +621,6 @@ export const initSocket = (ioInstance) => {
           $unset: { lastDisconnectedAt: "" }
         }, { new: true });
 
-        // Clean up old socket entries
         for (const [existingSocketId, existingDriverId] of connectedDrivers.entries()) {
           if (existingDriverId === userIdStr && existingSocketId !== socket.id) {
             connectedDrivers.delete(existingSocketId);
@@ -643,13 +629,11 @@ export const initSocket = (ioInstance) => {
 
         connectedDrivers.set(socket.id, userIdStr);
 
-        // Join user room for session management
         if (user.phone) {
           socket.join(`user:${user.phone}`);
           socket.data.phone = user.phone;
         }
 
-        // Send active trip immediately after status update
         if (isOnline) {
           await sendActiveTripToDriver(socket, userIdStr);
         }
@@ -681,7 +665,6 @@ export const initSocket = (ioInstance) => {
           return;
         }
 
-        // Update socket immediately
         await User.findByIdAndUpdate(driverId, { 
           $set: { 
             socketId: socket.id,
@@ -694,13 +677,11 @@ export const initSocket = (ioInstance) => {
 
         connectedDrivers.set(socket.id, driverId.toString());
 
-        // Join user room for session management
         if (driver.phone) {
           socket.join(`user:${driver.phone}`);
           socket.data.phone = driver.phone;
         }
 
-        // If tripId provided, verify and send
         if (tripId) {
           const trip = await Trip.findById(tripId).lean();
           if (!trip) {
@@ -759,7 +740,6 @@ export const initSocket = (ioInstance) => {
 
           console.log(`✅ Driver ${driverId} reconnected with trip ${tripId}`);
         } else {
-          // No tripId provided - check if driver has active trip
           await sendActiveTripToDriver(socket, driverId);
           socket.emit('reconnect:success', { message: 'Reconnected successfully' });
         }
@@ -827,6 +807,12 @@ export const initSocket = (ioInstance) => {
           socket.join(`user:${user.phone}`);
           socket.data.phone = user.phone;
         }
+
+        // ✅ Auto-join customer room so trip:cash_collected is always received
+        // regardless of what screen the customer is on
+        const customerRoom = `customer_${user._id.toString()}`;
+        socket.join(customerRoom);
+        console.log(`✅ Customer ${user._id} auto-joined room: ${customerRoom}`);
 
         socket.emit('customer:registered', {
           success: true,
@@ -1314,6 +1300,9 @@ export const initSocket = (ioInstance) => {
 
     // =========================================================================
     // DRIVER COMPLETE RIDE
+    // ✅ FIX: Do NOT emit trip:completed to customer here.
+    // Customer only gets notified via trip:cash_collected after the driver
+    // explicitly taps "Confirm Cash Collected" (confirmCashCollection endpoint).
     // =========================================================================
     socket.on('driver:complete_ride', async ({ tripId, driverId }) => {
       try {
@@ -1352,21 +1341,8 @@ export const initSocket = (ioInstance) => {
           }
         });
 
-        const customerIdStr = trip.customerId.toString();
-        
-        // ✅ EMIT TO CUSTOMER ROOM
-        console.log(`📢 Emitting trip:completed to customer_${customerIdStr} room`);
-        io.to(`customer_${customerIdStr}`).emit('trip:completed', {
-          tripId: tripId.toString(),
-          fare,
-          originalFare: trip.originalFare || null,
-          discountApplied: trip.discountApplied || 0,
-          coinsUsed: trip.coinsUsed || 0,
-          message: 'Ride completed',
-          timestamp: new Date().toISOString(),
-          awaitingPayment: true
-        });
-
+        // ✅ Only notify the DRIVER to show the "Collect Cash" screen.
+        // Customer stays on the en-route page until trip:cash_collected fires.
         socket.emit('trip:completed', {
           tripId: tripId.toString(),
           fare,
