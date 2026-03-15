@@ -1,4 +1,8 @@
 // src/controllers/tripController.js
+// ════════════════════════════════════════════════════════════════════════════════════
+// COMPLETE TRIP CONTROLLER - All Functions Integrated
+// Updated with new payment flow and socket events
+// ════════════════════════════════════════════════════════════════════════════════════
 
 import Trip from '../models/Trip.js';
 import Wallet from '../models/Wallet.js';
@@ -6,21 +10,21 @@ import User from '../models/User.js';
 import DriverPlan from '../models/DriverPlan.js';
 import mongoose from 'mongoose';
 import { startTripRetry, stopTripRetry } from '../utils/tripRetryBroadcaster.js';
-import { confirmCashReceipt as processCashCollection } from './paymentController.js';
 import { io } from '../socket/socketHandler.js';
 import { broadcastToDrivers } from '../utils/tripBroadcaster.js';
 import { TRIP_LIMITS } from '../config/tripConfig.js';
 import { generateOTP } from '../utils/otpGeneration.js';
 import RideHistory from '../models/RideHistory.js';
-
 import RewardSettings from '../models/RewardSettings.js';
 import AppSettings from '../models/AppSettings.js';
 import Reward from '../models/Reward.js';
 import { awardCoins, handleFirstRideReferral } from '../services/rewardService.js';
-// 🪙 NEW: enhanced coin award with distance + vehicle bonuses
 import { awardRideCoins } from '../services/coinService.js';
 
-// ✅ LEGAL STATUS TRANSITIONS
+// ════════════════════════════════════════════════════════════════════════════════════
+// CONSTANTS & HELPERS
+// ════════════════════════════════════════════════════════════════════════════════════
+
 const ALLOWED_TRANSITIONS = {
   requested: ['driver_assigned', 'cancelled', 'timeout'],
   driver_assigned: ['driver_at_pickup', 'cancelled'],
@@ -46,7 +50,43 @@ const getCustomerModel = async () => {
   }
 };
 
-// ✅ HELPER: Save ride to history (session-aware)
+function normalizeCoordinates(coords) {
+  if (!Array.isArray(coords) || coords.length !== 2) {
+    throw new Error('Coordinates must be [lat, lng] or [lng, lat]');
+  }
+  const [a, b] = coords.map(Number);
+  if (Math.abs(a) <= 90 && Math.abs(b) > 90) return [b, a];
+  return [a, b];
+}
+
+const findUserByIdOrPhone = async (idOrPhone) => {
+  if (!idOrPhone) return null;
+  if (typeof idOrPhone === 'string' && /^[0-9a-fA-F]{24}$/.test(idOrPhone)) {
+    const byId = await User.findById(idOrPhone);
+    if (byId) return byId;
+  }
+  return await User.findOne({ phone: idOrPhone });
+};
+
+function calculateDistanceFromCoords(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function toRad(value) {
+  return value * Math.PI / 180;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════════════
+
 async function saveToRideHistory(trip, status = 'Completed', session = null) {
   try {
     let populatedTrip = trip;
@@ -89,7 +129,6 @@ async function saveToRideHistory(trip, status = 'Completed', session = null) {
   }
 }
 
-// ✅ Process wallet/commission (session-aware)
 async function processWalletTransaction(driverId, tripId, fareAmount, session) {
   try {
     console.log(`💳 Processing wallet: Driver ${driverId}, Fare ₹${fareAmount}`);
@@ -99,7 +138,6 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
     const commissionSettings = await CommissionSettings.findOne({ type: 'global' });
     const defaultCommissionPercentage = commissionSettings?.percentage || 15;
 
-    // ── Check for active driver plan (broader query to also catch just-expired plans) ──
     const candidatePlan = await DriverPlan.findOne({
       driver: driverId,
       isActive: true,
@@ -115,7 +153,6 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
     let commissionRate = defaultCommissionPercentage;
 
     if (candidatePlan && candidatePlan.isValidNow()) {
-      // Plan is active and within valid time window / not expired
       const activePlan = candidatePlan;
       planApplied = true;
       appliedPlanId = activePlan._id;
@@ -138,12 +175,10 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
 
       console.log(`🎯 Plan applied: ${activePlan.planName} | Commission: ${commissionRate}% | Bonus: x${activePlan.bonusMultiplier}`);
     } else {
-      // Default commission logic
       commission = (fareAmount * defaultCommissionPercentage) / 100;
       commissionRate = defaultCommissionPercentage;
       finalDriverEarning = fareAmount - commission;
 
-      // Auto-expire plan if it exists but has passed its expiry date
       if (candidatePlan && candidatePlan.expiryDate && candidatePlan.expiryDate < new Date()) {
         candidatePlan.markAsExpired().catch((err) =>
           console.error('❌ Failed to mark plan as expired:', err)
@@ -171,7 +206,6 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
       }
     }, { session });
 
-    // ── Push transaction to Wallet model with plan breakdown ──
     const description = planApplied
       ? `Ride ₹${fareAmount} | Commission: ₹${commission} | Plan Bonus: +₹${planBonus.toFixed(2)}`
       : `Ride ₹${fareAmount} | Commission: ₹${commission}`;
@@ -234,7 +268,6 @@ async function processWalletTransaction(driverId, tripId, fareAmount, session) {
   }
 }
 
-// ✅ Award incentives to driver (session-aware)
 async function awardIncentivesToDriver(driverId, tripId, session = null) {
   try {
     const db = mongoose.connection.db;
@@ -281,7 +314,6 @@ async function awardIncentivesToDriver(driverId, tripId, session = null) {
   }
 }
 
-// ✅ Award coins to customer (session-aware)
 async function awardCoinsToCustomer(customerId, tripId, distance, session = null) {
   try {
     const settings = await RewardSettings.findOne();
@@ -339,40 +371,9 @@ async function awardCoinsToCustomer(customerId, tripId, distance, session = null
   }
 }
 
-function normalizeCoordinates(coords) {
-  if (!Array.isArray(coords) || coords.length !== 2) {
-    throw new Error('Coordinates must be [lat, lng] or [lng, lat]');
-  }
-  const [a, b] = coords.map(Number);
-  if (Math.abs(a) <= 90 && Math.abs(b) > 90) return [b, a];
-  return [a, b];
-}
-
-const findUserByIdOrPhone = async (idOrPhone) => {
-  if (!idOrPhone) return null;
-  if (typeof idOrPhone === 'string' && /^[0-9a-fA-F]{24}$/.test(idOrPhone)) {
-    const byId = await User.findById(idOrPhone);
-    if (byId) return byId;
-  }
-  return await User.findOne({ phone: idOrPhone });
-};
-
-function calculateDistanceFromCoords(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-function toRad(value) {
-  return value * Math.PI / 180;
-}
-
-// ========== TRIP CREATION ==========
+// ════════════════════════════════════════════════════════════════════════════════════
+// TRIP CREATION FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════════════
 
 const createShortTrip = async (req, res) => {
   let coinsDeducted = 0;
@@ -405,7 +406,7 @@ const createShortTrip = async (req, res) => {
       drop.coordinates[1], drop.coordinates[0]
     );
 
-    // Coin discount logic — only applies when useCoins === true (user opted in)
+    // Coin discount logic
     try {
       const appSettings = await AppSettings.getSettings();
       const { coinsRequiredForDiscount, discountAmount, enabled } = appSettings.coins;
@@ -445,13 +446,12 @@ const createShortTrip = async (req, res) => {
       console.log(`⚠️ Discount check failed: ${e.message}`);
     }
 
-    // ✅ STEP 1: NORMAL NEARBY DRIVERS (Socket OR FCM - Production Ready)
+    // Find nearby drivers (Socket OR FCM)
     const nearbyDrivers = await User.find({
       isDriver: true,
       vehicleType: sanitizedVehicleType,
       isOnline: true,
       isBusy: { $ne: true },
-      // ✅ PRODUCTION: Has either socket OR fcmToken (can be reached)
       $or: [
         { socketId: { $exists: true, $ne: null } },
         { fcmToken: { $exists: true, $ne: null } }
@@ -468,9 +468,9 @@ const createShortTrip = async (req, res) => {
           $maxDistance: TRIP_LIMITS.SHORT || 2000,
         },
       },
-    }).select('_id name phone socketId fcmToken vehicleType location rating').lean(); // ✅ Added fcmToken
+    }).select('_id name phone socketId fcmToken vehicleType location rating').lean();
 
-    // ✅ STEP 2: DESTINATION MODE DRIVERS (Socket OR FCM)
+    // Find destination mode drivers
     let destinationDrivers = [];
     try {
       destinationDrivers = await User.find({
@@ -478,7 +478,6 @@ const createShortTrip = async (req, res) => {
         vehicleType: sanitizedVehicleType,
         isOnline: true,
         isBusy: { $ne: true },
-        // ✅ PRODUCTION: Has either socket OR fcmToken
         $or: [
           { socketId: { $exists: true, $ne: null } },
           { fcmToken: { $exists: true, $ne: null } }
@@ -496,14 +495,13 @@ const createShortTrip = async (req, res) => {
             $maxDistance: 2000,
           },
         },
-      }).select("_id socketId fcmToken name phone vehicleType").lean(); // ✅ Added fcmToken
+      }).select("_id socketId fcmToken name phone vehicleType").lean();
 
       console.log(`🧡 Found ${destinationDrivers.length} destination-mode drivers for short trip`);
     } catch (destErr) {
       console.log(`⚠️ Destination driver query failed: ${destErr.message}`);
     }
 
-    // ✅ STEP 3: DESTINATION DRIVERS GET PRIORITY
     const destinationDriverIds = new Set(
       destinationDrivers.map(d => d._id?.toString())
     );
@@ -528,10 +526,9 @@ const createShortTrip = async (req, res) => {
       coinsUsed: coinsDeducted
     });
 
-    // Start retry loop
     startTripRetry(trip._id.toString());
 
-    // ✅ STEP 4: BROADCAST TO NORMAL-ONLY DRIVERS (async - uses Socket + FCM)
+    // Broadcast to normal drivers
     if (normalOnlyDrivers.length > 0) {
       await broadcastToDrivers(normalOnlyDrivers, {
         tripId: trip._id.toString(),
@@ -554,7 +551,7 @@ const createShortTrip = async (req, res) => {
       console.log(`📍 Sent normal trip request to ${normalOnlyDrivers.length} drivers`);
     }
 
-    // ✅ STEP 5: BROADCAST TO DESTINATION MODE DRIVERS (async - uses Socket + FCM)
+    // Broadcast to destination mode drivers
     if (destinationDrivers.length > 0) {
       await broadcastToDrivers(destinationDrivers, {
         tripId: trip._id.toString(),
@@ -604,6 +601,7 @@ const createShortTrip = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
 const createParcelTrip = async (req, res) => {
   try {
     const { customerId, pickup, drop, vehicleType, parcelDetails, fare } = req.body;
@@ -616,13 +614,13 @@ const createParcelTrip = async (req, res) => {
     const customer = await findUserByIdOrPhone(customerId);
     if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
 
-    // ✅ STEP 1: NORMAL NEARBY DRIVERS (Socket required)
+    // Find nearby drivers
     const nearbyDrivers = await User.find({
       isDriver: true,
       vehicleType: sanitizedVehicleType,
       isOnline: true,
       isBusy: { $ne: true },
-      socketId: { $exists: true, $ne: null }, // ✅ SOCKET REQUIRED
+      socketId: { $exists: true, $ne: null },
       $or: [{ currentTripId: null }, { currentTripId: { $exists: false } }],
       location: {
         $near: {
@@ -632,7 +630,7 @@ const createParcelTrip = async (req, res) => {
       }
     }).select('_id name phone socketId vehicleType location rating').lean();
 
-    // ✅ STEP 2: DESTINATION MODE DRIVERS (Socket required)
+    // Find destination mode drivers
     let destinationDrivers = [];
     try {
       destinationDrivers = await User.find({
@@ -640,7 +638,7 @@ const createParcelTrip = async (req, res) => {
         vehicleType: sanitizedVehicleType,
         isOnline: true,
         isBusy: { $ne: true },
-        socketId: { $exists: true, $ne: null }, // ✅ SOCKET REQUIRED
+        socketId: { $exists: true, $ne: null },
         $or: [{ currentTripId: null }, { currentTripId: { $exists: false } }],
         "goToDestination.enabled": true,
         "goToDestination.location": {
@@ -659,7 +657,6 @@ const createParcelTrip = async (req, res) => {
       console.log(`⚠️ Destination driver query failed: ${destErr.message}`);
     }
 
-    // ✅ STEP 3: PREVENT DUPLICATE NOTIFICATIONS
     const nearbyDriverIds = new Set(
       nearbyDrivers.map(d => d._id?.toString())
     );
@@ -682,10 +679,9 @@ const createParcelTrip = async (req, res) => {
       fare
     });
 
-    // Start retry loop
     startTripRetry(trip._id.toString());
 
-    // ✅ STEP 4: BROADCAST TO NORMAL NEARBY DRIVERS
+    // Broadcast to normal drivers
     if (nearbyDrivers.length) {
       broadcastToDrivers(nearbyDrivers, {
         tripId: trip._id.toString(),
@@ -708,7 +704,7 @@ const createParcelTrip = async (req, res) => {
       });
     }
 
-    // ✅ STEP 5: BROADCAST TO DESTINATION MODE DRIVERS
+    // Broadcast to destination mode drivers
     if (uniqueDestinationDrivers.length) {
       broadcastToDrivers(uniqueDestinationDrivers, {
         tripId: trip._id.toString(),
@@ -761,12 +757,12 @@ const createLongTrip = async (req, res) => {
 
     const radius = isSameDay ? TRIP_LIMITS.LONG_SAME_DAY : TRIP_LIMITS.LONG_ADVANCE;
 
-    // ✅ STEP 1: NORMAL NEARBY DRIVERS (Socket required)
+    // Find normal drivers
     const driverQuery = {
       isDriver: true,
       vehicleType: sanitizedVehicleType,
       isBusy: { $ne: true },
-      socketId: { $exists: true, $ne: null }, // ✅ SOCKET REQUIRED
+      socketId: { $exists: true, $ne: null },
       $or: [{ currentTripId: null }, { currentTripId: { $exists: false } }],
       location: {
         $near: {
@@ -779,14 +775,14 @@ const createLongTrip = async (req, res) => {
 
     const nearbyDrivers = await User.find(driverQuery).select('_id name phone socketId vehicleType location rating').lean();
 
-    // ✅ STEP 2: DESTINATION MODE DRIVERS (Socket required)
+    // Find destination mode drivers
     let destinationDrivers = [];
     try {
       const destQuery = {
         isDriver: true,
         vehicleType: sanitizedVehicleType,
         isBusy: { $ne: true },
-        socketId: { $exists: true, $ne: null }, // ✅ SOCKET REQUIRED
+        socketId: { $exists: true, $ne: null },
         $or: [{ currentTripId: null }, { currentTripId: { $exists: false } }],
         "goToDestination.enabled": true,
         "goToDestination.location": {
@@ -808,7 +804,6 @@ const createLongTrip = async (req, res) => {
       console.log(`⚠️ Destination driver query failed: ${destErr.message}`);
     }
 
-    // ✅ STEP 3: PREVENT DUPLICATE NOTIFICATIONS
     const nearbyDriverIds = new Set(
       nearbyDrivers.map(d => d._id?.toString())
     );
@@ -833,10 +828,9 @@ const createLongTrip = async (req, res) => {
       fare
     });
 
-    // Start retry loop
     startTripRetry(trip._id.toString());
 
-    // ✅ STEP 4: BROADCAST TO NORMAL NEARBY DRIVERS
+    // Broadcast to normal drivers
     if (nearbyDrivers.length) {
       broadcastToDrivers(nearbyDrivers, {
         tripId: trip._id.toString(),
@@ -861,7 +855,7 @@ const createLongTrip = async (req, res) => {
       });
     }
 
-    // ✅ STEP 5: BROADCAST TO DESTINATION MODE DRIVERS
+    // Broadcast to destination mode drivers
     if (uniqueDestinationDrivers.length) {
       broadcastToDrivers(uniqueDestinationDrivers, {
         tripId: trip._id.toString(),
@@ -902,9 +896,10 @@ const createLongTrip = async (req, res) => {
   }
 };
 
-/**
- * ✅ Cancel trip search BEFORE driver accepts
- */
+// ════════════════════════════════════════════════════════════════════════════════════
+// TRIP CANCELLATION
+// ════════════════════════════════════════════════════════════════════════════════════
+
 const cancelTripByCustomer = async (req, res) => {
   try {
     const { tripId, customerId, reason } = req.body;
@@ -923,7 +918,6 @@ const cancelTripByCustomer = async (req, res) => {
       });
     }
 
-    // ✅ ATOMIC CANCEL WITH VERSION INCREMENT
     const trip = await Trip.findOneAndUpdate(
       {
         _id: tripId,
@@ -982,11 +976,9 @@ const cancelTripByCustomer = async (req, res) => {
 
     console.log(`✅ Trip ${tripId} cancelled successfully (version: ${trip.version})`);
 
-    // 🛑 STOP RETRY LOOP
     stopTripRetry(tripId);
     console.log(`✅ Retry loop stopped for trip ${tripId}`);
 
-    // 📢 NOTIFY ALL ONLINE DRIVERS
     if (io) {
       const onlineDrivers = await User.find({
         isDriver: true,
@@ -1007,7 +999,6 @@ const cancelTripByCustomer = async (req, res) => {
       });
     }
 
-    // Refund coins if any were used
     let coinsRefunded = 0;
     if (trip.coinsUsed && trip.coinsUsed > 0) {
       try {
@@ -1040,7 +1031,81 @@ const cancelTripByCustomer = async (req, res) => {
   }
 };
 
-// ========== TRIP ACCEPTANCE ==========
+const cancelTrip = async (req, res) => {
+  try {
+    const { tripId, cancelledBy, reason } = req.body;
+    if (!tripId || !cancelledBy) return res.status(400).json({ success: false, message: 'tripId and cancelledBy required' });
+
+    const trip = await Trip.findById(tripId)
+      .populate('customerId', 'phone name socketId')
+      .populate('assignedDriver', 'name phone socketId');
+
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
+    if (trip.status === 'cancelled') return res.status(400).json({ success: false, message: 'Already cancelled' });
+    if (trip.status === 'completed') return res.status(400).json({ success: false, message: 'Cannot cancel completed trip' });
+
+    const isCustomer = trip.customerId?._id?.toString() === cancelledBy;
+    const isDriver = trip.assignedDriver?._id?.toString() === cancelledBy;
+    if (!isCustomer && !isDriver) return res.status(403).json({ success: false, message: 'Not authorized' });
+
+    let coinsRefunded = 0;
+    if (trip.coinsUsed && trip.coinsUsed > 0) {
+      try {
+        const CustomerModel = await getCustomerModel();
+        await CustomerModel.findByIdAndUpdate(trip.customerId._id, { $inc: { coins: trip.coinsUsed } });
+        coinsRefunded = trip.coinsUsed;
+      } catch (e) { console.error('Coin refund failed:', e); }
+    }
+
+    assertTransition(trip.status, 'cancelled');
+    trip.status = 'cancelled';
+    trip.version += 1;
+    trip.cancelledBy = cancelledBy;
+    trip.cancelledAt = new Date();
+    trip.cancellationReason = reason;
+    await trip.save();
+
+    await saveToRideHistory(trip, 'Cancelled');
+
+    if (trip.assignedDriver) {
+      await User.findByIdAndUpdate(trip.assignedDriver._id, { $set: { currentTripId: null, isBusy: false } });
+    }
+
+    if (trip.assignedDriver?.socketId && io) {
+      io.to(trip.assignedDriver.socketId).emit('trip:cancelled', { tripId, cancelledBy: isCustomer ? 'customer' : 'driver' });
+    }
+    if (trip.customerId?.socketId && io) {
+      io.to(trip.customerId.socketId).emit('trip:cancelled', { tripId, coinsRefunded });
+    }
+
+    if (!trip.assignedDriver && io) {
+      const onlineDrivers = await User.find({
+        isDriver: true,
+        isOnline: true,
+        socketId: { $exists: true, $ne: null }
+      }).select('socketId').lean();
+
+      console.log(`📡 [cancelTrip] Notifying ${onlineDrivers.length} drivers about cancellation`);
+
+      onlineDrivers.forEach(driver => {
+        io.to(driver.socketId).emit('trip:cancelled', {
+          tripId: trip._id.toString(),
+          cancelledBy: 'customer',
+          reason: 'customer_cancelled_search'
+        });
+      });
+    }
+
+    res.status(200).json({ success: true, message: 'Trip cancelled', coinsRefunded });
+  } catch (err) {
+    console.error('🔥 cancelTrip error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════════════════════════
+// TRIP ACCEPTANCE & STATUS UPDATES
+// ════════════════════════════════════════════════════════════════════════════════════
 
 const acceptTrip = async (req, res) => {
   const session = await mongoose.startSession();
@@ -1064,7 +1129,6 @@ const acceptTrip = async (req, res) => {
       
       if (!trip) throw new Error('Trip not available');
 
-      // ✅ FIXED: Fetch driver with location
       const driver = await User.findOne({
         _id: driverId, 
         isBusy: { $ne: true },
@@ -1100,10 +1164,9 @@ const acceptTrip = async (req, res) => {
 
       tripData = trip.toObject();
       
-      // ✅ FIXED: Complete driver data with location
       driverData = {
-        _id: driver._id.toString(),   // ✅ always plain string
-        id: driver._id.toString(),    // ✅ alias for Flutter fallback
+        _id: driver._id.toString(),
+        id: driver._id.toString(),
         name: driver.name,
         phone: driver.phone,
         photoUrl: driver.photoUrl || null,
@@ -1117,7 +1180,6 @@ const acceptTrip = async (req, res) => {
       };
     });
 
-    // ✅ FIXED: Fetch customer details
     const customer = await User.findById(tripData.customerId)
       .select('socketId name phone photoUrl rating')
       .lean();
@@ -1132,7 +1194,6 @@ const acceptTrip = async (req, res) => {
       };
     }
 
-    // ✅ FIXED: Send complete data to customer
     if (customer?.socketId && io) {
       io.to(customer.socketId).emit('trip:accepted', { 
         tripId: tripData._id.toString(), 
@@ -1140,8 +1201,8 @@ const acceptTrip = async (req, res) => {
         trip: {
           _id: tripData._id.toString(),
           tripId: tripData._id.toString(),
-          customerId: tripData.customerId.toString(),   // ✅ ADDED
-          driverId: tripData.assignedDriver.toString(), // ✅ ADDED
+          customerId: tripData.customerId.toString(),
+          driverId: tripData.assignedDriver.toString(),
           fare: tripData.fare || 0,
           finalFare: tripData.finalFare || tripData.fare || 0,
           pickup: {
@@ -1161,7 +1222,6 @@ const acceptTrip = async (req, res) => {
       console.log(`✅ Sent complete trip acceptance to customer with driver location`);
     }
 
-    // ✅ FIXED: Return complete data to driver
     return res.status(200).json({ 
       success: true, 
       data: { 
@@ -1170,8 +1230,8 @@ const acceptTrip = async (req, res) => {
         trip: {
           _id: tripData._id.toString(),
           tripId: tripData._id.toString(),
-          customerId: tripData.customerId.toString(),   // ✅ ADDED
-          driverId: tripData.assignedDriver.toString(), // ✅ ADDED
+          customerId: tripData.customerId.toString(),
+          driverId: tripData.assignedDriver.toString(),
           fare: tripData.fare || 0,
           finalFare: tripData.finalFare || tripData.fare || 0,
           type: tripData.type,
@@ -1209,8 +1269,6 @@ const rejectTrip = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
-// ========== TRIP STATUS UPDATES ==========
 
 const driverGoingToPickup = async (req, res) => {
   try {
@@ -1285,7 +1343,9 @@ const startRide = async (req, res) => {
   }
 };
 
-// ========== RIDE COMPLETION ==========
+// ════════════════════════════════════════════════════════════════════════════════════
+// RIDE COMPLETION & PAYMENT
+// ════════════════════════════════════════════════════════════════════════════════════
 
 const completeRideWithVerification = async (req, res) => {
   const session = await mongoose.startSession();
@@ -1354,9 +1414,6 @@ const completeRideWithVerification = async (req, res) => {
       await trip.save({ session });
       console.log('✅ Trip completed + payment marked collected');
 
-      // ──── FIX: Only process wallet for non-cash payments ────
-      // For cash rides, wallet will be processed separately in confirmCashCollection()
-      // to prevent duplicate transaction recording
       const paymentMethod = trip.payment?.method || trip.paymentMethod || 'unknown';
       
       if (paymentMethod?.toLowerCase() === 'cash') {
@@ -1379,7 +1436,6 @@ const completeRideWithVerification = async (req, res) => {
           }
         };
       } else {
-        // Online payment (Razorpay, etc.) - process wallet now
         console.log('💳 Online payment detected - processing wallet transaction');
         walletResult = await processWalletTransaction(driverId, tripId, fareAmount, session);
         if (!walletResult.success) {
@@ -1392,9 +1448,6 @@ const completeRideWithVerification = async (req, res) => {
         trip.drop.coordinates[1], trip.drop.coordinates[0]
       );
 
-      // ✅ Only award coins here for ONLINE payments.
-      // For CASH rides, coins are awarded in confirmCashCollection() after the
-      // driver confirms cash received — prevents double-award (this fn + confirmCash).
       const paymentMethodForCoins = trip.payment?.method || trip.paymentMethod || 'unknown';
       if (paymentMethodForCoins?.toLowerCase() !== 'cash') {
         coinReward = await awardRideCoins({
@@ -1407,7 +1460,6 @@ const completeRideWithVerification = async (req, res) => {
         console.log('🪙 Cash ride — coin award deferred to confirmCashCollection()');
       }
 
-      // Check first ride for referral
       const completedCount = await Trip.countDocuments({
         customerId: trip.customerId,
         status: 'completed',
@@ -1417,7 +1469,6 @@ const completeRideWithVerification = async (req, res) => {
         handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
           console.warn('⚠️ handleFirstRideReferral failed:', e.message)
         );
-        // 🎁 Lock welcome coupon — first ride done, never apply again
         User.findByIdAndUpdate(trip.customerId, { $set: { welcomeCouponUsed: true } })
           .catch((e) => console.warn('⚠️ welcomeCouponUsed update failed:', e.message));
       }
@@ -1491,17 +1542,12 @@ const completeRideWithVerification = async (req, res) => {
     });
 
   } catch (err) {
-    // withTransaction() auto-aborts on error — do NOT call abortTransaction() again
-    // or MongoDB throws "Cannot call abortTransaction twice"
     try { session.endSession(); } catch (_) {}
     console.error('🔥 completeRideWithVerification error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ============================================================
-// ✅ confirmCashCollection - Direct wallet update (no mock chain)
-// ============================================================
 const confirmCashCollection = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -1520,7 +1566,6 @@ const confirmCashCollection = async (req, res) => {
       return res.status(400).json({ success: false, message: 'tripId and driverId are required' });
     }
 
-    // ── 1. Load & validate trip ──────────────────────────────────────
     const trip = await Trip.findById(tripId).session(session);
     if (!trip) {
       await session.abortTransaction();
@@ -1542,15 +1587,14 @@ const confirmCashCollection = async (req, res) => {
       return res.json({ success: true, message: 'Cash already collected', alreadyProcessed: true });
     }
 
-    // ── 2. Calculate fare & commission (check for active plan) ────────
     const COMMISSION_RATE = 0.20;
     const fareAmount = Number(fare) || trip.finalFare || trip.fare || 0;
     if (fareAmount <= 0) {
       await session.abortTransaction();
-           return res.status(400).json({ success: false, message: 'Invalid fare amount' });
+      return res.status(400).json({ success: false, message: 'Invalid fare amount' });
     }
 
-    // ──── FIX: Check for active plan to apply benefits ────
+    // Check for active plan
     const now = new Date();
     const activePlan = await DriverPlan.findOne({
       driver: driverId,
@@ -1588,14 +1632,13 @@ const confirmCashCollection = async (req, res) => {
       }
     }
 
-    // Use calculated commission rate with plan (not hardcoded 20%)
     const commission = Math.round(fareAmount * finalCommissionRate * 100) / 100;
     const baseEarning = Math.round((fareAmount - commission) * 100) / 100;
     const driverEarning = Math.round((baseEarning + planBonus) * 100) / 100;
 
     console.log(`   Fare: ₹${fareAmount} | Commission: ₹${commission} | Plan Bonus: ₹${planBonus} | Driver: ₹${driverEarning}`);
 
-    // ── 3. Update wallet directly ────────────────────────────────────
+    // Update wallet
     let wallet = await Wallet.findOne({ driverId }).session(session);
     if (!wallet) {
       wallet = new Wallet({
@@ -1608,7 +1651,6 @@ const confirmCashCollection = async (req, res) => {
       });
     }
 
-    // Record ride earning with plan details (single comprehensive transaction)
     wallet.transactions.push({
       tripId,
       type: 'credit',
@@ -1630,25 +1672,19 @@ const confirmCashCollection = async (req, res) => {
       createdAt: new Date()
     });
 
-    // Update totals
     wallet.totalEarnings    += driverEarning;
     wallet.totalCommission  += commission;
     if (planApplied && planBonus > 0) {
       wallet.totalPlanBonusEarned = (wallet.totalPlanBonusEarned || 0) + planBonus;
     }
 
-    // Cash flow: driver physically has the cash, owes commission to platform
-    // Commission is DEBT — add to pendingAmount directly
     wallet.pendingAmount = Math.round((wallet.pendingAmount + commission) * 100) / 100;
-
-    // availableBalance tracks online earnings minus withdrawals (not cash)
-    // Keep it unchanged for cash trips — pendingAmount is the debt tracker
 
     await wallet.save({ session });
 
     console.log(`   Wallet saved: earning=₹${driverEarning}, commission=₹${commission}, pending=₹${wallet.pendingAmount}`);
 
-    // ── 4. Mark trip as payment collected ───────────────────────────
+    // Mark trip as payment collected
     trip.paymentCollected  = true;
     trip.paymentStatus     = 'completed';
     trip.paymentMethod     = 'cash';
@@ -1658,34 +1694,64 @@ const confirmCashCollection = async (req, res) => {
 
     await session.commitTransaction();
 
-    // ── 5. Emit socket to customer ───────────────────────────────────
+    // ════════════════════════════════════════════════════════════════════════════
+    // ✅ EMIT SOCKET EVENTS
+    // ════════════════════════════════════════════════════════════════════════════
+    
     if (req.io) {
       const customerId = trip.customerId?.toString();
+      
+      console.log(`📡 Emitting socket events...`);
+
+      // To customer
       if (customerId) {
+        console.log(`📢 Emitting trip:cash_collected to customer_${customerId}`);
         req.io.to(`customer_${customerId}`).emit('trip:cash_collected', {
-          tripId,
+          tripId: tripId.toString(),
           message: 'Driver confirmed cash received. Thank you!',
+          timestamp: new Date().toISOString(),
+          paymentCollected: true,
+          fareAmount: fareAmount,
+          driverConfirmed: true,
+          status: 'completed'
+        });
+      }
+
+      // To driver
+      console.log(`📢 Emitting payment:confirmed to driver_${driverId}`);
+      req.io.to(`driver_${driverId}`).emit('payment:confirmed', {
+        tripId: tripId.toString(),
+        amount: fareAmount,
+        driverAmount: driverEarning,
+        commission: commission,
+        pendingAmount: wallet.pendingAmount,
+        method: 'cash',
+        timestamp: new Date().toISOString(),
+        planApplied: planApplied,
+        planBonus: planBonus,
+        planName: appliedPlanDetails?.planName || null
+      });
+
+      // Fallback to customer
+      if (customerId) {
+        console.log(`📢 Emitting payment:confirmed to customer_${customerId} (fallback)`);
+        req.io.to(`customer_${customerId}`).emit('payment:confirmed', {
+          tripId: tripId.toString(),
+          message: 'Payment confirmed by driver',
+          status: 'completed',
           timestamp: new Date().toISOString()
         });
       }
-      req.io.to(`driver_${driverId}`).emit('payment:confirmed', {
-        tripId,
-        amount: fareAmount,
-        driverAmount: driverEarning,
-        commission,
-        pendingAmount: wallet.pendingAmount,
-        method: 'cash',
-        timestamp: new Date().toISOString()
-      });
+    } else {
+      console.warn('⚠️ req.io not available - socket events not emitted');
     }
 
     console.log('✅ Cash collection complete');
 
-    // ── 6. Award coins to customer + handle first-ride referral (non-critical) ─
+    // Award coins
     let coinReward = null;
     try {
       if (trip.customerId) {
-        // Use the new rewardService for consistent coin logic
         const cashTripDistance = calculateDistanceFromCoords(
           trip.pickup.coordinates[1], trip.pickup.coordinates[0],
           trip.drop.coordinates[1], trip.drop.coordinates[0]
@@ -1697,7 +1763,6 @@ const confirmCashCollection = async (req, res) => {
           vehicleType: trip.vehicleType,
         });
 
-        // Check if this is their first completed ride → trigger referral chain
         const completedCount = await Trip.countDocuments({
           customerId: trip.customerId,
           status: 'completed',
@@ -1707,7 +1772,6 @@ const confirmCashCollection = async (req, res) => {
           handleFirstRideReferral(trip.customerId, tripId).catch((e) =>
             console.warn('⚠️ handleFirstRideReferral failed:', e.message)
           );
-          // 🎁 Lock welcome coupon — first ride done, never apply again
           User.findByIdAndUpdate(trip.customerId, { $set: { welcomeCouponUsed: true } })
             .catch((e) => console.warn('⚠️ welcomeCouponUsed update failed:', e.message));
         }
@@ -1716,6 +1780,17 @@ const confirmCashCollection = async (req, res) => {
       console.warn('⚠️ Coin award failed (non-critical):', coinErr.message);
     }
 
+    console.log('');
+    console.log('✅ ═══════════════════════════════════════════════════════════════');
+    console.log('✅ CASH COLLECTION SUCCESS');
+    console.log(`   Driver earned: ₹${driverEarning.toFixed(2)}`);
+    console.log(`   Commission deducted: ₹${commission.toFixed(2)}`);
+    if (planApplied) {
+      console.log(`   Plan bonus: ₹${planBonus.toFixed(2)}`);
+    }
+    console.log('✅ ═══════════════════════════════════════════════════════════════');
+    console.log('');
+
     return res.status(200).json({
       success: true,
       message: 'Cash collected successfully',
@@ -1723,8 +1798,10 @@ const confirmCashCollection = async (req, res) => {
       fareBreakdown: {
         tripFare: fareAmount,
         commission,
-        commissionPercentage: COMMISSION_RATE * 100,
-        driverEarning
+        commissionPercentage: finalCommissionRate * 100,
+        driverEarning,
+        planBonus,
+        planApplied
       },
       wallet: {
         totalEarnings:    wallet.totalEarnings,
@@ -1735,14 +1812,19 @@ const confirmCashCollection = async (req, res) => {
       coinReward: coinReward?.awarded ? {
         coinsAwarded: coinReward.coinsAwarded,
         totalCoins: coinReward.totalCoins
-      } : null
+      } : null,
+      socketEmitted: !!req.io
     });
 
   } catch (err) {
     await session.abortTransaction();
     console.error('🔥 confirmCashCollection error:', err);
     if (!res.headersSent) {
-      res.status(500).json({ success: false, message: 'Failed to confirm cash collection' });
+      res.status(500).json({ 
+        success: false, 
+        message: 'Failed to confirm cash collection',
+        error: err.message 
+      });
     }
   } finally {
     session.endSession();
@@ -1780,90 +1862,15 @@ const completeTrip = async (req, res) => {
     session.endSession();
     res.status(200).json({ success: true, message: 'Trip completed' });
   } catch (err) {
-    // withTransaction() auto-aborts on error — do NOT call abortTransaction() again
     try { session.endSession(); } catch (_) {}
     console.error('🔥 completeTrip error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ========== CANCEL TRIP ==========
-
-const cancelTrip = async (req, res) => {
-  try {
-    const { tripId, cancelledBy, reason } = req.body;
-    if (!tripId || !cancelledBy) return res.status(400).json({ success: false, message: 'tripId and cancelledBy required' });
-
-    const trip = await Trip.findById(tripId)
-      .populate('customerId', 'phone name socketId')
-      .populate('assignedDriver', 'name phone socketId');
-
-    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
-    if (trip.status === 'cancelled') return res.status(400).json({ success: false, message: 'Already cancelled' });
-    if (trip.status === 'completed') return res.status(400).json({ success: false, message: 'Cannot cancel completed trip' });
-
-    const isCustomer = trip.customerId?._id?.toString() === cancelledBy;
-    const isDriver = trip.assignedDriver?._id?.toString() === cancelledBy;
-    if (!isCustomer && !isDriver) return res.status(403).json({ success: false, message: 'Not authorized' });
-
-    // Refund coins
-    let coinsRefunded = 0;
-    if (trip.coinsUsed && trip.coinsUsed > 0) {
-      try {
-        const CustomerModel = await getCustomerModel();
-        await CustomerModel.findByIdAndUpdate(trip.customerId._id, { $inc: { coins: trip.coinsUsed } });
-        coinsRefunded = trip.coinsUsed;
-      } catch (e) { console.error('Coin refund failed:', e); }
-    }
-
-    assertTransition(trip.status, 'cancelled');
-    trip.status = 'cancelled';
-    trip.version += 1;
-    trip.cancelledBy = cancelledBy;
-    trip.cancelledAt = new Date();
-    trip.cancellationReason = reason;
-    await trip.save();
-
-    await saveToRideHistory(trip, 'Cancelled');
-
-    if (trip.assignedDriver) {
-      await User.findByIdAndUpdate(trip.assignedDriver._id, { $set: { currentTripId: null, isBusy: false } });
-    }
-
-    if (trip.assignedDriver?.socketId && io) {
-      io.to(trip.assignedDriver.socketId).emit('trip:cancelled', { tripId, cancelledBy: isCustomer ? 'customer' : 'driver' });
-    }
-    if (trip.customerId?.socketId && io) {
-      io.to(trip.customerId.socketId).emit('trip:cancelled', { tripId, coinsRefunded });
-    }
-
-    // Notify all online drivers if no driver assigned
-    if (!trip.assignedDriver && io) {
-      const onlineDrivers = await User.find({
-        isDriver: true,
-        isOnline: true,
-        socketId: { $exists: true, $ne: null }
-      }).select('socketId').lean();
-
-      console.log(`📡 [cancelTrip] Notifying ${onlineDrivers.length} drivers about cancellation`);
-
-      onlineDrivers.forEach(driver => {
-        io.to(driver.socketId).emit('trip:cancelled', {
-          tripId: trip._id.toString(),
-          cancelledBy: 'customer',
-          reason: 'customer_cancelled_search'
-        });
-      });
-    }
-
-    res.status(200).json({ success: true, message: 'Trip cancelled', coinsRefunded });
-  } catch (err) {
-    console.error('🔥 cancelTrip error:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-// ========== QUERY FUNCTIONS ==========
+// ════════════════════════════════════════════════════════════════════════════════════
+// QUERY FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════════════
 
 const getTripById = async (req, res) => {
   try {
@@ -1941,9 +1948,6 @@ const getActiveRide = async (req, res) => {
   }
 };
 
-// ========== DRIVER LOCATION BY TRIP ID ==========
-// Flutter polls GET /api/trip/:tripId/driver-location as socket fallback
-
 const getDriverLocationByTripId = async (req, res) => {
   try {
     const { tripId } = req.params;
@@ -1989,9 +1993,11 @@ const getDriverLocationByTripId = async (req, res) => {
   }
 };
 
-// ========== SUPPORT ==========
+// ════════════════════════════════════════════════════════════════════════════════════
+// SUPPORT
+// ════════════════════════════════════════════════════════════════════════════════════
 
-export const requestTripSupport = async (req, res) => {
+const requestTripSupport = async (req, res) => {
   try {
     const { tripId, reason } = req.body;
     if (!tripId) return res.status(400).json({ success: false, message: 'tripId required' });
@@ -2013,7 +2019,9 @@ export const requestTripSupport = async (req, res) => {
   }
 };
 
-// ========== EXPORTS ==========
+// ════════════════════════════════════════════════════════════════════════════════════
+// EXPORTS
+// ════════════════════════════════════════════════════════════════════════════════════
 
 export {
   createShortTrip,
@@ -2035,5 +2043,6 @@ export {
   getTripByIdWithPayment,
   getActiveRide,
   awardCoinsToCustomer,
-  getDriverLocationByTripId,   // ✅ NEW: Flutter polls /api/trip/:tripId/driver-location
+  getDriverLocationByTripId,
+  requestTripSupport
 };
