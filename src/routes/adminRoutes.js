@@ -11,7 +11,7 @@ import path from "path";
 import fs from "fs";
 
 // 📁 Multer Banner Upload
-import { uploadBanner, uploadBannerToCloudinary, uploadNotificationToCloudinary } from "../middlewares/multer.js";
+import { uploadBanner, uploadBannerToCloudinary, uploadNotificationToCloudinary, uploadToCloudinary } from "../middlewares/multer.js";
 
 import {
   // Dashboard
@@ -302,7 +302,9 @@ router.post(
         });
       }
 
-      const imageUrl = req.file.path; // Cloudinary URL
+      // ✅ multer now uses memoryStorage — manually upload buffer to Cloudinary
+      const result = await uploadToCloudinary(req.file.buffer, "notifications");
+      const imageUrl = result.secure_url;
 
       console.log(`✅ Notification image uploaded: ${imageUrl}`);
 
@@ -310,7 +312,7 @@ router.post(
         success: true,
         message: "Image uploaded successfully",
         imageUrl,
-        cloudinary_id: req.file.filename,
+        cloudinary_id: result.public_id,
       });
     } catch (err) {
       console.error("❌ Error uploading image:", err);
