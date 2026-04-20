@@ -3,25 +3,9 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 
-// Handle both constructor and factory-function export shapes across versions.
+// ✅ multer-storage-cloudinary v3 (CommonJS) — import via default then destructure
 import multerCloudinary from "multer-storage-cloudinary";
-const CloudinaryStorageExport =
-  multerCloudinary?.CloudinaryStorage ||
-  multerCloudinary?.default?.CloudinaryStorage ||
-  multerCloudinary?.default ||
-  multerCloudinary;
-
-const createCloudinaryStorage = (options) => {
-  if (typeof CloudinaryStorageExport !== "function") {
-    throw new Error("Invalid multer-storage-cloudinary export shape");
-  }
-
-  try {
-    return new CloudinaryStorageExport(options);
-  } catch {
-    return CloudinaryStorageExport(options);
-  }
-};
+const CloudinaryStorage = multerCloudinary.CloudinaryStorage; // ✅ property access, not destructure (ESM+CJS compat)
 
 // ✅ Import ROOT cloudinary package — v3 calls this.cloudinary.v2.uploader internally
 import cloudinary from "../utils/cloudinary.js";
@@ -117,13 +101,13 @@ export const uploadBanner = multer({
 // ===============================
 // ☁️ Cloudinary Banner Storage
 // ===============================
-const bannerCloudinaryStorage = createCloudinaryStorage({
-  cloudinary: cloudinary,   // root package — v3 reads .v2.uploader from this
-  params: {
+const bannerCloudinaryStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: async (req, file) => ({
     folder: "banners",
     allowed_formats: ["jpg", "jpeg", "png", "webp"],
-    public_id: (req, file) => `banner_${Date.now()}_${Math.round(Math.random() * 1e4)}`,
-  },
+    public_id: `banner_${Date.now()}_${Math.round(Math.random() * 1e4)}`,
+  }),
 });
 
 export const uploadBannerToCloudinary = multer({
@@ -134,13 +118,13 @@ export const uploadBannerToCloudinary = multer({
 // ===============================
 // ☁️ Cloudinary Notification Storage
 // ===============================
-const notificationCloudinaryStorage = createCloudinaryStorage({
-  cloudinary: cloudinary,   // root package — v3 reads .v2.uploader from this
-  params: {
+const notificationCloudinaryStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: async (req, file) => ({
     folder: "notifications",
     allowed_formats: ["jpg", "jpeg", "png", "webp"],
-    public_id: (req, file) => `notif_${Date.now()}_${Math.round(Math.random() * 1e4)}`,
-  },
+    public_id: `notif_${Date.now()}_${Math.round(Math.random() * 1e4)}`,
+  }),
 });
 
 export const uploadNotificationToCloudinary = multer({
