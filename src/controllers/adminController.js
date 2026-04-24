@@ -1621,9 +1621,28 @@ export const verifyDriverDocument = async (req, res) => {
       updates.extractedData = extractedData;
     }
 
+    const normalizedDocType = String(doc.docType || "")
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_");
+    const isProfileDocumentType = [
+      "profile",
+      "profile_photo",
+      "profilephoto",
+      "profile_picture",
+      "profilepicture",
+      "selfie",
+      "photo",
+    ].includes(normalizedDocType);
+
+    if (isApprovedStatus && isProfileDocumentType) {
+      // Profile photos are approve/reject only. Do not move/copy into custom folders.
+      updates.approvedAt = new Date();
+      updates.approvedBy = "admin";
+    }
+
     // 🔄 IF APPROVED/VERIFIED: Move files to custom save folder path
     const shouldMoveToStorage =
-      isApprovedStatus && doc.url && (isRenderRuntime || !!normalizedSaveFolderPath);
+      isApprovedStatus && !isProfileDocumentType && doc.url && (isRenderRuntime || !!normalizedSaveFolderPath);
 
     if (shouldMoveToStorage) {
       try {
