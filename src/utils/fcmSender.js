@@ -113,12 +113,12 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
       message.notification = {
         title: String(dataPayload.title || 'New Notification'),
         body: String(dataPayload.body || ''),
-        ...(fullImageUrl && { imageUrl: fullImageUrl }),
+        ...(fullImageUrl && { image: fullImageUrl }), // ✅ FCM v1: top-level uses `image`
       };
       message.android.notification = {
         channelId: CHANNEL_ID,
         priority: 'high',
-        ...(fullImageUrl && { imageUrl: fullImageUrl }),
+        ...(fullImageUrl && { image: fullImageUrl }), // ✅ FCM v1: android.notification also uses `image`
       };
     }
 
