@@ -143,21 +143,23 @@ const sendBroadcastNotification = async (req, res) => {
       });
     }
 
+    // ✅ FIX: Use `role` field (not `isDriver`) — consistent with the rest of the codebase.
+    // `isDriver: { $ne: true }` was matching drivers with missing/null isDriver field.
     let query = {};
     if (role === "driver") {
-      query = { isDriver: true };
+      query = { role: "driver" };
     } else if (role === "customer") {
-      query = { isDriver: { $ne: true } };
+      query = { role: "customer" };
     }
     // if role is undefined / "all" → no filter → all users
 
-    const users = await User.find(query).select("_id fcmToken isDriver name");
+    const users = await User.find(query).select("_id fcmToken role name");
 
     let successCount = 0;
     let failCount = 0;
 
     for (const user of users) {
-      const userRole = user.isDriver ? "driver" : "customer";
+      const userRole = user.role; // ✅ use role field directly
 
       // ✅ Save to DB — each user gets their own notification record
       await createNotification({
@@ -174,7 +176,7 @@ const sendBroadcastNotification = async (req, res) => {
       // ✅ Send FCM
       if (user.fcmToken) {
         try {
-          if (user.isDriver) {
+          if (user.role === "driver") {
             // ✅ FIX: Pass title + body so fcmSender can add notification block
             // for killed-app delivery
             await sendToDriver(user.fcmToken, {
@@ -238,7 +240,7 @@ const sendIndividualNotification = async (req, res) => {
       });
     }
 
-    const userRole = user.isDriver ? "driver" : "customer";
+    const userRole = user.role; // ✅ use role field directly
 
     await createNotification({
       userId: user._id,
@@ -253,7 +255,7 @@ const sendIndividualNotification = async (req, res) => {
 
     let fcmResult = { success: false };
     if (user.fcmToken) {
-      if (user.isDriver) {
+      if (user.role === "driver") {
         // ✅ FIX: Pass title + body for killed-app notification block
         fcmResult = await sendToDriver(user.fcmToken, {
           notificationType: "ADMIN_NOTIFICATION",
