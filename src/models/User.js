@@ -405,8 +405,9 @@ const userSchema = new mongoose.Schema(
     },
     firebaseUid: {
       type: String,
-      unique: true,
       sparse: true,
+      // 🔥 FIXED: Removed unique: true to allow same Firebase user for multiple roles
+      // Now using compound index { firebaseUid: 1, role: 1 } instead
     },
 
     /* ================================
@@ -560,6 +561,8 @@ const userSchema = new mongoose.Schema(
 ================================ */
 // 🔥 FIXED: Compound unique index on phone + role to allow separate accounts per role
 userSchema.index({ phone: 1, role: 1 }, { unique: true });
+// 🔥 FIXED: Compound unique index on firebaseUid + role to allow same Firebase user for multiple roles
+userSchema.index({ firebaseUid: 1, role: 1 }, { sparse: true, unique: true });
 userSchema.index({ location: "2dsphere" });
 userSchema.index({ "goToDestination.location": "2dsphere" });
 userSchema.index({
