@@ -4,10 +4,12 @@ import mongoose from "mongoose";
 const userSchema = new mongoose.Schema(
   {
     // 📞 Basic Info
+    // 🔥 FIXED: phone is no longer unique globally — only phone+role combination is unique
+    // This allows same phone number to have SEPARATE accounts for driver and customer
     phone: {
       type: String,
       required: true,
-      unique: true,
+      index: true, // Add index for faster queries but remove unique constraint
     },
     name: {
       type: String,
@@ -556,6 +558,8 @@ const userSchema = new mongoose.Schema(
 /* ================================
    📌 INDEXES
 ================================ */
+// 🔥 FIXED: Compound unique index on phone + role to allow separate accounts per role
+userSchema.index({ phone: 1, role: 1 }, { unique: true });
 userSchema.index({ location: "2dsphere" });
 userSchema.index({ "goToDestination.location": "2dsphere" });
 userSchema.index({

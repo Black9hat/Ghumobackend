@@ -35,7 +35,8 @@ export const firebaseSync = async (req, res) => {
     console.log(`✅ Firebase sync: ${phoneKey} | uid: ${firebaseUid} | role: ${loginRole} | device: ${deviceIdValue}`);
 
     // ── Find or Create User ──────────────────────────────────────────────────
-    let user      = await User.findOne({ phone: phoneKey });
+    // 🔥 FIXED: Find user by BOTH phone AND role to support separate accounts
+    let user      = await User.findOne({ phone: phoneKey, role: loginRole });
     let isNewUser = false;
 
     if (!user) {
@@ -88,22 +89,15 @@ export const firebaseSync = async (req, res) => {
       }
 
     } else {
-      // Existing user login
+      // Existing user login (same phone, same role)
       if (!user.firebaseUid) {
         user.firebaseUid = firebaseUid;
         await user.save();
       }
 
-      if (loginRole === "driver" && user.role !== "driver") {
-        isNewUser        = true;
-        user.role        = "driver";
-        user.isDriver    = true;
-        user.vehicleType = null;
-        await user.save();
-        console.log(`🔄 Converted to driver: ${user._id}`);
-      } else {
-        console.log(`✅ Existing user login: ${user._id} | referredBy: ${user.referredBy || 'none'} | referralCode in body: ${referralCode || 'none'}`);
-      }
+      // 🔥 FIXED: Removed role conversion logic
+      // Now each role is a separate user account, so we never convert roles
+      console.log(`✅ Existing user login: ${user._id} (role: ${loginRole}) | referredBy: ${user.referredBy || 'none'} | referralCode in body: ${referralCode || 'none'}`);
 
       // ✅ Late referral: user reinstalled with referral link but not yet referred
       if (
