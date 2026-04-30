@@ -10,6 +10,7 @@ import {
   recordReferralSignup,
 } from "../services/rewardService.js";
 
+
 /* ────────────── Firebase Sync ────────────── */
 export const firebaseSync = async (req, res) => {
   try {
