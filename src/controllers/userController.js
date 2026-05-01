@@ -123,18 +123,30 @@ export const updateUser = async (req, res) => {
     console.log("🔧 PUT /api/user/:phone called");
     const { phone } = req.params;
     const normalizedPhone = normalizePhone(phone);
-    const requestedRole = normalizeUserRole(req.body.role || req.query.role);
+    const providedRole = req.body.role || req.query.role;
     
     if (!normalizedPhone) {
       return res.status(400).json({ message: "Invalid phone number format" });
     }
 
+    // 🔥 FIXED: Role is now REQUIRED to avoid confusion with multiple roles per phone
+    if (!providedRole) {
+      return res.status(400).json({
+        message: "Role is required for update. Please specify 'customer' or 'driver' in request body or query.",
+        hint: "Example: PUT /api/user/2345234222 with body: { role: 'customer', name: '...' }"
+      });
+    }
+
+    const requestedRole = normalizeUserRole(providedRole);
     const body = req.body;
 
     const user = await User.findOne({ phone: normalizedPhone, role: requestedRole });
     if (!user) {
       console.warn(`❌ User not found for phone: ${phone} (normalized: ${normalizedPhone}, role: ${requestedRole})`);
-      return res.status(404).json({ message: "User not found." });
+      return res.status(404).json({
+        message: `User not found for phone: ${phone} with role: ${requestedRole}`,
+        hint: "Create the user first using POST /api/user or verify the phone number and role are correct."
+      });
     }
 
     // Apply patch updates (only if field is provided)
