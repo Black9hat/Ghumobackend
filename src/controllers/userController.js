@@ -143,6 +143,13 @@ export const updateUser = async (req, res) => {
         role: requestedRole,
         name: body.name || "User",
         gender: body.gender,
+        // ensure driver flag follows role
+        isDriver: requestedRole === "driver",
+        // provide required location coordinates with safe default
+        location: {
+          type: "Point",
+          coordinates: (body.location && body.location.coordinates) ? body.location.coordinates : [0, 0],
+        },
       });
       console.log(`✅ New ${requestedRole} user created automatically`);
     }
