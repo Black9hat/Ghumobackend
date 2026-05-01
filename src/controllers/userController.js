@@ -123,30 +123,28 @@ export const updateUser = async (req, res) => {
     console.log("🔧 PUT /api/user/:phone called");
     const { phone } = req.params;
     const normalizedPhone = normalizePhone(phone);
-    const providedRole = req.body.role || req.query.role;
     
     if (!normalizedPhone) {
       return res.status(400).json({ message: "Invalid phone number format" });
     }
 
-    // 🔥 FIXED: Role is now REQUIRED to avoid confusion with multiple roles per phone
-    if (!providedRole) {
-      return res.status(400).json({
-        message: "Role is required for update. Please specify 'customer' or 'driver' in request body or query.",
-        hint: "Example: PUT /api/user/2345234222 with body: { role: 'customer', name: '...' }"
-      });
-    }
-
+    // 🔥 FIXED: Default to "customer" if role not provided (auto-create behavior)
+    const providedRole = req.body.role || req.query.role || "customer";
     const requestedRole = normalizeUserRole(providedRole);
     const body = req.body;
 
-    const user = await User.findOne({ phone: normalizedPhone, role: requestedRole });
+    let user = await User.findOne({ phone: normalizedPhone, role: requestedRole });
+    
+    // 🔥 NEW: Auto-create user if not found (upsert behavior)
     if (!user) {
-      console.warn(`❌ User not found for phone: ${phone} (normalized: ${normalizedPhone}, role: ${requestedRole})`);
-      return res.status(404).json({
-        message: `User not found for phone: ${phone} with role: ${requestedRole}`,
-        hint: "Create the user first using POST /api/user or verify the phone number and role are correct."
+      console.log(`📝 User not found, auto-creating: phone=${normalizedPhone}, role=${requestedRole}`);
+      user = new User({
+        phone: normalizedPhone,
+        role: requestedRole,
+        name: body.name || "User",
+        gender: body.gender,
       });
+      console.log(`✅ New ${requestedRole} user created automatically`);
     }
 
     // Apply patch updates (only if field is provided)
