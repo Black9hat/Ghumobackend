@@ -1,0 +1,2059 @@
+// sockets/socketHandler.js - UPDATED WITH PAYMENT WAITING FIX
+// This is the COMPLETE file with the critical awaiting_payment fix
+
+import User from '../models/User.js';
+import Trip from '../models/Trip.js';
+import Wallet from '../models/Wallet.js';
+import mongoose from 'mongoose';
+import ChatMessageModel from '../models/ChatMessage.js';
+import CoinTransaction from '../models/CoinTransaction.js';
+import { startNotificationRetryJob } from '../utils/notificationRetry.js';
+import { startStaleTripCleanup } from '../utils/staleTripsCleanup.js';
+import { sendToDriver } from '../utils/fcmSender.js';
+import { promoteNextStandby, reassignStandbyDriver } from '../controllers/standbyController.js';
+import { broadcastToDrivers } from '../utils/tripBroadcaster.js';
+import { initSupportSockets } from './supportSocketHandler.js';
+import {
+  stopProgressiveBroadcast,
+  notifyOnlineDriverForProgressiveBroadcast,
+} from '../utils/progressiveTripBroadcaster.js';
+
+import {
+  createShortTrip,
+  createParcelTrip,
+  createLongTrip,
+} from '../controllers/tripController.js';
+import { emitTripError } from '../utils/errorEmitter.js';
+
+const TRIP_TIMEOUT_MS = 60000;
+const PENDING_COMMISSION_BLOCK_LIMIT = 50;
+
+const ChatMessage = mongoose.models.ChatMessage || ChatMessageModel;
+
+let io;
+
+const connectedDrivers = new Map();
+const connectedCustomers = new Map();
+
+const DISTANCE_LIMITS = {
+  short: 5000,
+  parcel: 5000,
+  long_same_day: 20000,
+  long_multi_day: 50000,
+};
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+async function awardIncentivesToDriver(driverId, tripId) {
+  try {
+    // ✅ NEW: Fetch driver with vehicleType
+    const driver = await User.findById(driverId)
+      .select('totalCoinsCollected totalIncentiveEarned totalRidesCompleted wallet vehicleType lastRideId');
+
+    if (!driver) {
+      return { success: false, error: 'Driver not found' };
+    }
+
+    // ✅ NEW: Get commission settings (includes perRideIncentive and perRideCoins)
+    const CommissionSetting = mongoose.model('CommissionSetting');
+    const vehicleType = driver.vehicleType || 'auto';
+    const settings = await CommissionSetting.getForVehicle(vehicleType);
+
+    if (!settings || (settings.perRideIncentive === 0 && settings.perRideCoins === 0)) {
+      return { success: true, awarded: false };
+    }
+
+    // ✅ RACE CONDITION FIX: Check if this trip was already awarded
+    if (driver.lastRideId && driver.lastRideId.toString() === tripId.toString()) {
+      console.log(`⚠️ Trip ${tripId} already awarded to driver ${driverId}, skipping`);
+      return { success: true, awarded: false, alreadyAwarded: true };
+    }
+
+    const newCoins = (driver.totalCoinsCollected || 0) + settings.perRideCoins;
+    const newIncentive = (driver.totalIncentiveEarned || 0) + settings.perRideIncentive;
+    const newRides = (driver.totalRidesCompleted || 0) + 1;
+    const newWallet = (driver.wallet || 0) + settings.perRideIncentive;
+
+    const result = await User.findByIdAndUpdate(driverId, {
+      $set: {
+        totalCoinsCollected: newCoins,
+        totalIncentiveEarned: newIncentive,
+        totalRidesCompleted: newRides,
+        wallet: newWallet,
+        lastRideId: tripId,
+        lastIncentiveAwardedAt: new Date()
+      }
+    }, { new: true });
+
+    return { success: true, awarded: true, newWallet, newCoins };
+  } catch (error) {
+    console.error('❌ Error awarding incentives:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+const normalizePhone = (phone) => {
+  if (!phone) return null;
+  return String(phone).replace(/[^0-9]/g, "");
+};
+
+const validateTripPayload = (payload) => {
+  if (!payload || typeof payload !== 'object') return false;
+  const { type, customerId, pickup, drop } = payload;
+  if (!type || !customerId || !pickup || !drop) return false;
+  if (!pickup.coordinates || !Array.isArray(pickup.coordinates) || pickup.coordinates.length !== 2) return false;
+  if (!drop.coordinates || !Array.isArray(drop.coordinates) || drop.coordinates.length !== 2) return false;
+  return true;
+};
+
+const resolveUserByIdOrPhone = async (idOrPhone) => {
+  if (!idOrPhone) return null;
+
+  try {
+    if (typeof idOrPhone === 'string' && /^[0-9a-fA-F]{24}$/.test(idOrPhone)) {
+      const byId = await User.findById(idOrPhone);
+      if (byId) return byId;
+    }
+
+    const byFirebaseUid = await User.findOne({ firebaseUid: idOrPhone });
+    if (byFirebaseUid) return byFirebaseUid;
+
+    const normalizedPhone = normalizePhone(idOrPhone);
+    const byPhone = await User.findOne({ phone: normalizedPhone });
+    if (byPhone) return byPhone;
+
+    return null;
+  } catch (err) {
+    console.error('❌ resolveUserByIdOrPhone error:', err);
+    return null;
+  }
+};
+
+function toRad(value) {
+  return value * Math.PI / 180;
+}
+
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+async function getActiveTrip(driverId) {
+  try {
+    const driver = await User.findById(driverId)
+      .select('currentTripId')
+      .lean();
+
+    if (!driver?.currentTripId) return null;
+
+    const trip = await Trip.findById(driver.currentTripId).lean();
+    if (!trip) return null;
+
+    const activeStatuses = ['driver_assigned', 'driver_going_to_pickup', 'driver_at_pickup', 'ride_started'];
+    
+    const isActive = activeStatuses.includes(trip.status) || 
+      (trip.status === 'awaiting_payment' && !trip.paymentCollected) ||
+      (trip.status === 'completed' && !trip.paymentCollected);
+
+    if (!isActive) return null;
+
+    const customer = await User.findById(trip.customerId)
+      .select('name phone photoUrl rating')
+      .lean();
+
+    return {
+      trip,
+      customer
+    };
+  } catch (e) {
+    console.error('❌ getActiveTrip error:', e);
+    return null;
+  }
+}
+
+// ============================================================================
+// ✅ CRITICAL FIX: sendActiveTripToDriver() - HANDLES awaiting_payment SEPARATELY
+// ============================================================================
+
+async function sendActiveTripToDriver(socket, driverId) {
+  try {
+    const activeData = await getActiveTrip(driverId);
+    
+    if (!activeData) return false;
+
+    const { trip, customer } = activeData;
+
+    // ✅ CRITICAL FIX: Handle awaiting_payment status separately
+    // Don't send full ride details - send payment waiting signal instead
+    if (trip.status === 'awaiting_payment' && !trip.paymentCollected) {
+      console.log(`💰 Detected awaiting_payment status - sending payment_waiting:restore`);
+      
+      socket.emit('payment_waiting:restore', {
+        tripId: trip._id.toString(),
+        status: 'awaiting_payment',
+        fare: trip.finalFare || trip.fare,
+        message: 'Waiting for cash collection. Please collect from customer.',
+        paymentCollected: trip.paymentCollected,
+        awaitingCashCollection: true,
+        timestamp: new Date().toISOString()
+      });
+      
+      console.log(`💰 Sent payment_waiting:restore to driver ${driverId}`);
+      return true;
+    }
+
+    // ✅ Only send full ride details for ACTIVE trips (not awaiting_payment)
+    const payload = {
+      tripId: trip._id.toString(),
+      status: trip.status,
+      rideStatus: trip.rideStatus,
+      otp: trip.otp,
+      trip: {
+        pickup: {
+          lat: trip.pickup.coordinates[1],
+          lng: trip.pickup.coordinates[0],
+          address: trip.pickup.address
+        },
+        drop: {
+          lat: trip.drop.coordinates[1],
+          lng: trip.drop.coordinates[0],
+          address: trip.drop.address
+        },
+        fare: trip.fare,
+        type: trip.type
+      },
+      customer: customer ? {
+        id: customer._id.toString(),
+        name: customer.name,
+        phone: customer.phone,
+        photoUrl: customer.photoUrl,
+        rating: customer.rating
+      } : null,
+      paymentInfo: trip.status === 'completed' ? {
+        fare: trip.finalFare || trip.fare,
+        paymentCollected: trip.paymentCollected,
+        awaitingCashCollection: !trip.paymentCollected
+      } : null
+    };
+
+    socket.emit('active_trip:restore', payload);
+    console.log(`📦 Sent active trip ${trip._id} to driver ${driverId} immediately`);
+    
+    return true;
+  } catch (e) {
+    console.error('❌ sendActiveTripToDriver error:', e);
+    return false;
+  }
+}
+
+// ============================================================================
+// 📡 SESSION MANAGEMENT HELPER FUNCTIONS
+// ============================================================================
+
+// 🔥 ROLE-BASED SESSION CONTROL: Export helper to emit force_logout with role awareness
+export const emitForceLogout = (io, phone, data) => {
+  try {
+    const { role = "customer", reason, message, newDeviceId } = data;
+    
+    // 🔥 Emit to role-specific room to only affect the target role session
+    const roleRoomName = `user:${phone}:${role}`;
+
+    console.log(`📡 Emitting force_logout to ROLE-SPECIFIC room: ${roleRoomName}`);
+
+    io.to(roleRoomName).emit('force_logout', {
+      reason: reason || 'multi_device_login',
+      message: message || `Your ${role} account has been logged in on another device`,
+      newDeviceId: newDeviceId,
+      role: role, // 🔥 Include role in notification
+      timestamp: new Date().toISOString(),
+    });
+
+    return { success: true };
+  } catch (error) {
+    console.error('❌ emitForceLogout error:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+export const emitToUser = (io, phone, event, data) => {
+  try {
+    const roomName = `user:${phone}`;
+    io.to(roomName).emit(event, data);
+    return { success: true };
+  } catch (error) {
+    console.error(`❌ emitToUser error for ${phone}:`, error);
+    return { success: false, error: error.message };
+  }
+};
+
+// ============================================================================
+// MAIN SOCKET INITIALIZATION
+// ============================================================================
+
+export const initSocket = (ioInstance) => {
+  io = ioInstance;
+
+  io.on('connection', async (socket) => {
+    console.log(`🟢 New connection: ${socket.id}`);
+
+    // Check for admin connection
+    const isAdmin = socket.handshake.query?.role === 'admin' ||
+      socket.handshake.auth?.role === 'admin';
+
+    if (isAdmin) {
+      console.log('👨‍💼 ADMIN CONNECTED:', socket.id);
+      socket.join('admin-room');
+      socket.emit('admin:connected', {
+        success: true,
+        message: 'Connected to admin room',
+        socketId: socket.id,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // Check if this is a driver reconnecting with driverId in query
+    const queryDriverId = socket.handshake.query?.driverId || socket.handshake.auth?.driverId;
+    
+    if (queryDriverId) {
+      console.log(`🔄 Driver ${queryDriverId} connecting with ID in handshake`);
+      
+      const driver = await User.findById(queryDriverId).select('phone vehicleType').lean();
+      
+      // Update driver's socket immediately
+      await User.findByIdAndUpdate(queryDriverId, {
+        $set: {
+          socketId: socket.id,
+          isOnline: true,
+          lastConnectedAt: new Date(),
+          lastHeartbeat: new Date()
+        },
+        $unset: { lastDisconnectedAt: "" }
+      });
+      
+      connectedDrivers.set(socket.id, queryDriverId);
+      
+      // Join user room for session management
+      if (driver?.phone) {
+        socket.join(`user:${driver.phone}`);
+        socket.data.phone = driver.phone;
+      }
+
+      // ✅ NEW: Auto-join all drivers to driver-room for config broadcasts
+      socket.join('driver-room');
+
+      // ✅ NEW: Send current commission config to driver on initial connect
+      const CommissionSetting = mongoose.model('CommissionSetting');
+      const driverVehicleType = driver?.vehicleType || 'auto';
+      const config = await CommissionSetting.getForVehicle(driverVehicleType);
+      socket.emit('config:updated', {
+        type: 'config_update',
+        timestamp: new Date(),
+        vehicleType: driverVehicleType,
+        commissionPercent: config.commissionPercent,
+        platformFeeFlat: config.platformFeeFlat,
+        platformFeePercent: config.platformFeePercent,
+        perRideIncentive: config.perRideIncentive,
+        perRideCoins: config.perRideCoins,
+      });
+      
+      // ✅ Send active trip IMMEDIATELY on connection
+      // This will send payment_waiting:restore if awaiting_payment
+      const hasSentTrip = await sendActiveTripToDriver(socket, queryDriverId);
+      
+      if (hasSentTrip) {
+        console.log(`✅ Driver ${queryDriverId} reconnected with trip restored immediately`);
+      }
+    }
+
+    // =========================================================================
+    // ✅ ROOM JOINING FOR PAYMENT EVENTS
+    // =========================================================================
+    socket.on('join_room', async (data) => {
+      try {
+        const { room } = data;
+        
+        if (!room) {
+          console.log('⚠️ join_room - no room provided');
+          socket.emit('join_room:error', { success: false, message: 'Room name required' });
+          return;
+        }
+
+        socket.join(room);
+        console.log(`✅ Socket ${socket.id} joined room: ${room}`);
+        
+        const roomSockets = await io.in(room).allSockets();
+        console.log(`   Room "${room}" now has ${roomSockets.size} member(s)`);
+        
+        socket.emit('join_room:success', {
+          success: true,
+          room: room,
+          socketId: socket.id,
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error('❌ join_room error:', error);
+        socket.emit('join_room:error', { success: false, message: error.message });
+      }
+    });
+
+    // =========================================================================
+    // ✅ ROOM LEAVING FOR CLEANUP
+    // =========================================================================
+    socket.on('leave_room', async (data) => {
+      try {
+        const { room } = data;
+        
+        if (!room) {
+          console.log('⚠️ leave_room - no room provided');
+          return;
+        }
+
+        socket.leave(room);
+        console.log(`✅ Socket ${socket.id} left room: ${room}`);
+        
+        const roomSockets = await io.in(room).allSockets();
+        console.log(`   Room "${room}" now has ${roomSockets.size} member(s)`);
+        
+        socket.emit('leave_room:success', {
+          success: true,
+          room: room,
+          socketId: socket.id,
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error('❌ leave_room error:', error);
+      }
+    });
+
+    // =========================================================================
+    // 🔐 USER JOIN ROOM (for force_logout events)
+    // =========================================================================
+    socket.on('user:join', async (data) => {
+      try {
+        const { phone } = data;
+        
+        if (!phone) {
+          console.log('⚠️ user:join - no phone provided');
+          return;
+        }
+
+        const roomName = `user:${phone}`;
+        socket.join(roomName);
+        socket.data.phone = phone;
+
+        const roomMembers = await io.in(roomName).allSockets();
+        console.log(`✅ User joined room ${roomName} (socket: ${socket.id})`);
+        console.log(`   Room ${roomName} now has ${roomMembers.size} member(s)`);
+
+        socket.emit('user:joined', {
+          success: true,
+          room: roomName,
+          socketId: socket.id,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error('❌ user:join error:', error);
+      }
+    });
+
+    // =========================================================================
+    // 🔐 USER LEAVE ROOM
+    // =========================================================================
+    socket.on('user:leave', async (data) => {
+      try {
+        const { phone } = data;
+        
+        if (!phone) return;
+
+        const roomName = `user:${phone}`;
+        socket.leave(roomName);
+        
+        console.log(`👋 User left room ${roomName} (socket: ${socket.id})`);
+      } catch (error) {
+        console.error('❌ user:leave error:', error);
+      }
+    });
+
+    // =========================================================================
+    // 📱 USER CONNECTION HANDLER (SESSION MANAGEMENT)
+    // 🔥 ROLE-BASED SESSION CONTROL: Register with role awareness
+    // =========================================================================
+    socket.on('user:connect', async (data) => {
+      try {
+        const { phone, customerId, role, deviceId } = data;
+        
+        if (!phone) {
+          console.log('⚠️ user:connect - no phone provided');
+          socket.emit('error', { message: 'Phone number required' });
+          return;
+        }
+
+        // 🔥 ROLE-BASED SESSION CONTROL: Default to "customer" if not specified
+        const userRole = role || "customer";
+
+        const roomName = `user:${phone}`;
+        const roleRoomName = `user:${phone}:${userRole}`; // 🔥 Role-specific room
+
+        socket.join(roomName);
+        socket.join(roleRoomName); // 🔥 Also join role-specific room for force_logout
+
+        if (customerId) {
+          socket.join(`customer:${customerId}`);
+        }
+
+        if (userRole === 'driver') {
+          socket.join(`driver:${customerId}`);
+        }
+
+        console.log(`✅ User ${phone} (${userRole}) joined rooms: ${roomName}, ${roleRoomName}`);
+
+        socket.data.phone = phone;
+        socket.data.customerId = customerId;
+        socket.data.role = userRole;
+        socket.data.deviceId = deviceId || null; // 🔥 Track deviceId in socket data
+
+        socket.emit('connection:success', {
+          message: 'Connected to server',
+          timestamp: new Date().toISOString(),
+          socketId: socket.id,
+          role: userRole,
+        });
+      } catch (error) {
+        console.error('❌ user:connect error:', error);
+        socket.emit('error', { message: 'Connection failed' });
+      }
+    });
+
+    // =========================================================================
+    // 📤 CLIENT LOGOUT REQUEST
+    // 🔥 ROLE-BASED SESSION CONTROL: Logout specific role only
+    // =========================================================================
+    socket.on('user:logout', async (data) => {
+      try {
+        const { phone, reason, role } = data;
+        
+        if (!phone) {
+          console.log('⚠️ user:logout - no phone provided');
+          return;
+        }
+
+        // 🔥 ROLE-BASED SESSION CONTROL: Default to "customer" if not specified
+        const logoutRole = role || socket.data.role || "customer";
+
+        console.log(`👋 User ${phone} (${logoutRole}) requesting logout, reason: ${reason || 'user_initiated'}`);
+
+        const SessionManager = (await import('../services/SessionManager.js')).default;
+
+        const result = await SessionManager.handleLogout(phone, reason || 'user_logout', logoutRole);
+
+        if (result.success) {
+          socket.emit('logout:success', {
+            message: 'Logged out successfully',
+            timestamp: new Date().toISOString(),
+            role: logoutRole,
+          });
+
+          // Leave role-specific rooms
+          const roomName = `user:${phone}`;
+          const roleRoomName = `user:${phone}:${logoutRole}`;
+          socket.leave(roomName);
+          socket.leave(roleRoomName);
+
+          // Leave other role rooms if applicable
+          const otherRoles = logoutRole === 'customer' ? 'driver' : 'customer';
+          const otherRoleRoomName = `user:${phone}:${otherRoles}`;
+          // Don't leave generic room if other role still active
+          
+          console.log(`✅ User ${phone} (${logoutRole}) left rooms`);
+        } else {
+          socket.emit('error', { message: result.error || 'Logout failed' });
+        }
+      } catch (error) {
+        console.error('❌ user:logout error:', error);
+        socket.emit('error', { message: 'Logout failed' });
+      }
+    });
+
+    // =========================================================================
+    // SAVE FCM TOKEN VIA SOCKET
+    // =========================================================================
+    socket.on('driver:save_fcm_token', async ({ driverId, fcmToken }) => {
+      try {
+        if (!driverId || !fcmToken) {
+          console.log('⚠️ Missing driverId or fcmToken');
+          socket.emit('fcm_token:error', { success: false, message: 'Missing data' });
+          return;
+        }
+
+        console.log(`📱 Saving FCM token via socket for: ${driverId}`);
+        console.log(`   Token: ${fcmToken.substring(0, 30)}...`);
+
+        await User.findByIdAndUpdate(driverId, {
+          $set: { 
+            fcmToken: fcmToken,
+            fcmTokenUpdatedAt: new Date()
+          }
+        });
+
+        console.log(`✅ FCM token saved for driver ${driverId}`);
+        socket.emit('fcm_token:saved', { success: true });
+
+      } catch (error) {
+        console.error('❌ driver:save_fcm_token error:', error);
+        socket.emit('fcm_token:error', { success: false, message: error.message });
+      }
+    });
+
+    // Admin join event
+    socket.on('admin:join', () => {
+      socket.join('admin-room');
+      socket.emit('admin:joined', {
+        success: true,
+        room: 'admin-room',
+        socketId: socket.id
+      });
+    });
+
+    // Admin test event
+    socket.on('admin:test', (data) => {
+      socket.emit('admin:test_response', {
+        success: true,
+        message: 'Test received',
+        yourSocketId: socket.id,
+        timestamp: new Date().toISOString(),
+        rooms: Array.from(socket.rooms)
+      });
+    });
+
+    // =========================================================================
+    // DRIVER STATUS UPDATE
+    // 🔥 ROLE-BASED SESSION CONTROL: Track socketId per role (driver)
+    // =========================================================================
+    socket.on('updateDriverStatus', async (payload = {}) => {
+      try {
+        const {
+          driverId,
+          isOnline,
+          location,
+          lat,
+          lng,
+          fcmToken,
+          profileData,
+          vehicleType,
+        } = payload;
+
+        if (!driverId) return;
+
+        const user = await resolveUserByIdOrPhone(driverId);
+        if (!user) {
+          console.warn(`updateDriverStatus: user not found for ${driverId}`);
+          return;
+        }
+
+        const userIdStr = user._id.toString();
+
+        let effectiveOnline = !!isOnline;
+        let pendingAmount = 0;
+
+        if (effectiveOnline) {
+          const wallet = await Wallet.findOne({ driverId: user._id })
+            .sort({ updatedAt: -1, lastUpdated: -1, createdAt: -1 })
+            .select('pendingAmount')
+            .lean();
+          pendingAmount = Number(wallet?.pendingAmount || 0);
+
+          if (pendingAmount >= PENDING_COMMISSION_BLOCK_LIMIT) {
+            effectiveOnline = false;
+            console.log(
+              `🚫 Driver ${userIdStr} blocked from ONLINE due to pending commission ₹${pendingAmount} (limit ₹${PENDING_COMMISSION_BLOCK_LIMIT})`,
+            );
+          }
+        }
+
+        const set = {
+          socketId: socket.id,
+          isOnline: effectiveOnline,
+          canReceiveNewRequests: effectiveOnline,
+          lastConnectedAt: new Date(),
+          lastHeartbeat: new Date(),
+          lastLocationUpdate: new Date(),
+        };
+
+        if (location?.coordinates?.length === 2) {
+          set.location = { type: 'Point', coordinates: location.coordinates };
+        } else if (
+          typeof lat === 'number' &&
+          typeof lng === 'number' &&
+          !Number.isNaN(lat) &&
+          !Number.isNaN(lng)
+        ) {
+          set.location = { type: 'Point', coordinates: [lng, lat] };
+        }
+
+        if (fcmToken) set.fcmToken = fcmToken;
+
+        const allowedProfileKeys = [
+          'name', 'photoUrl', 'rating', 'vehicleBrand', 'vehicleNumber', 'vehicleType',
+        ];
+
+        if (profileData && typeof profileData === 'object') {
+          for (const key of allowedProfileKeys) {
+            if (profileData[key] !== undefined && profileData[key] !== null) {
+              set[key] = key === 'vehicleType'
+                ? String(profileData[key]).toLowerCase().trim()
+                : profileData[key];
+            }
+          }
+        }
+
+        if (vehicleType) {
+          set.vehicleType = String(vehicleType).toLowerCase().trim();
+        }
+
+        await User.findByIdAndUpdate(user._id, { 
+          $set: set,
+          $unset: { lastDisconnectedAt: "" }
+        }, { new: true });
+
+        for (const [existingSocketId, existingDriverId] of connectedDrivers.entries()) {
+          if (existingDriverId === userIdStr && existingSocketId !== socket.id) {
+            connectedDrivers.delete(existingSocketId);
+          }
+        }
+
+        connectedDrivers.set(socket.id, userIdStr);
+
+        // 🔥 ROLE-BASED SESSION CONTROL: Update driver role session
+        const updatedUser = await User.findById(userIdStr);
+        if (updatedUser) {
+          if (!updatedUser.sessionsByRole) {
+            updatedUser.sessionsByRole = {
+              customer: { deviceId: null, socketId: null, fcmToken: null, loginAt: null, isActive: false },
+              driver: { deviceId: null, socketId: null, fcmToken: null, loginAt: null, isActive: false }
+            };
+          }
+          updatedUser.sessionsByRole.driver.socketId = socket.id;
+          updatedUser.sessionsByRole.driver.isActive = true;
+          await updatedUser.save();
+        }
+
+        if (user.phone) {
+          socket.join(`user:${user.phone}`);
+          socket.join(`user:${user.phone}:driver`); // 🔥 Role-specific room
+          socket.data.phone = user.phone;
+        }
+
+        // ✅ NEW: Auto-join all drivers to driver-room for config broadcasts
+        socket.join('driver-room');
+
+        // ✅ NEW: Send current commission config to driver on status update
+        if (effectiveOnline) {
+          const CommissionSetting = mongoose.model('CommissionSetting');
+          const driverVehicleType = user.vehicleType || 'auto';
+          const config = await CommissionSetting.getForVehicle(driverVehicleType);
+          socket.emit('config:updated', {
+            type: 'config_update',
+            timestamp: new Date(),
+            vehicleType: driverVehicleType,
+            commissionPercent: config.commissionPercent,
+            platformFeeFlat: config.platformFeeFlat,
+            platformFeePercent: config.platformFeePercent,
+            perRideIncentive: config.perRideIncentive,
+            perRideCoins: config.perRideCoins,
+          });
+        }
+
+        if (effectiveOnline) {
+          await sendActiveTripToDriver(socket, userIdStr);
+          await notifyOnlineDriverForProgressiveBroadcast(userIdStr);
+        }
+
+        socket.emit('driver:statusUpdated', {
+          ok: true,
+          isOnline: effectiveOnline,
+          socketId: socket.id,
+          driverId: userIdStr,
+          role: 'driver',
+          pendingAmount,
+          pendingCommissionLimit: PENDING_COMMISSION_BLOCK_LIMIT,
+          blockedByPendingCommission: !!isOnline && !effectiveOnline,
+        });
+
+        console.log(`📶 Driver ${userIdStr} is now ${effectiveOnline ? 'ONLINE ✅' : 'OFFLINE 🔴'}`);
+      } catch (e) {
+        emitTripError({ socket, message: 'Failed to update driver status.' });
+        console.error('❌ updateDriverStatus error:', e);
+      }
+    });
+
+    // =========================================================================
+    // DRIVER RECONNECT WITH ACTIVE TRIP
+    // =========================================================================
+    socket.on('driver:reconnect_with_trip', async ({ driverId, tripId }) => {
+      try {
+        console.log('🔄 DRIVER RECONNECT REQUEST', driverId, tripId);
+
+        const driver = await User.findById(driverId).lean();
+        if (!driver) {
+          socket.emit('reconnect:failed', { message: 'Driver not found' });
+          return;
+        }
+
+        await User.findByIdAndUpdate(driverId, { 
+          $set: { 
+            socketId: socket.id,
+            isOnline: true,
+            lastConnectedAt: new Date(),
+            lastHeartbeat: new Date()
+          },
+          $unset: { lastDisconnectedAt: "" }
+        });
+
+        connectedDrivers.set(socket.id, driverId.toString());
+
+        if (driver.phone) {
+          socket.join(`user:${driver.phone}`);
+          socket.data.phone = driver.phone;
+        }
+
+        if (tripId) {
+          const trip = await Trip.findById(tripId).lean();
+          if (!trip) {
+            socket.emit('reconnect:failed', { message: 'Trip not found', shouldClearTrip: true });
+            return;
+          }
+
+          const activeStatuses = ['driver_assigned', 'driver_going_to_pickup', 'driver_at_pickup', 'ride_started'];
+          const isActive = activeStatuses.includes(trip.status) || 
+            (trip.status === 'completed' && !trip.paymentCollected);
+
+          if (!isActive) {
+            socket.emit('reconnect:failed', { 
+              message: `Trip is ${trip.status}`, 
+              shouldClearTrip: true, 
+              tripStatus: trip.status 
+            });
+            return;
+          }
+
+          const customer = await User.findById(trip.customerId)
+            .select('name phone photoUrl rating')
+            .lean();
+
+          socket.emit('reconnect:success', {
+            tripId: trip._id.toString(),
+            status: trip.status,
+            rideStatus: trip.rideStatus,
+            otp: trip.otp,
+            trip: {
+              pickup: {
+                lat: trip.pickup.coordinates[1],
+                lng: trip.pickup.coordinates[0],
+                address: trip.pickup.address
+              },
+              drop: {
+                lat: trip.drop.coordinates[1],
+                lng: trip.drop.coordinates[0],
+                address: trip.drop.address
+              },
+              fare: trip.fare
+            },
+            customer: customer ? {
+              id: customer._id.toString(),
+              name: customer.name,
+              phone: customer.phone,
+              photoUrl: customer.photoUrl,
+              rating: customer.rating
+            } : null,
+            paymentInfo: trip.status === 'completed' ? {
+              fare: trip.finalFare || trip.fare,
+              paymentCollected: trip.paymentCollected,
+              awaitingCashCollection: !trip.paymentCollected
+            } : null
+          });
+
+          console.log(`✅ Driver ${driverId} reconnected with trip ${tripId}`);
+        } else {
+          await sendActiveTripToDriver(socket, driverId);
+          socket.emit('reconnect:success', { message: 'Reconnected successfully' });
+        }
+      } catch (e) {
+        console.error('❌ driver:reconnect_with_trip error:', e);
+        socket.emit('reconnect:failed', { message: 'Reconnection failed', error: e.message });
+      }
+    });
+
+    // =========================================================================
+    // REQUEST ACTIVE TRIP (for app restart scenarios)
+    // =========================================================================
+    socket.on('driver:request_active_trip', async ({ driverId }) => {
+      try {
+        if (!driverId) {
+          socket.emit('active_trip:none', { message: 'No driverId provided' });
+          return;
+        }
+
+        console.log(`📱 Driver ${driverId} requesting active trip data`);
+
+        const sent = await sendActiveTripToDriver(socket, driverId);
+        
+        if (!sent) {
+          socket.emit('active_trip:none', { message: 'No active trip found' });
+        }
+      } catch (e) {
+        console.error('❌ driver:request_active_trip error:', e);
+        socket.emit('active_trip:error', { message: e.message });
+      }
+    });
+
+    // =========================================================================
+    // CUSTOMER REGISTER
+    // 🔥 ROLE-BASED SESSION CONTROL: Track socketId per role
+    // =========================================================================
+    socket.on('customer:register', async ({ customerId, isReconnect }) => {
+      try {
+        if (!customerId) {
+          socket.emit('customer:registered', { success: false, error: 'customerId missing' });
+          return;
+        }
+
+        const user = await resolveUserByIdOrPhone(customerId);
+        if (!user) {
+          socket.emit('customer:registered', {
+            success: false,
+            error: 'User not found in database',
+            providedId: customerId
+          });
+          return;
+        }
+
+        // 🔥 ROLE-BASED SESSION CONTROL: Track per role
+        for (const [existingSocketId, existingCustomerId] of connectedCustomers.entries()) {
+          if (existingCustomerId === user._id.toString()) {
+            connectedCustomers.delete(existingSocketId);
+          }
+        }
+
+        // 🔥 Update ONLY customer role session in DB
+        if (!user.sessionsByRole) {
+          user.sessionsByRole = {
+            customer: { deviceId: null, socketId: null, fcmToken: null, loginAt: null, isActive: false },
+            driver: { deviceId: null, socketId: null, fcmToken: null, loginAt: null, isActive: false }
+          };
+        }
+        user.sessionsByRole.customer.socketId = socket.id;
+        user.sessionsByRole.customer.isActive = true;
+        
+        await user.save();
+
+        connectedCustomers.set(socket.id, user._id.toString());
+
+        // Join user room for session management
+        if (user.phone) {
+          socket.join(`user:${user.phone}`);
+          socket.join(`user:${user.phone}:customer`); // 🔥 Role-specific room
+          socket.data.phone = user.phone;
+        }
+
+        // ✅ Auto-join customer room so trip:cash_collected is always received
+        // regardless of what screen the customer is on
+        const customerRoom = `customer_${user._id.toString()}`;
+        socket.join(customerRoom);
+        console.log(`✅ Customer ${user._id} auto-joined rooms: ${customerRoom}, user:${user.phone}:customer`);
+
+        socket.emit('customer:registered', {
+          success: true,
+          customerId: user._id.toString(),
+          mongoId: user._id.toString(),
+          socketId: socket.id,
+          phone: user.phone,
+          name: user.name,
+          firebaseUid: user.firebaseUid,
+          role: 'customer'
+        });
+      } catch (e) {
+        console.error('❌ customer:register error:', e);
+        socket.emit('customer:registered', { success: false, error: e.message });
+      }
+    });
+
+    // =========================================================================
+    // CUSTOMER REQUEST TRIP
+    // =========================================================================
+    socket.on('customer:request_trip', async (payload) => {
+      try {
+        if (!validateTripPayload(payload)) {
+          emitTripError({ socket, message: 'Invalid trip request payload.' });
+          return;
+        }
+
+        const user = await resolveUserByIdOrPhone(payload.customerId);
+        if (!user) {
+          emitTripError({ socket, message: 'Customer not found in database.' });
+          return;
+        }
+
+        payload.customerId = user._id.toString();
+
+        const { type } = payload;
+        let controllerFn;
+        if (type === 'short') controllerFn = createShortTrip;
+        else if (type === 'parcel') controllerFn = createParcelTrip;
+        else if (type === 'long') controllerFn = createLongTrip;
+        else {
+          emitTripError({ socket, message: 'Unknown trip type.' });
+          return;
+        }
+
+        const req = { body: payload };
+        const res = {
+          status: (code) => ({
+            json: (data) => {
+              socket.emit('trip:request_response', { ...data, status: code });
+              if (data.success && data.tripId) {
+                console.log(`🛣️ Trip request (${type}) created. TripId: ${data.tripId}`);
+                if (data.drivers === 0) {
+                  emitTripError({ socket, tripId: data.tripId, message: 'No drivers available.' });
+                }
+              } else if (!data.success) {
+                emitTripError({ socket, message: data.message });
+              }
+            },
+          }),
+        };
+
+        await controllerFn(req, res);
+      } catch (e) {
+        emitTripError({ socket, message: 'Internal server error.' });
+        console.error('❌ customer:request_trip error:', e);
+      }
+    });
+
+    // =========================================================================
+    // DRIVER ACCEPT TRIP
+    // =========================================================================
+    socket.on('driver:accept_trip', async ({ tripId, driverId }) => {
+      try {
+        console.log('');
+        console.log('='.repeat(60));
+        console.log(`🚗 Driver ${driverId} accepting trip ${tripId}`);
+        console.log('='.repeat(60));
+
+        if (!driverId || !tripId) {
+          socket.emit('trip:accept_failed', {
+            message: 'Missing driverId or tripId',
+            reason: 'invalid_request'
+          });
+          return;
+        }
+
+        const existingTrip = await Trip.findById(tripId)
+          .select('version status cancelledAt cancelledBy')
+          .lean();
+
+        if (!existingTrip) {
+          socket.emit('trip:accept_failed', {
+            message: 'Trip not found',
+            reason: 'trip_not_found'
+          });
+          return;
+        }
+
+        if (existingTrip.status !== 'requested') {
+          socket.emit('trip:accept_failed', {
+            message: `Trip is already ${existingTrip.status}`,
+            reason: 'trip_unavailable'
+          });
+          return;
+        }
+
+        if (existingTrip.cancelledAt || existingTrip.cancelledBy) {
+          socket.emit('trip:accept_failed', {
+            message: 'Trip was cancelled by customer',
+            reason: 'trip_cancelled'
+          });
+          return;
+        }
+
+        const currentVersion = existingTrip.version || 1;
+
+        // Atomic reserve driver
+        const driver = await User.findOneAndUpdate(
+          {
+            _id: driverId,
+            $or: [
+              { isBusy: { $ne: true } },
+              { isBusy: { $exists: false } }
+            ],
+            $or: [
+              { currentTripId: null },
+              { currentTripId: { $exists: false } }
+            ]
+          },
+          {
+            $set: {
+              isBusy: true,
+              currentTripId: tripId,
+              canReceiveNewRequests: false,
+              lastTripAcceptedAt: new Date()
+            }
+          },
+          {
+            new: true,
+            select: 'name phone photoUrl rating vehicleBrand vehicleNumber location'
+          }
+        ).lean();
+
+        if (!driver) {
+          socket.emit('trip:accept_failed', {
+            message: 'You are already on another trip',
+            reason: 'driver_busy'
+          });
+          return;
+        }
+
+        // Atomic reserve trip with version lock
+        const trip = await Trip.findOneAndUpdate(
+          {
+            _id: tripId,
+            status: 'requested',
+            version: currentVersion,
+            $or: [
+              { cancelledAt: { $exists: false } },
+              { cancelledAt: null }
+            ]
+          },
+          {
+            $set: {
+              assignedDriver: driverId,
+              status: 'driver_assigned',
+              acceptedAt: new Date()
+            },
+            $inc: { version: 1 }
+          },
+          { new: true }
+        ); // 🔑 NOT using .lean() so we get full document with all fields including coinsUsed
+
+        if (!trip) {
+          // Rollback driver
+          await User.findByIdAndUpdate(driverId, {
+            $set: {
+              isBusy: false,
+              currentTripId: null,
+              canReceiveNewRequests: true
+            }
+          });
+
+          const checkTrip = await Trip.findById(tripId).lean();
+          let failReason = 'trip_unavailable';
+          let failMessage = 'Trip no longer available';
+
+          if (checkTrip) {
+            if (checkTrip.cancelledAt || checkTrip.cancelledBy) {
+              failReason = 'trip_cancelled';
+              failMessage = 'Trip was cancelled by customer';
+            } else if (checkTrip.status === 'driver_assigned') {
+              failReason = 'trip_taken';
+              failMessage = 'Trip was accepted by another driver';
+            }
+          }
+
+          socket.emit('trip:accept_failed', { message: failMessage, reason: failReason });
+          return;
+        }
+
+        console.log(`✅ Trip ${tripId} assigned to driver ${driverId}`);
+        console.log(`🔍 Trip object:`, {
+          _id: trip._id,
+          coinsUsed: trip.coinsUsed,
+          discountApplied: trip.discountApplied,
+          customerId: trip.customerId,
+          status: trip.status
+        });
+        stopProgressiveBroadcast(tripId);
+
+        // 🪙 DEDUCT COINS IF DISCOUNT WAS APPLIED
+        let coinsDeducted = 0;
+        console.log(`🪙 Checking coins: coinsUsed=${trip.coinsUsed}, condition=${trip.coinsUsed && trip.coinsUsed > 0}`);
+        
+        if (trip.coinsUsed && trip.coinsUsed > 0) {
+          console.log(`🪙 COIN DEDUCTION STARTED: ${trip.coinsUsed} coins from customer ${trip.customerId}`);
+          try {
+            const CustomerModel = mongoose.models.Customer || User;
+            const customerForCoin = await CustomerModel.findById(trip.customerId);
+
+            console.log(`🪙 Customer lookup: found=${!!customerForCoin}, coins=${customerForCoin?.coins || 'N/A'}`);
+
+            if (customerForCoin && (customerForCoin.coins || 0) >= trip.coinsUsed) {
+              const oldBalance = customerForCoin.coins;
+              customerForCoin.coins -= trip.coinsUsed;
+              customerForCoin.totalCoinsRedeemed = (customerForCoin.totalCoinsRedeemed || 0) + trip.coinsUsed;
+              await customerForCoin.save();
+
+              console.log(`🪙 Customer balance updated: ${oldBalance} → ${customerForCoin.coins}`);
+
+              // ✅ CREATE TRANSACTION RECORD
+              console.log(`🪙 Creating CoinTransaction record: userId=${trip.customerId}, tripId=${trip._id}, type=spend`);
+              
+              const txnResult = await CoinTransaction.create({
+                userId: trip.customerId,
+                tripId: trip._id,
+                coinsEarned: -trip.coinsUsed,
+                type: 'spend',
+                description: `Redeemed ${trip.coinsUsed} coins for ₹${trip.discountApplied || 0} ride discount`,
+                balanceAfter: customerForCoin.coins,
+                breakdown: {
+                  baseCoins: 0,
+                  distanceBonus: 0,
+                  vehicleBonus: 0,
+                  randomBonus: 0
+                }
+              });
+
+              coinsDeducted = trip.coinsUsed;
+              console.log(`🪙 ✅ COMPLETE: Coins deducted: ${coinsDeducted} | Balance: ${customerForCoin.coins} | TxnId: ${txnResult._id}`);
+            } else {
+              console.warn(`⚠️ INSUFFICIENT COINS: Required ${trip.coinsUsed}, Available ${customerForCoin?.coins || 0}`);
+            }
+          } catch (coinErr) {
+            console.error("❌ SOCKET COIN DEDUCTION FAILED - DETAILS:");
+            console.error("   Error Message:", coinErr.message);
+            console.error("   Error Stack:", coinErr.stack);
+            console.error("   Full Error:", coinErr);
+          }
+        } else {
+          console.log(`⏭️  SKIPPED: No coins to deduct (coinsUsed=${trip.coinsUsed})`);
+        }
+
+        const customer = await User.findById(trip.customerId)
+          .select('name phone photoUrl rating socketId')
+          .lean();
+
+        const { generateOTP } = await import('../utils/otpGeneration.js');
+        const rideCode = generateOTP();
+
+        await Trip.findByIdAndUpdate(tripId, { $set: { otp: rideCode } });
+
+        let customerSocketId = customer.socketId;
+        if (!customerSocketId) {
+          const customerIdStr = trip.customerId.toString();
+          for (const [socketId, custId] of connectedCustomers.entries()) {
+            if (custId === customerIdStr) {
+              customerSocketId = socketId;
+              break;
+            }
+          }
+        }
+
+        if (customerSocketId) {
+          io.to(customerSocketId).emit('trip:accepted', {
+            tripId: tripId.toString(),
+            rideCode,
+            trip: {
+              pickup: {
+                lat: trip.pickup.coordinates[1],
+                lng: trip.pickup.coordinates[0],
+                address: trip.pickup.address || "Pickup Location",
+              },
+              drop: {
+                lat: trip.drop.coordinates[1],
+                lng: trip.drop.coordinates[0],
+                address: trip.drop.address || "Drop Location",
+              },
+              fare: trip.fare || 0
+            },
+            driver: {
+              id: driver._id.toString(),
+              name: driver.name || 'Driver',
+              phone: driver.phone || null,
+              photoUrl: driver.photoUrl || null,
+              rating: driver.rating || 4.8,
+              vehicleBrand: driver.vehicleBrand || 'Vehicle',
+              vehicleNumber: driver.vehicleNumber || 'N/A',
+              location: driver.location ? {
+                lat: driver.location.coordinates[1],
+                lng: driver.location.coordinates[0],
+              } : null,
+            },
+          });
+        }
+
+        socket.emit('trip:confirmed_for_driver', {
+          tripId: tripId.toString(),
+          rideCode,
+          trip: {
+            pickup: {
+              lat: trip.pickup.coordinates[1],
+              lng: trip.pickup.coordinates[0],
+              address: trip.pickup.address || "Pickup Location",
+            },
+            drop: {
+              lat: trip.drop.coordinates[1],
+              lng: trip.drop.coordinates[0],
+              address: trip.drop.address || "Drop Location",
+            },
+            fare: trip.fare || 0
+          },
+          customer: {
+            id: customer._id.toString(),
+            name: customer.name || 'Customer',
+            phone: customer.phone || null,
+            photoUrl: customer.photoUrl || null,
+            rating: customer.rating || 5.0,
+          }
+        });
+
+        // Notify other drivers
+        const otherDrivers = await User.find({
+          isDriver: true,
+          isOnline: true,
+          _id: { $ne: driverId },
+          socketId: { $exists: true, $ne: null }
+        }).select('socketId').lean();
+
+        otherDrivers.forEach(otherDriver => {
+          if (otherDriver.socketId) {
+            io.to(otherDriver.socketId).emit('trip:taken', {
+              tripId,
+              message: 'This trip has been accepted by another driver'
+            });
+          }
+        });
+
+        console.log(`✅ SUCCESS: Trip accepted by ${driver.name}`);
+        console.log('='.repeat(60));
+
+      } catch (e) {
+        console.error('❌ driver:accept_trip error:', e);
+
+        try {
+          if (driverId) {
+            await User.findByIdAndUpdate(driverId, {
+              $set: { isBusy: false, currentTripId: null, canReceiveNewRequests: true }
+            });
+          }
+          if (tripId) {
+            await Trip.findByIdAndUpdate(tripId, {
+              $unset: { assignedDriver: 1, otp: 1 },
+              $set: { status: 'requested', acceptedAt: null }
+            });
+          }
+        } catch (rollbackError) {
+          console.error('❌ Rollback failed:', rollbackError);
+        }
+
+        socket.emit('trip:accept_failed', {
+          message: 'Failed to accept trip. Please try again.',
+          reason: 'server_error'
+        });
+      }
+    });
+
+    // =========================================================================
+    // CUSTOMER CANCEL SEARCH
+    // =========================================================================
+    socket.on('customer:cancel_search', async ({ tripId, customerId, reason }) => {
+      try {
+        if (!tripId || !customerId) {
+          socket.emit('cancel:failed', { success: false, message: 'tripId and customerId required' });
+          return;
+        }
+
+        const trip = await Trip.findOneAndUpdate(
+          {
+            _id: tripId,
+            customerId: customerId,
+            status: 'requested',
+            $or: [
+              { assignedDriver: { $exists: false } },
+              { assignedDriver: null }
+            ]
+          },
+          {
+            $set: {
+              status: 'cancelled',
+              cancelledAt: new Date(),
+              cancelledBy: customerId,
+              cancellationReason: reason || 'customer_cancelled_search'
+            },
+            $inc: { version: 1 }
+          },
+          { new: true }
+        ).lean();
+
+        if (!trip) {
+          const existingTrip = await Trip.findById(tripId).lean();
+
+          if (!existingTrip) {
+            socket.emit('cancel:failed', { success: false, message: 'Trip not found' });
+            return;
+          }
+
+          if (existingTrip.status === 'driver_assigned') {
+            socket.emit('cancel:failed', {
+              success: false,
+              message: 'Driver already accepted. Use cancel ride instead.',
+              status: existingTrip.status
+            });
+            return;
+          }
+
+          if (existingTrip.status === 'cancelled') {
+            socket.emit('cancel:success', { success: true, message: 'Already cancelled', alreadyCancelled: true });
+            return;
+          }
+
+          socket.emit('cancel:failed', { success: false, message: 'Cannot cancel at this stage', status: existingTrip.status });
+          return;
+        }
+
+        stopProgressiveBroadcast(tripId);
+
+        const onlineDrivers = await User.find({
+          isDriver: true,
+          isOnline: true,
+          socketId: { $exists: true, $ne: null }
+        }).select('socketId').lean();
+
+        onlineDrivers.forEach(driver => {
+          if (driver.socketId) {
+            io.to(driver.socketId).emit('trip:cancelled', {
+              tripId,
+              reason: 'customer_cancelled_search',
+              message: 'Customer cancelled the search'
+            });
+          }
+        });
+
+        socket.emit('cancel:success', { success: true, message: 'Search cancelled successfully', tripId });
+        console.log(`🛑 Trip ${tripId} cancelled by customer`);
+
+      } catch (e) {
+        console.error('❌ customer:cancel_search error:', e);
+        socket.emit('cancel:failed', { success: false, message: 'Failed to cancel: ' + e.message });
+      }
+    });
+
+    // =========================================================================
+    // DRIVER START RIDE
+    // =========================================================================
+    socket.on('driver:start_ride', async ({ tripId, driverId, otp }) => {
+      try {
+        const trip = await Trip.findById(tripId);
+        if (!trip) {
+          socket.emit('trip:start_error', { message: 'Trip not found' });
+          return;
+        }
+
+        if (trip.otp !== otp) {
+          socket.emit('trip:start_error', { message: 'Invalid OTP. Please check the code.' });
+          return;
+        }
+
+        if (trip.status !== 'driver_assigned' && trip.status !== 'driver_at_pickup') {
+          socket.emit('trip:start_error', { message: `Cannot start ride. Status is: ${trip.status}` });
+          return;
+        }
+
+        await Trip.findByIdAndUpdate(tripId, { 
+          $set: { status: 'ride_started', rideStartTime: new Date() },
+          $inc: { version: 1 }
+        });
+
+        const customerIdStr = trip.customerId.toString();
+        let customerSocketId = null;
+        for (const [socketId, custId] of connectedCustomers.entries()) {
+          if (custId === customerIdStr) {
+            customerSocketId = socketId;
+            break;
+          }
+        }
+
+        const rideStartedPayload = {
+          tripId: tripId.toString(),
+          message: 'Ride has started',
+          timestamp: new Date().toISOString()
+        };
+
+        if (customerSocketId) {
+          io.to(customerSocketId).emit('trip:ride_started', rideStartedPayload);
+        }
+
+        socket.emit('trip:ride_started', { 
+          tripId: tripId.toString(), 
+          message: 'Ride started successfully', 
+          timestamp: new Date().toISOString() 
+        });
+
+        console.log(`🚀 Ride ${tripId} started`);
+      } catch (e) {
+        console.error('❌ driver:start_ride error:', e);
+        socket.emit('trip:start_error', { message: 'Failed to start ride: ' + e.message });
+      }
+    });
+
+    // =========================================================================
+    // DRIVER COMPLETE RIDE
+    // ✅ FIX: Do NOT emit trip:completed to customer here.
+    // Customer only gets notified via trip:cash_collected after the driver
+    // explicitly taps "Confirm Cash Collected" (confirmCashCollection endpoint).
+    // =========================================================================
+    socket.on('driver:complete_ride', async ({ tripId, driverId }) => {
+      try {
+        const trip = await Trip.findById(tripId);
+        if (!trip) {
+          socket.emit('trip:complete_error', { message: 'Trip not found' });
+          return;
+        }
+
+        if (trip.status !== 'ride_started') {
+          socket.emit('trip:complete_error', { message: 'Ride has not started yet' });
+          return;
+        }
+
+        const fare = trip.fare || trip.estimatedFare || 100;
+
+        await Trip.findByIdAndUpdate(tripId, {
+          $set: {
+            status: 'awaiting_payment',
+            rideStatus: 'awaiting_payment',
+            rideEndTime: new Date(),
+            finalFare: fare,
+            paymentCollected: false
+          },
+          $inc: { version: 1 }
+        });
+
+        await User.findByIdAndUpdate(driverId, {
+          $set: {
+            currentTripId: tripId,
+            isBusy: true,
+            canReceiveNewRequests: false,
+            awaitingCashCollection: true,
+            lastTripCompletedAt: new Date()
+          }
+        });
+
+        // ✅ Only notify the DRIVER to show the "Collect Cash" screen.
+        // Customer stays on the en-route page until trip:cash_collected fires.
+        socket.emit('trip:completed', {
+          tripId: tripId.toString(),
+          fare,
+          message: 'Ride completed. Please collect ₹' + fare.toFixed(2) + ' from customer.',
+          awaitingCashCollection: true,
+          timestamp: new Date().toISOString()
+        });
+
+        console.log(`✅ Ride ${tripId} completed, waiting for cash collection`);
+      } catch (e) {
+        console.error('❌ driver:complete_ride error:', e);
+        socket.emit('trip:complete_error', { message: 'Failed to complete ride: ' + e.message });
+      }
+    });
+
+    // =========================================================================
+    // DRIVER GOING TO PICKUP
+    // =========================================================================
+    socket.on('driver:going_to_pickup', async ({ tripId, driverId }) => {
+      try {
+        await Trip.findByIdAndUpdate(tripId, { 
+          $set: { status: 'driver_going_to_pickup' },
+          $inc: { version: 1 }
+        });
+
+        const trip = await Trip.findById(tripId).lean();
+        const customerIdStr = trip.customerId.toString();
+        let customerSocketId = null;
+        for (const [socketId, custId] of connectedCustomers.entries()) {
+          if (custId === customerIdStr) {
+            customerSocketId = socketId;
+            break;
+          }
+        }
+        if (customerSocketId) {
+          io.to(customerSocketId).emit('trip:driver_going_to_pickup', { 
+            tripId: tripId.toString(), 
+            message: 'Driver is on the way to pickup' 
+          });
+        }
+        socket.emit('trip:status_updated', { success: true });
+      } catch (e) {
+        console.error('❌ driver:going_to_pickup error:', e);
+      }
+    });
+
+    // =========================================================================
+    // DRIVER ARRIVED AT PICKUP
+    // =========================================================================
+    socket.on('trip:arrived_at_pickup', async ({ tripId, driverId }) => {
+      try {
+        await Trip.findByIdAndUpdate(tripId, { 
+          $set: { status: 'driver_at_pickup' },
+          $inc: { version: 1 }
+        });
+
+        const trip = await Trip.findById(tripId).lean();
+        const customerIdStr = trip.customerId.toString();
+        let customerSocketId = null;
+        for (const [socketId, custId] of connectedCustomers.entries()) {
+          if (custId === customerIdStr) {
+            customerSocketId = socketId;
+            break;
+          }
+        }
+        if (customerSocketId) {
+          io.to(customerSocketId).emit('trip:driver_arrived', { 
+            tripId: tripId.toString(), 
+            message: 'Driver has arrived at pickup location' 
+          });
+        }
+        socket.emit('trip:status_updated', { success: true });
+      } catch (e) {
+        console.error('❌ trip:arrived_at_pickup error:', e);
+      }
+    });
+
+    // =========================================================================
+    // DRIVER LOCATION UPDATE
+    // =========================================================================
+    socket.on('driver:location', async ({ tripId, driverId, latitude, longitude, sequence, timestamp }) => {
+      try {
+        if (!tripId || !driverId || !latitude || !longitude) return;
+
+        const updateData = {
+          $set: {
+            location: { type: 'Point', coordinates: [longitude, latitude] },
+            lastLocationUpdate: new Date(),
+            lastHeartbeat: new Date()
+          }
+        };
+
+        if (typeof sequence === 'number') {
+          updateData.$set.locationSequence = sequence;
+        }
+
+        await User.findByIdAndUpdate(driverId, updateData);
+
+        const trip = await Trip.findById(tripId).lean();
+        if (!trip) return;
+
+        const dropLat = trip.drop.coordinates[1];
+        const dropLng = trip.drop.coordinates[0];
+        const distance = calculateDistance(latitude, longitude, dropLat, dropLng);
+        const distanceInMeters = distance * 1000;
+
+        if (distanceInMeters <= 500 && trip.status === 'ride_started') {
+          await User.findByIdAndUpdate(driverId, { $set: { canReceiveNewRequests: true } });
+        }
+
+        const customerIdStr = trip.customerId.toString();
+        let customerSocketId = null;
+        for (const [socketId, custId] of connectedCustomers.entries()) {
+          if (custId === customerIdStr) {
+            customerSocketId = socketId;
+            break;
+          }
+        }
+
+        if (!customerSocketId) {
+          const customer = await User.findById(customerIdStr).select('socketId').lean();
+          if (customer?.socketId) {
+            customerSocketId = customer.socketId;
+          }
+        }
+
+        if (customerSocketId) {
+          io.to(customerSocketId).emit('driver:locationUpdate', {
+            tripId: tripId.toString(),
+            driverId,
+            latitude,
+            longitude,
+            distanceToDestination: Math.round(distanceInMeters),
+            sequence: typeof sequence === 'number' ? sequence : Date.now(),
+            timestamp: new Date().toISOString()
+          });
+          console.log(`📡 Emitted driver:locationUpdate to customer ${customerIdStr}`);
+        } else {
+          console.warn(`⚠️ No socket found for customer ${customerIdStr} — location update dropped`);
+        }
+      } catch (e) {
+        console.error('❌ driver:location error:', e);
+      }
+    });
+
+    // =========================================================================
+    // CUSTOMER LOCATION UPDATE
+    // =========================================================================
+    socket.on('customer:location', async ({ tripId, customerId, latitude, longitude, sequence, timestamp }) => {
+      try {
+        if (!tripId || !customerId || !latitude || !longitude) return;
+
+        await User.findByIdAndUpdate(customerId, {
+          $set: {
+            location: { type: 'Point', coordinates: [longitude, latitude] },
+            lastLocationUpdate: new Date()
+          }
+        });
+
+        const trip = await Trip.findById(tripId).lean();
+        if (trip && trip.assignedDriver) {
+          const driver = await User.findById(trip.assignedDriver).select('socketId').lean();
+          if (driver?.socketId) {
+            io.to(driver.socketId).emit('customer:locationUpdate', {
+              tripId: tripId.toString(),
+              customerId,
+              latitude,
+              longitude,
+              timestamp: new Date().toISOString()
+            });
+          }
+        }
+      } catch (e) {
+        console.error('❌ customer:location error:', e);
+      }
+    });
+
+    // =========================================================================
+    // DRIVER HEARTBEAT
+    // =========================================================================
+    socket.on('driver:heartbeat', async ({ tripId, driverId, timestamp, location }) => {
+      try {
+        if (!driverId) return;
+
+        const updateData = {
+          $set: { 
+            lastHeartbeat: new Date(),
+            lastLocationUpdate: new Date(),
+            socketId: socket.id,
+            isOnline: true
+          }
+        };
+
+        if (location && location.lat && location.lng) {
+          updateData.$set.location = {
+            type: 'Point',
+            coordinates: [location.lng, location.lat]
+          };
+        }
+
+        await User.findByIdAndUpdate(driverId, updateData);
+
+        if (tripId) {
+          await Trip.findByIdAndUpdate(tripId, { 
+            $set: { lastDriverHeartbeat: new Date() } 
+          });
+        }
+
+        socket.emit('heartbeat:ack', { 
+          timestamp: Date.now(),
+          socketId: socket.id 
+        });
+      } catch (e) {
+        console.error('❌ driver:heartbeat error:', e);
+      }
+    });
+
+    // =========================================================================
+    // CHAT HANDLERS
+    // =========================================================================
+    socket.on('chat:join', (data) => {
+      try {
+        const { tripId, userId } = data;
+        if (!tripId) return;
+        socket.join(`chat_${tripId}`);
+        socket.to(`chat_${tripId}`).emit('chat:user_joined', { userId, timestamp: new Date().toISOString() });
+      } catch (error) {
+        console.error('❌ chat:join error:', error);
+      }
+    });
+
+    socket.on('chat:leave', (data) => {
+      try {
+        const { tripId, userId } = data;
+        if (!tripId) return;
+        socket.leave(`chat_${tripId}`);
+        socket.to(`chat_${tripId}`).emit('chat:user_left', { userId, timestamp: new Date().toISOString() });
+      } catch (error) {
+        console.error('❌ chat:leave error:', error);
+      }
+    });
+
+    socket.on('chat:send_message', async (data) => {
+      try {
+        const { tripId, fromId, toId, message, timestamp } = data;
+        if (!tripId || !fromId || !toId || !message) {
+          socket.emit('chat:error', { error: 'Missing required fields' });
+          return;
+        }
+
+        try {
+          const chatMessage = new ChatMessage({
+            tripId, senderId: fromId, receiverId: toId, message,
+            timestamp: timestamp ? new Date(timestamp) : new Date()
+          });
+          await chatMessage.save();
+        } catch (dbError) {
+          console.warn('⚠️ Failed to save chat message:', dbError);
+        }
+
+        const messageData = {
+          tripId, fromId, toId, senderId: fromId, receiverId: toId, message,
+          timestamp: timestamp || new Date().toISOString()
+        };
+
+        socket.to(`chat_${tripId}`).emit('chat:receive_message', messageData);
+        socket.emit('chat:message_sent', { success: true, timestamp: messageData.timestamp });
+
+        let recipientSocketId = null;
+        for (const [socketId, userId] of connectedCustomers.entries()) {
+          if (userId === toId) { recipientSocketId = socketId; break; }
+        }
+        if (!recipientSocketId) {
+          for (const [socketId, userId] of connectedDrivers.entries()) {
+            if (userId === toId) { recipientSocketId = socketId; break; }
+          }
+        }
+        if (recipientSocketId) {
+          io.to(recipientSocketId).emit('chat:receive_message', messageData);
+        }
+      } catch (error) {
+        console.error('❌ chat:send_message error:', error);
+        socket.emit('chat:error', { error: 'Failed to send message' });
+      }
+    });
+
+    socket.on('chat:typing', (data) => {
+      try {
+        const { tripId, userId, isTyping } = data;
+        if (!tripId) return;
+        socket.to(`chat_${tripId}`).emit('chat:typing_status', { userId, isTyping, timestamp: new Date().toISOString() });
+      } catch (error) {
+        console.error('❌ chat:typing error:', error);
+      }
+    });
+
+    socket.on('chat:mark_read', async (data) => {
+      try {
+        const { tripId, userId } = data;
+        if (!tripId || !userId) return;
+        await ChatMessage.updateMany({ tripId, receiverId: userId, read: false }, { $set: { read: true } });
+        socket.to(`chat_${tripId}`).emit('chat:messages_read', { userId, tripId, timestamp: new Date().toISOString() });
+      } catch (error) {
+        console.error('❌ chat:mark_read error:', error);
+      }
+    });
+
+    socket.on('chat:get_unread', async (data) => {
+      try {
+        const { userId } = data;
+        if (!userId) return;
+        const unreadCount = await ChatMessage.countDocuments({ receiverId: userId, read: false });
+        socket.emit('chat:unread_count', { userId, count: unreadCount, timestamp: new Date().toISOString() });
+      } catch (error) {
+        console.error('❌ chat:get_unread error:', error);
+      }
+    });
+
+    // =========================================================================
+    // DRIVER GO OFFLINE (Explicit)
+    // =========================================================================
+    socket.on('driver:go_offline', async ({ driverId }) => {
+      try {
+        const driver = await User.findById(driverId).select('currentTripId isBusy name').lean();
+        if (!driver) return;
+        
+        if (driver.currentTripId || driver.isBusy) {
+          socket.emit('driver:offline_blocked', { 
+            success: false, 
+            message: 'Cannot go offline during active trip', 
+            currentTripId: driver.currentTripId 
+          });
+          return;
+        }
+
+        await User.findByIdAndUpdate(driverId, { 
+          $set: { isOnline: false, socketId: null, canReceiveNewRequests: false } 
+        });
+        
+        connectedDrivers.delete(socket.id);
+        console.log(`🔴 Driver ${driverId} went offline (explicit request)`);
+        
+        socket.emit('driver:offline_success', { success: true });
+        socket.disconnect(true);
+      } catch (e) {
+        console.error('❌ driver:go_offline error:', e);
+      }
+    });
+
+    // =========================================================================
+    // TRIP RETRY REQUEST
+    // =========================================================================
+    socket.on('trip:rerequest', async ({ tripId, customerId, vehicleType, retryAttempt }) => {
+      try {
+        if (!tripId) return;
+
+        const trip = await Trip.findById(tripId).lean();
+        if (!trip || trip.status !== 'requested' || trip.cancelledAt) {
+          socket.emit('trip:rerequest_failed', { message: 'Trip no longer available', shouldCancelSearch: true });
+          return;
+        }
+
+        const nearbyDrivers = await User.find({
+          isDriver: true,
+          vehicleType: vehicleType,
+          isOnline: true,
+          isBusy: { $ne: true },
+          $or: [
+            { currentTripId: null },
+            { currentTripId: { $exists: false } }
+          ],
+          location: {
+            $near: {
+              $geometry: { type: 'Point', coordinates: trip.pickup.coordinates },
+              $maxDistance: DISTANCE_LIMITS.short || 5000,
+            },
+          },
+        })
+          .select('name phone vehicleType location isOnline socketId fcmToken')
+          .lean();
+
+        if (nearbyDrivers.length === 0) return;
+
+        const payload = {
+          tripId: trip._id.toString(),
+          type: trip.type,
+          vehicleType: vehicleType,
+          customerId: customerId,
+          pickup: {
+            lat: trip.pickup.coordinates[1],
+            lng: trip.pickup.coordinates[0],
+            address: trip.pickup.address || "Pickup Location",
+          },
+          drop: {
+            lat: trip.drop.coordinates[1],
+            lng: trip.drop.coordinates[0],
+            address: trip.drop.address || "Drop Location",
+          },
+          fare: trip.fare || 0,
+          retryAttempt: retryAttempt,
+          isRetry: true
+        };
+
+        broadcastToDrivers(nearbyDrivers, payload);
+        console.log(`🔄 Retry #${retryAttempt}: Sent to ${nearbyDrivers.length} drivers`);
+
+      } catch (e) {
+        console.error('❌ trip:rerequest error:', e);
+      }
+    });
+
+    // =========================================================================
+    // DISCONNECT HANDLER
+    // =========================================================================
+    socket.on('disconnect', async () => {
+      try {
+        const driverId = connectedDrivers.get(socket.id);
+        const customerId = connectedCustomers.get(socket.id);
+
+        if (driverId) {
+          console.log(`⚠️ Driver ${driverId} socket disconnected - STAYING ONLINE`);
+
+          await User.findByIdAndUpdate(driverId, {
+            $set: {
+              socketId: null,
+              lastDisconnectedAt: new Date()
+            }
+          });
+
+          connectedDrivers.delete(socket.id);
+          
+          console.log(`✅ Driver ${driverId} socket cleared - REMAINS ONLINE for FCM requests`);
+        }
+
+        if (customerId) {
+          connectedCustomers.delete(socket.id);
+          await User.findByIdAndUpdate(customerId, {
+            $set: { socketId: null, lastDisconnectedAt: new Date() }
+          });
+        }
+      } catch (e) {
+        console.error('❌ disconnect cleanup error:', e);
+      }
+    });
+
+    // Add support socket handlers
+    initSupportSockets(io, socket);
+
+  }); // END OF io.on('connection')
+
+  // =========================================================================
+  // AUTO-CLEANUP EXPIRED TRIPS
+  // =========================================================================
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      const expiredTrips = await Trip.find({
+        status: 'requested',
+        createdAt: { $lt: new Date(now.getTime() - TRIP_TIMEOUT_MS) }
+      });
+
+      if (!expiredTrips.length) return;
+
+      for (const trip of expiredTrips) {
+        await Trip.findByIdAndUpdate(trip._id, {
+          $set: {
+            status: 'timeout',
+            timeoutAt: new Date(),
+            timeoutReason: 'No driver accepted within 60 seconds'
+          },
+          $inc: { version: 1 }
+        });
+
+        stopProgressiveBroadcast(trip._id.toString());
+
+        const customer = await User.findById(trip.customerId).select('socketId').lean();
+        if (customer?.socketId) {
+          io.to(customer.socketId).emit('trip:timeout', {
+            tripId: trip._id.toString(),
+            message: 'No drivers available right now. Please try again.',
+            reason: 'timeout'
+          });
+        }
+
+        const onlineDrivers = await User.find({
+          isDriver: true,
+          isOnline: true,
+          socketId: { $exists: true, $ne: null }
+        }).select('socketId').lean();
+
+        onlineDrivers.forEach(driver => {
+          if (driver.socketId) {
+            io.to(driver.socketId).emit('trip:expired', {
+              tripId: trip._id.toString(),
+              message: 'This request has expired'
+            });
+          }
+        });
+      }
+    } catch (e) {
+      console.error('❌ Cleanup job error:', e);
+    }
+  }, 10000);
+
+  console.log('⏰ Trip cleanup job started');
+  startNotificationRetryJob();
+  startStaleTripCleanup();
+  console.log('🚀 Socket.IO initialized with payment_waiting:restore support');
+
+};
+
+export { io, connectedDrivers, connectedCustomers };
