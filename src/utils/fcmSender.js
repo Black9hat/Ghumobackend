@@ -1,13 +1,15 @@
 // src/utils/fcmSender.js
-// VERSION: FIXED-V6 — Admin notifications get notification block for killed-app delivery
+// VERSION: FIXED-V7 — null imageUrl guard + correct image field in notification block
 
 import admin from 'firebase-admin';
 import User from '../models/User.js';
 
-// ✅ FIX: Mobile OS strictly blocks "http://" in the background. Enforce "https://"
+// ✅ Enforce https:// — mobile OS blocks http:// in background images
 const getFullImageUrl = (url) => {
-  if (!url) return null;
-  let secureUrl = url.replace('http://', 'https://');
+  // ✅ FIX: Treat empty string as null — prevents garbage URLs like "https://..."
+  if (!url || typeof url !== 'string' || url.trim() === '') return null;
+
+  let secureUrl = url.trim().replace('http://', 'https://');
 
   if (secureUrl.startsWith('https://')) return secureUrl;
 
@@ -33,13 +35,13 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
   try {
     const pickup = dataPayload.pickup || {};
     const drop = dataPayload.drop || {};
+
+    // ✅ FIX: Only convert imageUrl to full URL if it's actually a non-empty string
     const fullImageUrl = getFullImageUrl(dataPayload.imageUrl);
     const tripId = String(dataPayload.tripId || '');
 
-    // ✅ KEY FIX: Detect if this is an admin notification (not a trip request).
-    // Trip requests must be pure data-only (native overlay handles them).
-    // Admin/broadcast notifications need a notification block so Android
-    // can display them even when the app is killed.
+    // Admin/broadcast notifications need a notification block for killed-app delivery.
+    // Trip requests stay pure data-only so the native overlay handles them.
     const isAdminNotification =
       dataPayload.notificationType === 'ADMIN_NOTIFICATION' ||
       dataPayload.notificationType === 'TRIP_REASSIGNED' ||
@@ -68,8 +70,8 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
 
         title: String(dataPayload.title || 'New Trip Request'),
         body: String(dataPayload.body || ''),
-        imageUrl: fullImageUrl || '',
-        image: fullImageUrl || '',
+        // ✅ FIX: Only include imageUrl/image in data if we actually have one
+        ...(fullImageUrl ? { imageUrl: fullImageUrl, image: fullImageUrl } : { imageUrl: '', image: '' }),
       },
 
       android: {
@@ -83,14 +85,11 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
       apns: {
         headers: {
           'apns-priority': '10',
-          ...(tripId
-            ? { 'apns-collapse-id': `trip_request_${tripId}` }
-            : {}),
+          ...(tripId ? { 'apns-collapse-id': `trip_request_${tripId}` } : {}),
         },
         payload: {
           aps: {
             'content-available': 1,
-            // ✅ For admin notifications, also show alert on iOS
             ...(isAdminNotification && {
               alert: {
                 title: String(dataPayload.title || 'New Notification'),
@@ -100,25 +99,31 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
             }),
           },
         },
+        // ✅ FIX: Only add fcmOptions.image if fullImageUrl is non-null
         ...(isAdminNotification && fullImageUrl && {
           fcmOptions: { image: fullImageUrl },
         }),
       },
     };
 
-    // ✅ FIX: Admin notifications get a top-level notification block.
-    // This ensures Android shows the notification even when app is killed.
-    // Trip requests stay pure data-only so native overlay handles them.
+    // ✅ Admin notifications get a top-level notification block for killed-app display.
+    // Trip requests stay pure data-only.
     if (isAdminNotification) {
-      message.notification = {
+      const notifBlock = {
         title: String(dataPayload.title || 'New Notification'),
         body: String(dataPayload.body || ''),
-        ...(fullImageUrl && { image: fullImageUrl }), // ✅ FCM v1: top-level uses `image`
       };
+      // ✅ FIX: Only add image field if we actually have a URL
+      if (fullImageUrl) {
+        notifBlock.image = fullImageUrl;
+      }
+      message.notification = notifBlock;
+
       message.android.notification = {
         channelId: CHANNEL_ID,
         priority: 'high',
-        ...(fullImageUrl && { image: fullImageUrl }), // ✅ FCM v1: android.notification also uses `image`
+        // ✅ FIX: Only add image if we have one
+        ...(fullImageUrl ? { image: fullImageUrl } : {}),
       };
     }
 
@@ -171,7 +176,7 @@ export const sendToDriver = async (fcmToken, dataPayload = {}) => {
   }
 };
 
-// ✅ Customer side — unchanged
+// ✅ Customer side
 export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
   if (!fcmToken) {
     console.error('❌ No FCM token provided');
@@ -179,6 +184,7 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
   }
 
   try {
+    // ✅ FIX: getFullImageUrl now guards against empty strings
     const fullImageUrl = getFullImageUrl(data.imageUrl);
 
     console.log('');
@@ -214,8 +220,9 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
         type: String(data.type || 'customer'),
         title: String(title),
         body: String(body),
-        imageUrl: String(fullImageUrl || ''),
-        image: String(fullImageUrl || ''),
+        // ✅ FIX: Only include imageUrl/image in data if non-null
+        imageUrl: fullImageUrl || '',
+        image: fullImageUrl || '',
         tripId: String(data.tripId || ''),
         timestamp: new Date().toISOString(),
         click_action: 'FLUTTER_NOTIFICATION_CLICK',
@@ -246,9 +253,8 @@ export const sendToCustomer = async (fcmToken, title, body, data = {}) => {
             'content-available': 1,
           },
         },
-        fcmOptions: {
-          ...(fullImageUrl && { image: fullImageUrl }),
-        },
+        // ✅ FIX: Only add fcmOptions if we have a real image URL
+        ...(fullImageUrl ? { fcmOptions: { image: fullImageUrl } } : {}),
       },
     };
 

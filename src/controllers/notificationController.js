@@ -143,23 +143,35 @@ const sendBroadcastNotification = async (req, res) => {
       });
     }
 
-    // ✅ FIX: Use `role` field (not `isDriver`) — consistent with the rest of the codebase.
-    // `isDriver: { $ne: true }` was matching drivers with missing/null isDriver field.
+    // ✅ FIX: Use isDriver (the canonical, reliable field) instead of role field.
+    // The role field may be missing or stale on older user documents.
+    // isDriver is always set correctly during registration.
     let query = {};
     if (role === "driver") {
-      query = { role: "driver" };
+      query = { isDriver: true };
     } else if (role === "customer") {
-      query = { role: "customer" };
+      query = { isDriver: false };
     }
     // if role is undefined / "all" → no filter → all users
 
-    const users = await User.find(query).select("_id fcmToken role name");
+    // ✅ Only fetch users who have an FCM token (skip users who can't receive push)
+    const users = await User.find(query).select("_id fcmToken isDriver name");
 
     let successCount = 0;
     let failCount = 0;
+    const processedTokens = new Set();
 
     for (const user of users) {
-      const userRole = user.role; // ✅ use role field directly
+      // 🛡️ Deduplicate by FCM token — skip if same token seen already this run
+      if (user.fcmToken) {
+        if (processedTokens.has(user.fcmToken)) {
+          console.log(`🛡️ Skipping duplicate token for user ${user._id}`);
+          continue;
+        }
+        processedTokens.add(user.fcmToken);
+      }
+
+      const userRole = user.isDriver ? "driver" : "customer";
 
       // ✅ Save to DB — each user gets their own notification record
       await createNotification({
@@ -168,27 +180,27 @@ const sendBroadcastNotification = async (req, res) => {
         title,
         body,
         type,
-        imageUrl,
+        imageUrl: imageUrl || null,
         ctaText,
         ctaRoute,
       });
 
-      // ✅ Send FCM
+      // ✅ Send FCM only if user has a token
       if (user.fcmToken) {
         try {
-          if (user.role === "driver") {
-            // ✅ FIX: Pass title + body so fcmSender can add notification block
-            // for killed-app delivery
+          if (user.isDriver) {
+            // ✅ sendToDriver with ADMIN_NOTIFICATION type — adds notification block
+            // for killed-app delivery, and includes imageUrl in both data + notification
             await sendToDriver(user.fcmToken, {
               notificationType: "ADMIN_NOTIFICATION",
               title,
               body,
-              imageUrl: imageUrl || "",
+              imageUrl: imageUrl || null,
             });
           } else {
             await sendToCustomer(user.fcmToken, title, body, {
               type,
-              imageUrl: imageUrl || "",
+              imageUrl: imageUrl || null,
             });
           }
           successCount++;
@@ -240,7 +252,7 @@ const sendIndividualNotification = async (req, res) => {
       });
     }
 
-    const userRole = user.role; // ✅ use role field directly
+    const userRole = user.isDriver ? "driver" : "customer";
 
     await createNotification({
       userId: user._id,
@@ -248,25 +260,24 @@ const sendIndividualNotification = async (req, res) => {
       title,
       body,
       type,
-      imageUrl,
+      imageUrl: imageUrl || null,
       ctaText,
       ctaRoute,
     });
 
     let fcmResult = { success: false };
     if (user.fcmToken) {
-      if (user.role === "driver") {
-        // ✅ FIX: Pass title + body for killed-app notification block
+      if (user.isDriver) {
         fcmResult = await sendToDriver(user.fcmToken, {
           notificationType: "ADMIN_NOTIFICATION",
           title,
           body,
-          imageUrl: imageUrl || "",
+          imageUrl: imageUrl || null,
         });
       } else {
         fcmResult = await sendToCustomer(user.fcmToken, title, body, {
           type,
-          imageUrl: imageUrl || "",
+          imageUrl: imageUrl || null,
         });
       }
     }
@@ -284,14 +295,14 @@ const sendIndividualNotification = async (req, res) => {
 
 /**
  * 📥 Get user notifications (driver or customer — filtered by role)
- * Called by: GET /api/admin/notifications/user  (with user auth)
+ * Called by: GET /api/notifications  (with user auth)
  */
 const getUserNotifications = async (req, res) => {
   try {
     const userId = req.user._id;
     const { page = 1, limit = 20, unreadOnly = false } = req.query;
 
-    // ✅ FIX: Filter by role so drivers don't see customer notifications
+    // ✅ Use isDriver (reliable) to determine role
     const userRole = req.user.isDriver ? "driver" : "customer";
     const query = { userId, role: userRole };
 
@@ -328,7 +339,7 @@ const getUserNotifications = async (req, res) => {
 
 /**
  * 🎁 Get latest 5 offers for the logged-in user
- * Called by: GET /api/admin/offers  (with user auth)
+ * Called by: GET /api/notifications/offers  (with user auth)
  */
 const getOffers = async (req, res) => {
   try {
@@ -362,13 +373,11 @@ const getOffers = async (req, res) => {
 /**
  * 🎁 Admin: Get all unique promotion offers (for admin panel display)
  * Called by: GET /api/admin/offers/all  (with admin auth)
- * Returns one record per unique title+body combination with role info
  */
 const getAllOffersAdmin = async (req, res) => {
   try {
     console.log("🎁 Admin fetching all offers...");
 
-    // Aggregate to get one representative doc per unique title+body+imageUrl
     const offers = await Notification.aggregate([
       { $match: { type: "promotion" } },
       { $sort: { createdAt: -1 } },
@@ -439,7 +448,6 @@ const deleteOffer = async (req, res) => {
       });
     }
 
-    // ✅ Delete ALL notifications with same title, body, imageUrl across all users
     const deleteResult = await Notification.deleteMany({
       title: offer.title,
       body: offer.body,
@@ -598,7 +606,7 @@ export {
   sendIndividualNotification,
   getUserNotifications,
   getOffers,
-  getAllOffersAdmin,       // ✅ NEW: Admin view of all offers
+  getAllOffersAdmin,
   deleteOffer,
   markAsRead,
   markAllAsRead,
