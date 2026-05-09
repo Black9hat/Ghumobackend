@@ -34,26 +34,35 @@ class SessionManager {
       }
 
       // 🔥 ROLE-BASED SESSION CONTROL: Check for existing session for SAME ROLE ONLY
+      // 🔥 FIX: Also check legacy fields (currentDeviceId/currentFcmToken/sessionActive)
+      // Users registered before sessionsByRole was introduced have session data ONLY in
+      // legacy fields — sessionsByRole.customer.isActive stays false → force logout never fires
       const existingSession = user.sessionsByRole?.[loginRole];
-      const hasActiveSessionSameRole = existingSession?.isActive && existingSession?.deviceId && existingSession?.deviceId !== deviceId;
-      
+      const sessionByRoleActive = !!(existingSession?.isActive && existingSession?.deviceId && existingSession?.deviceId !== deviceId);
+      const legacyActive = !sessionByRoleActive &&
+        user.sessionActive === true &&
+        !!user.currentDeviceId &&
+        user.currentDeviceId !== deviceId;
+
+      const hasActiveSessionSameRole = sessionByRoleActive || legacyActive;
+
+      // Resolve old token/deviceId from whichever source is populated
       let forcedLogout = false;
-      let oldDeviceId = null;
-      let oldFcmToken = null;
+      let oldDeviceId = sessionByRoleActive ? existingSession.deviceId : (legacyActive ? user.currentDeviceId : null);
+      let oldFcmToken = sessionByRoleActive ? existingSession.fcmToken : (legacyActive ? user.currentFcmToken : null);
 
       if (hasActiveSessionSameRole) {
-        console.log(`⚠️ User ${phone} (${loginRole}) has active session on device ${existingSession.deviceId}`);
+        const sourceLabel = sessionByRoleActive ? 'sessionsByRole' : 'legacy fields';
+        console.log(`⚠️ User ${phone} (${loginRole}) has active session on device ${oldDeviceId} [detected via ${sourceLabel}]`);
         console.log(`🔄 Forcing logout on old device (SAME ROLE ONLY)...`);
         
-        oldDeviceId = existingSession.deviceId;
-        oldFcmToken = existingSession.fcmToken;
         forcedLogout = true;
 
         // 🔥 Archive old session with ROLE information
         user.previousSessions.push({
           deviceId: oldDeviceId,
           fcmToken: oldFcmToken,
-          loginAt: existingSession.loginAt,
+          loginAt: existingSession?.loginAt ?? user.lastLoginAt ?? null,
           logoutAt: new Date(),
           reason: 'force_logout',
           role: loginRole,
