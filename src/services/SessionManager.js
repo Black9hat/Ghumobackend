@@ -23,7 +23,7 @@ class SessionManager {
       console.log(`🔐 Session Manager: Handling login for ${phone} as ${loginRole} on device ${deviceId}`);
       
       // Find user by phone
-      const user = await User.findOne({ phone });
+      const user = await User.findOne({ phone, role: loginRole });
       
       if (!user) {
         console.log(`⚠️ User not found: ${phone}`);
@@ -226,7 +226,7 @@ class SessionManager {
       const logoutRole = role || "customer";
       console.log(`👋 Handling logout for ${phone} (${logoutRole}), reason: ${reason}`);
 
-      const user = await User.findOne({ phone });
+      const user = await User.findOne({ phone, role: logoutRole });
       
       if (!user) {
         console.log(`⚠️ User not found during logout: ${phone}`);
@@ -291,7 +291,7 @@ class SessionManager {
   static async getSessionStatus(phone, role = "customer") {
     try {
       const checkRole = role || "customer";
-      const user = await User.findOne({ phone });
+      const user = await User.findOne({ phone, role: checkRole });
       
       if (!user) {
         return { active: false, error: 'User not found' };
@@ -321,7 +321,7 @@ class SessionManager {
   static async refreshFcmToken(phone, newFcmToken, role = "customer") {
     try {
       const refreshRole = role || "customer";
-      const user = await User.findOne({ phone });
+      const user = await User.findOne({ phone, role: refreshRole });
       
       if (!user) {
         return { success: false, error: 'User not found' };

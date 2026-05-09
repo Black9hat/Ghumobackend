@@ -2,6 +2,29 @@
 import admin from "../utils/firebase.js";
 import User from "../models/User.js";
 
+const resolveRequestedRole = (req) => {
+  const headerRole = String(
+    req.headers['x-app-role'] ||
+      req.headers['x-user-role'] ||
+      req.headers['x-client-role'] ||
+      req.headers['x-role'] ||
+      ''
+  ).toLowerCase().trim();
+
+  const bodyRole = String(req.body?.role || req.query?.role || '').toLowerCase().trim();
+  const path = String(req.originalUrl || req.path || '').toLowerCase();
+
+  if (headerRole === 'driver' || headerRole === 'customer') return headerRole;
+  if (bodyRole === 'driver' || bodyRole === 'customer') return bodyRole;
+
+  if (path.startsWith('/api/driver')) return 'driver';
+  if (path.startsWith('/api/customer')) return 'customer';
+  if (path.startsWith('/api/notifications')) return 'driver';
+  if (path.includes('/admin/notifications') || path.includes('/admin/offers')) return 'customer';
+
+  return null;
+};
+
 // =====================================================
 // 🔐 Protect normal users (Driver / Customer)
 // =====================================================
@@ -38,7 +61,28 @@ export const protect = async (req, res, next) => {
     // Normalize phone number (extract last 10 digits)
     const phone = phoneInToken.replace(/\D/g, "").slice(-10);
 
-    const user = await User.findOne({ phone });
+    const requestedRole = resolveRequestedRole(req);
+    let user = requestedRole
+      ? await User.findOne({ phone, role: requestedRole })
+      : await User.findOne({ phone });
+
+    if (!user) {
+      const matches = await User.find({ phone }).select('_id phone role isDriver vehicleType');
+
+      if (matches.length === 1) {
+        user = matches[0];
+      } else if (matches.length > 1) {
+        if (requestedRole) {
+          user = matches.find((candidate) => candidate.role === requestedRole) || null;
+        }
+
+        if (!user) {
+          const driverMatch = matches.find((candidate) => candidate.role === 'driver' || candidate.isDriver);
+          const customerMatch = matches.find((candidate) => candidate.role === 'customer' && !candidate.isDriver);
+          user = requestedRole === 'driver' ? driverMatch || customerMatch : customerMatch || driverMatch;
+        }
+      }
+    }
 
     if (!user) {
       console.log(`❌ User not found in DB for phone: ${phone}`);

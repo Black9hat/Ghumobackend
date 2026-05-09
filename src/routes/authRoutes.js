@@ -65,7 +65,9 @@ router.post('/firebase-sync', async (req, res) => {
     // ── Normalize phone (strip +91 prefix) ───────────────────────────────────
     const phoneKey = phone.replace(/^\+91/, '').replace(/^91/, '');
 
-    let user = await User.findOne({ phone: phoneKey });
+    const requestedRole = role === 'driver' || role === 'customer' ? role : 'customer';
+
+    let user = await User.findOne({ phone: phoneKey, role: requestedRole });
 
     // ── NEW USER ──────────────────────────────────────────────────────────────
     if (!user) {
@@ -75,8 +77,8 @@ router.post('/firebase-sync', async (req, res) => {
         phone:           phoneKey,
         name:            'New User',
         firebaseUid,
-        role:            role || 'customer',
-        isDriver:        role === 'driver',
+        role:            requestedRole,
+        isDriver:        requestedRole === 'driver',
         location: {
           type:        'Point',
           coordinates: [78.4867, 17.385],
@@ -163,7 +165,7 @@ router.post('/firebase-sync', async (req, res) => {
     // into onboarding after logout/login.
     const requestedRole = (role === 'driver' || role === 'customer')
       ? role
-      : (user.isDriver ? 'driver' : 'customer');
+      : (user.role === 'driver' ? 'driver' : 'customer');
 
     if (requestedRole === 'driver') {
       if (user.role !== 'driver') {
