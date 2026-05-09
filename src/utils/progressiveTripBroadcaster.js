@@ -88,9 +88,19 @@ const fetchPhaseDrivers = async (controller, radius) => {
     query._id = { $nin: excludedIds };
   }
 
-  return User.find(query)
+  const phaseDrivers = await User.find(query)
     .select('_id name socketId fcmToken vehicleType location')
     .lean();
+  
+  // ✅ ENHANCED LOGGING: Debug progressive broadcast phases
+  console.log(`🔄 Phase ${controller.state.currentPhaseIndex + 1} (${radius}m) for ${trip.vehicleType}:`);
+  console.log(`   Drivers found: ${phaseDrivers.length}`);
+  console.log(`   Already notified: ${excludedIds.length}`);
+  if (phaseDrivers.length > 0) {
+    console.log(`   First driver: ${phaseDrivers[0].name} (${phaseDrivers[0].socketId ? '✅ Socket' : '❌ No Socket'})`);
+  }
+  
+  return phaseDrivers;
 };
 
 const fetchDriversForSecondAttempt = async (controller, phaseNumber) => {

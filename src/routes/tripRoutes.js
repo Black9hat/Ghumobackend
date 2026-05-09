@@ -183,6 +183,85 @@ router.get('/debug/trip/:tripId/payment-status', async (req, res) => {
 
 router.post("/support/request", requestTripSupport);
 
+// ════════════════════════════════════════════════════════════════════════════
+// DEBUG ENDPOINT: Check driver availability by vehicle type and location
+// Usage: POST /api/trip/debug/driver-availability
+// Body: { vehicleType: "auto", lat: 17.456, lng: 78.123 }
+// ════════════════════════════════════════════════════════════════════════════
+router.post('/debug/driver-availability', async (req, res) => {
+  try {
+    const { vehicleType, lat, lng } = req.body;
+    
+    if (!vehicleType || lat === undefined || lng === undefined) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'vehicleType, lat, and lng are required' 
+      });
+    }
+    
+    const normalizedType = String(vehicleType).trim().toLowerCase();
+    const radii = [2000, 3000, 5000];
+    
+    console.log('\n' + '='.repeat(70));
+    console.log('🔍 DRIVER AVAILABILITY DEBUG');
+    console.log('='.repeat(70));
+    console.log(`Vehicle Type: ${normalizedType}`);
+    console.log(`Location: ${lat}, ${lng}`);
+    
+    const results = {};
+    
+    for (const radius of radii) {
+      const drivers = await User.find({
+        isDriver: true,
+        vehicleType: normalizedType,
+        isOnline: true,
+        isBusy: { $ne: true },
+        $or: [
+          { socketId: { $exists: true, $ne: null } },
+          { fcmToken: { $exists: true, $ne: null } },
+        ],
+        $and: [
+          { $or: [{ currentTripId: null }, { currentTripId: { $exists: false } }] },
+        ],
+        location: {
+          $near: {
+            $geometry: { type: 'Point', coordinates: [lng, lat] },
+            $maxDistance: radius,
+          },
+        },
+      }).select('_id name socketId fcmToken vehicleType location').lean();
+      
+      results[`${radius}m`] = {
+        count: drivers.length,
+        drivers: drivers.map(d => ({
+          id: d._id.toString().substring(0, 8),
+          name: d.name,
+          hasSocket: !!d.socketId,
+          hasFCM: !!d.fcmToken,
+        })),
+      };
+      
+      console.log(`\n📍 Within ${radius}m: ${drivers.length} drivers`);
+      drivers.slice(0, 3).forEach((d, i) => {
+        console.log(`   ${i+1}. ${d.name} - Socket:${d.socketId ? '✅' : '❌'} FCM:${d.fcmToken ? '✅' : '❌'}`);
+      });
+    }
+    
+    console.log('='.repeat(70) + '\n');
+    
+    return res.status(200).json({
+      success: true,
+      vehicleType: normalizedType,
+      location: { lat, lng },
+      results,
+    });
+    
+  } catch (err) {
+    console.error('❌ Driver availability debug error:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 router.post('/short', createShortTrip);
 router.post('/parcel', createParcelTrip);
 router.get('/driver/active/:driverId', getDriverActiveTrip);

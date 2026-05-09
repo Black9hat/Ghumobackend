@@ -484,6 +484,15 @@ const createShortTrip = async (req, res) => {
       },
     }).select('_id name phone socketId fcmToken vehicleType location rating').lean();
 
+    // ✅ ENHANCED LOGGING: Debug vehicle type specific issues
+    console.log(`📍 Nearby driver query for ${sanitizedVehicleType}:`);
+    console.log(`   Pickup coords: ${JSON.stringify(pickup.coordinates)}`);
+    console.log(`   Search radius: ${TRIP_LIMITS.SHORT}m`);
+    console.log(`   Drivers found: ${nearbyDrivers.length}`);
+    if (nearbyDrivers.length > 0) {
+      console.log(`   First driver: ${nearbyDrivers[0].name} (${nearbyDrivers[0].socketId ? '✅ Socket' : '❌ No Socket'})`);
+    }
+
     let destinationDrivers = [];
     try {
       destinationDrivers = await User.find({
@@ -506,6 +515,7 @@ const createShortTrip = async (req, res) => {
           },
         },
       }).select('_id socketId fcmToken name phone vehicleType').lean();
+      console.log(`   Destination drivers found: ${destinationDrivers.length}`);
     } catch (destErr) {
       console.log(`⚠️ Destination driver query failed: ${destErr.message}`);
     }
