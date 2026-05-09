@@ -326,7 +326,18 @@ export const initSocket = (ioInstance) => {
     if (queryDriverId) {
       console.log(`🔄 Driver ${queryDriverId} connecting with ID in handshake`);
       
-      const driver = await User.findById(queryDriverId).select('phone vehicleType role').lean();
+      const driver = await User.findById(queryDriverId).select('phone vehicleType role sessionsByRole').lean();
+      
+      if (driver) {
+        const driverRole = driver.role || 'driver';
+        const driverSession = driver.sessionsByRole?.[driverRole];
+        
+        console.log(`🔑 Driver session info:`);
+        console.log(`   Role: ${driverRole}`);
+        console.log(`   Phone: ${driver.phone}`);
+        console.log(`   Current deviceId: ${driverSession?.deviceId || 'NONE'}`);
+        console.log(`   Current isActive: ${driverSession?.isActive || false}`);
+      }
       
       // Update driver's socket immediately
       await User.findByIdAndUpdate(queryDriverId, {
@@ -347,7 +358,11 @@ export const initSocket = (ioInstance) => {
         // 🔥 JOIN ROLE-SPECIFIC ROOM FOR FORCE LOGOUT
         const driverRole = driver?.role || 'driver';
         socket.join(`user:${driver.phone}:${driverRole}`);
-        console.log(`🔥 Driver ${queryDriverId} joined role-specific room: user:${driver.phone}:${driverRole}`);
+        
+        console.log(`✅ Driver socket joined rooms:`);
+        console.log(`   - user:${driver.phone}`);
+        console.log(`   - user:${driver.phone}:${driverRole}`);
+        
         socket.data.phone = driver.phone;
         socket.data.role = driverRole;
       }

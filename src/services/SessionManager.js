@@ -66,13 +66,26 @@ class SessionManager {
         
         // 1️⃣ Send FCM notification (works even if app is closed)
         if (oldFcmToken) {
+          console.log(`📲 Sending FCM force_logout to token: ${oldFcmToken.substring(0, 20)}...`);
           await this.sendForceLogoutNotification(oldFcmToken, phone, loginRole, deviceId);
+        } else {
+          console.log(`⚠️ No FCM token available for force_logout fallback`);
         }
 
         // 2️⃣ Send Socket.io event ONLY to this role
         if (io) {
           // 🔥 Send to role-specific room to ensure other roles aren't affected
-          io.to(`user:${phone}:${loginRole}`).emit('force_logout', {
+          const roomName = `user:${phone}:${loginRole}`;
+          
+          // 🔥 DEBUG: Check how many sockets are in this room
+          const roomSockets = io.sockets.adapter.rooms.get(roomName);
+          const socketCount = roomSockets ? roomSockets.size : 0;
+          
+          console.log(`📡 Emitting force_logout to room: ${roomName}`);
+          console.log(`   Room has ${socketCount} socket(s)`);
+          console.log(`   oldDeviceId: ${oldDeviceId}, newDeviceId: ${deviceId}`);
+          
+          io.to(roomName).emit('force_logout', {
             type: 'force_logout',
             role: loginRole,
             reason: 'multi_device_login',
@@ -82,7 +95,15 @@ class SessionManager {
             timestamp: new Date().toISOString(),
           });
           
-          console.log(`📡 Sent force_logout socket event to room: user:${phone}:${loginRole}`);
+          if (socketCount === 0) {
+            console.log(`⚠️ WARNING: Room ${roomName} is empty! Force_logout event will be lost.`);
+            console.log(`   This might mean:`);
+            console.log(`   1. Socket hasn't connected yet`);
+            console.log(`   2. Socket already disconnected`);
+            console.log(`   3. Socket didn't join the room`);
+          } else {
+            console.log(`✅ Force_logout emitted to ${socketCount} socket(s)`);
+          }
         }
       } else {
         console.log(`✅ No active session for ${phone} (${loginRole}) or same deviceId`);
