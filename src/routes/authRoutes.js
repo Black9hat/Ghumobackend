@@ -65,7 +65,7 @@ router.post('/firebase-sync', async (req, res) => {
     // ── Normalize phone (strip +91 prefix) ───────────────────────────────────
     const phoneKey = phone.replace(/^\+91/, '').replace(/^91/, '');
 
-    const requestedRole = role === 'driver' || role === 'customer' ? role : 'customer';
+    let requestedRole = role === 'driver' || role === 'customer' ? role : 'customer';
 
     let user = await User.findOne({ phone: phoneKey, role: requestedRole });
 
