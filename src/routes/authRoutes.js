@@ -163,7 +163,7 @@ router.post('/firebase-sync', async (req, res) => {
     // 🔥 Ensure role consistency for existing users logging into driver app.
     // Without this, stale role='customer' can push approved drivers back
     // into onboarding after logout/login.
-    const requestedRole = (role === 'driver' || role === 'customer')
+    requestedRole = (role === 'driver' || role === 'customer')
       ? role
       : (user.role === 'driver' ? 'driver' : 'customer');
 
