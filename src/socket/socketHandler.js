@@ -444,25 +444,38 @@ export const initSocket = (ioInstance) => {
     // =========================================================================
     socket.on('user:join', async (data) => {
       try {
-        const { phone } = data;
+        const { phone, role = 'customer' } = data;
         
         if (!phone) {
           console.log('⚠️ user:join - no phone provided');
           return;
         }
 
+        // Join generic room
         const roomName = `user:${phone}`;
         socket.join(roomName);
+        
+        // 🔥 Join role-specific room for force_logout targeting
+        const roleRoomName = `user:${phone}:${role}`;
+        socket.join(roleRoomName);
+        
         socket.data.phone = phone;
+        socket.data.role = role;
 
         const roomMembers = await io.in(roomName).allSockets();
+        const roleRoomMembers = await io.in(roleRoomName).allSockets();
+        
         console.log(`✅ User joined room ${roomName} (socket: ${socket.id})`);
         console.log(`   Room ${roomName} now has ${roomMembers.size} member(s)`);
+        console.log(`🔥 User joined role-specific room ${roleRoomName}`);
+        console.log(`   Role room ${roleRoomName} now has ${roleRoomMembers.size} member(s)`);
 
         socket.emit('user:joined', {
           success: true,
           room: roomName,
+          roleRoom: roleRoomName,
           socketId: socket.id,
+          role: role,
           timestamp: new Date().toISOString(),
         });
       } catch (error) {
@@ -475,14 +488,18 @@ export const initSocket = (ioInstance) => {
     // =========================================================================
     socket.on('user:leave', async (data) => {
       try {
-        const { phone } = data;
+        const { phone, role = 'customer' } = data;
         
         if (!phone) return;
 
         const roomName = `user:${phone}`;
+        const roleRoomName = `user:${phone}:${role}`;
+        
         socket.leave(roomName);
+        socket.leave(roleRoomName);
         
         console.log(`👋 User left room ${roomName} (socket: ${socket.id})`);
+        console.log(`👋 User left role-specific room ${roleRoomName}`);
       } catch (error) {
         console.error('❌ user:leave error:', error);
       }
