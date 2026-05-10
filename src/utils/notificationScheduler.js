@@ -70,7 +70,7 @@ const sendToAllByRole = async (role, title, body) => {
     role:     role === 'customer' ? { $in: ['customer', 'user'] } : role,
   };
 
-  const users = await User.find(query).select('_id fcmToken').lean();
+  const users = await User.find(query).select('_id fcmToken currentFcmToken').lean();
   console.log(`📤 Sending scheduled "${title}" to ${users.length} ${role}s`);
 
   let sent = 0, failed = 0;
@@ -83,7 +83,7 @@ const sendToAllByRole = async (role, title, body) => {
       chunk.map((user) =>
         sendFCMNotification({
           userId: user._id,
-          token:  user.fcmToken,
+          token:  user.fcmToken || user.currentFcmToken,
           title,
           body,
           type:  'general',
