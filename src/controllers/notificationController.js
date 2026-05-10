@@ -5,6 +5,16 @@ import Notification from "../models/Notification.js";
 import { sendToDriver, sendToCustomer } from "../utils/fcmSender.js";
 
 /**
+ * 🔥 FIX: Get the best available FCM token for a user.
+ * Customer app saves token to currentFcmToken (legacy field).
+ * Driver app saves to both fcmToken AND currentFcmToken.
+ * Always check both fields — use whichever is non-empty.
+ */
+const getEffectiveFcmToken = (user) => {
+  return user.fcmToken || user.currentFcmToken || null;
+};
+
+/**
  * 📢 Save notification in DB (COMMON)
  */
 const createNotification = async ({
@@ -45,7 +55,6 @@ const sendTripNotification = async (to, type, tripId) => {
     const trip = await Trip.findById(tripId);
     if (!trip) return;
 
-    // ================= DRIVER =================
     if (to === "driver") {
       const driver = await User.findById(trip.assignedDriver);
       if (!driver) return;
@@ -70,8 +79,9 @@ const sendTripNotification = async (to, type, tripId) => {
         data: { tripId: tripId.toString() },
       });
 
-      if (driver.fcmToken) {
-        await sendToDriver(driver.fcmToken, {
+      const token = getEffectiveFcmToken(driver);
+      if (token) {
+        await sendToDriver(token, {
           notificationType: "TRIP_REQUEST",
           tripId: trip._id.toString(),
           pickup: trip.pickup,
@@ -82,7 +92,6 @@ const sendTripNotification = async (to, type, tripId) => {
       }
     }
 
-    // ================= CUSTOMER =================
     if (to === "customer") {
       const customer = await User.findById(trip.customerId);
       if (!customer) return;
@@ -116,8 +125,9 @@ const sendTripNotification = async (to, type, tripId) => {
         data: { tripId: tripId.toString() },
       });
 
-      if (customer.fcmToken) {
-        await sendToCustomer(customer.fcmToken, title, body, {
+      const token = getEffectiveFcmToken(customer);
+      if (token) {
+        await sendToCustomer(token, title, body, {
           tripId: trip._id.toString(),
           type: "trip",
         });
@@ -131,6 +141,14 @@ const sendTripNotification = async (to, type, tripId) => {
 /**
  * 📢 Admin broadcast notification (to all users of a role)
  * Called by: POST /api/admin/send-fcm
+ *
+ * 🔥 FIX 1: Use getEffectiveFcmToken() — checks both fcmToken AND currentFcmToken.
+ *    Customer users only have currentFcmToken; using fcmToken alone finds nothing.
+ *
+ * 🔥 FIX 2: Role query uses isDriver (reliable) not role field (may be stale).
+ *
+ * 🔥 FIX 3: sendToDriver with ADMIN_NOTIFICATION adds notification block
+ *    so image shows on Android even when app is killed.
  */
 const sendBroadcastNotification = async (req, res) => {
   try {
@@ -143,37 +161,46 @@ const sendBroadcastNotification = async (req, res) => {
       });
     }
 
-    // ✅ FIX: Use isDriver (the canonical, reliable field) instead of role field.
-    // The role field may be missing or stale on older user documents.
-    // isDriver is always set correctly during registration.
+    // ✅ Role query using isDriver (canonical field, always set correctly)
     let query = {};
     if (role === "driver") {
       query = { isDriver: true };
     } else if (role === "customer") {
       query = { isDriver: false };
     }
-    // if role is undefined / "all" → no filter → all users
+    // role === "all" or undefined → no filter → send to everyone
 
-    // ✅ Only fetch users who have an FCM token (skip users who can't receive push)
-    const users = await User.find(query).select("_id fcmToken isDriver name");
+    console.log(`\n${"=".repeat(60)}`);
+    console.log(`📢 BROADCAST NOTIFICATION`);
+    console.log(`   Role: ${role || "all"}`);
+    console.log(`   Title: ${title}`);
+    console.log(`   Image: ${imageUrl || "none"}`);
+    console.log(`${"=".repeat(60)}`);
+
+    // ✅ Fetch both token fields so we can use whichever is populated
+    const users = await User.find(query).select("_id fcmToken currentFcmToken isDriver name");
 
     let successCount = 0;
     let failCount = 0;
+    let noTokenCount = 0;
     const processedTokens = new Set();
 
     for (const user of users) {
-      // 🛡️ Deduplicate by FCM token — skip if same token seen already this run
-      if (user.fcmToken) {
-        if (processedTokens.has(user.fcmToken)) {
+      // 🔥 FIX: Use either fcmToken OR currentFcmToken — whichever exists
+      const effectiveToken = getEffectiveFcmToken(user);
+
+      // 🛡️ Deduplicate by token
+      if (effectiveToken) {
+        if (processedTokens.has(effectiveToken)) {
           console.log(`🛡️ Skipping duplicate token for user ${user._id}`);
           continue;
         }
-        processedTokens.add(user.fcmToken);
+        processedTokens.add(effectiveToken);
       }
 
       const userRole = user.isDriver ? "driver" : "customer";
 
-      // ✅ Save to DB — each user gets their own notification record
+      // ✅ Save to DB
       await createNotification({
         userId: user._id,
         role: userRole,
@@ -186,32 +213,42 @@ const sendBroadcastNotification = async (req, res) => {
       });
 
       // ✅ Send FCM only if user has a token
-      if (user.fcmToken) {
+      if (effectiveToken) {
         try {
           if (user.isDriver) {
-            // ✅ sendToDriver with ADMIN_NOTIFICATION type — adds notification block
-            // for killed-app delivery, and includes imageUrl in both data + notification
-            await sendToDriver(user.fcmToken, {
+            // sendToDriver with ADMIN_NOTIFICATION adds notification block
+            // → image shows in system tray even when app is killed
+            await sendToDriver(effectiveToken, {
               notificationType: "ADMIN_NOTIFICATION",
               title,
               body,
               imageUrl: imageUrl || null,
             });
           } else {
-            await sendToCustomer(user.fcmToken, title, body, {
+            // sendToCustomer already has notification block + imageUrl support
+            await sendToCustomer(effectiveToken, title, body, {
               type,
               imageUrl: imageUrl || null,
             });
           }
           successCount++;
+          console.log(`✅ Sent to ${userRole} ${user._id} (${user.name})`);
         } catch (fcmErr) {
-          console.error(`FCM failed for ${user._id}:`, fcmErr.message);
+          console.error(`❌ FCM failed for ${user._id}:`, fcmErr.message);
           failCount++;
         }
+      } else {
+        noTokenCount++;
+        console.log(`⚠️ No FCM token for user ${user._id} (${user.name || "unknown"})`);
       }
     }
 
-    console.log(`📢 Broadcast sent: ${successCount} success, ${failCount} failed`);
+    console.log(`\n✅ Broadcast complete:`);
+    console.log(`   Total users: ${users.length}`);
+    console.log(`   FCM sent: ${successCount}`);
+    console.log(`   No token: ${noTokenCount}`);
+    console.log(`   Failed: ${failCount}`);
+    console.log(`${"=".repeat(60)}\n`);
 
     res.status(200).json({
       success: true,
@@ -219,6 +256,7 @@ const sendBroadcastNotification = async (req, res) => {
       data: {
         total: users.length,
         success: successCount,
+        noToken: noTokenCount,
         failed: failCount,
       },
     });
@@ -231,7 +269,8 @@ const sendBroadcastNotification = async (req, res) => {
 /**
  * 💬 Admin individual notification (to specific user)
  * Called by: POST /api/admin/send-individual-notification
- *         or POST /api/admin/send-fcm/individual
+ *
+ * 🔥 FIX: Use getEffectiveFcmToken() for same reason as broadcast.
  */
 const sendIndividualNotification = async (req, res) => {
   try {
@@ -253,6 +292,12 @@ const sendIndividualNotification = async (req, res) => {
     }
 
     const userRole = user.isDriver ? "driver" : "customer";
+    const effectiveToken = getEffectiveFcmToken(user);
+
+    console.log(`\n📨 INDIVIDUAL NOTIFICATION`);
+    console.log(`   User: ${user.name} (${userRole})`);
+    console.log(`   Token source: ${user.fcmToken ? "fcmToken" : user.currentFcmToken ? "currentFcmToken" : "NONE"}`);
+    console.log(`   Image: ${imageUrl || "none"}`);
 
     await createNotification({
       userId: user._id,
@@ -266,26 +311,29 @@ const sendIndividualNotification = async (req, res) => {
     });
 
     let fcmResult = { success: false };
-    if (user.fcmToken) {
+    if (effectiveToken) {
       if (user.isDriver) {
-        fcmResult = await sendToDriver(user.fcmToken, {
+        fcmResult = await sendToDriver(effectiveToken, {
           notificationType: "ADMIN_NOTIFICATION",
           title,
           body,
           imageUrl: imageUrl || null,
         });
       } else {
-        fcmResult = await sendToCustomer(user.fcmToken, title, body, {
+        fcmResult = await sendToCustomer(effectiveToken, title, body, {
           type,
           imageUrl: imageUrl || null,
         });
       }
+    } else {
+      console.log(`⚠️ No FCM token for user ${userId}`);
     }
 
     res.status(200).json({
       success: true,
       message: `Notification sent to ${user.name || userId}`,
       fcmDelivered: fcmResult.success,
+      tokenFound: !!effectiveToken,
     });
   } catch (err) {
     console.error("❌ sendIndividualNotification error:", err);
@@ -294,15 +342,13 @@ const sendIndividualNotification = async (req, res) => {
 };
 
 /**
- * 📥 Get user notifications (driver or customer — filtered by role)
- * Called by: GET /api/notifications  (with user auth)
+ * 📥 Get user notifications
  */
 const getUserNotifications = async (req, res) => {
   try {
     const userId = req.user._id;
     const { page = 1, limit = 20, unreadOnly = false } = req.query;
 
-    // ✅ Use isDriver (reliable) to determine role
     const userRole = req.user.isDriver ? "driver" : "customer";
     const query = { userId, role: userRole };
 
@@ -339,14 +385,11 @@ const getUserNotifications = async (req, res) => {
 
 /**
  * 🎁 Get latest 5 offers for the logged-in user
- * Called by: GET /api/notifications/offers  (with user auth)
  */
 const getOffers = async (req, res) => {
   try {
     const userId = req.user._id;
     const userRole = req.user.isDriver ? "driver" : "customer";
-
-    console.log(`🎁 Fetching offers for user: ${userId} (${userRole})`);
 
     const offers = await Notification.find({
       userId,
@@ -356,8 +399,6 @@ const getOffers = async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(5)
       .lean();
-
-    console.log(`✅ Found ${offers.length} offers for user ${userId}`);
 
     res.status(200).json({
       success: true,
@@ -371,23 +412,16 @@ const getOffers = async (req, res) => {
 };
 
 /**
- * 🎁 Admin: Get all unique promotion offers (for admin panel display)
- * Called by: GET /api/admin/offers/all  (with admin auth)
+ * 🎁 Admin: Get all unique promotion offers
  */
 const getAllOffersAdmin = async (req, res) => {
   try {
-    console.log("🎁 Admin fetching all offers...");
-
     const offers = await Notification.aggregate([
       { $match: { type: "promotion" } },
       { $sort: { createdAt: -1 } },
       {
         $group: {
-          _id: {
-            title: "$title",
-            body: "$body",
-            imageUrl: "$imageUrl",
-          },
+          _id: { title: "$title", body: "$body", imageUrl: "$imageUrl" },
           _docId: { $first: "$_id" },
           title: { $first: "$title" },
           body: { $first: "$body" },
@@ -412,13 +446,7 @@ const getAllOffersAdmin = async (req, res) => {
       },
     ]);
 
-    console.log(`✅ Admin found ${offers.length} unique offers`);
-
-    res.status(200).json({
-      success: true,
-      offers,
-      count: offers.length,
-    });
+    res.status(200).json({ success: true, offers, count: offers.length });
   } catch (err) {
     console.error("❌ getAllOffersAdmin error:", err);
     res.status(500).json({ success: false, message: err.message });
@@ -426,27 +454,15 @@ const getAllOffersAdmin = async (req, res) => {
 };
 
 /**
- * 🗑️ Admin delete all instances of an offer (removes for all users)
- * Called by: DELETE /api/admin/offers/:id
+ * 🗑️ Admin delete offer (removes for all users)
  */
 const deleteOffer = async (req, res) => {
   try {
     const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({
-        success: false,
-        message: "Offer ID is required",
-      });
-    }
+    if (!id) return res.status(400).json({ success: false, message: "Offer ID is required" });
 
     const offer = await Notification.findById(id);
-    if (!offer) {
-      return res.status(404).json({
-        success: false,
-        message: "Offer not found",
-      });
-    }
+    if (!offer) return res.status(404).json({ success: false, message: "Offer not found" });
 
     const deleteResult = await Notification.deleteMany({
       title: offer.title,
@@ -455,11 +471,9 @@ const deleteOffer = async (req, res) => {
       type: "promotion",
     });
 
-    console.log(`✅ Deleted ${deleteResult.deletedCount} offer instances`);
-
     res.status(200).json({
       success: true,
-      message: `Offer deleted successfully (${deleteResult.deletedCount} instances removed)`,
+      message: `Offer deleted (${deleteResult.deletedCount} instances removed)`,
       deletedCount: deleteResult.deletedCount,
     });
   } catch (err) {
@@ -483,10 +497,7 @@ const markAsRead = async (req, res) => {
     );
 
     if (!notification) {
-      return res.status(404).json({
-        success: false,
-        message: "Notification not found",
-      });
+      return res.status(404).json({ success: false, message: "Notification not found" });
     }
 
     res.status(200).json({ success: true, notification });
@@ -497,7 +508,7 @@ const markAsRead = async (req, res) => {
 };
 
 /**
- * 👍👍 Mark all notifications as read
+ * 👍👍 Mark all as read
  */
 const markAllAsRead = async (req, res) => {
   try {
@@ -509,10 +520,7 @@ const markAllAsRead = async (req, res) => {
       { isRead: true }
     );
 
-    res.status(200).json({
-      success: true,
-      message: "All notifications marked as read",
-    });
+    res.status(200).json({ success: true, message: "All notifications marked as read" });
   } catch (err) {
     console.error("❌ markAllAsRead error:", err);
     res.status(500).json({ success: false, message: err.message });
@@ -520,29 +528,20 @@ const markAllAsRead = async (req, res) => {
 };
 
 /**
- * 🗑️ Delete notification (user deletes their own)
+ * 🗑️ Delete one notification (user's own)
  */
 const deleteNotification = async (req, res) => {
   try {
     const { notificationId } = req.params;
     const userId = req.user._id;
 
-    const notification = await Notification.findOneAndDelete({
-      _id: notificationId,
-      userId,
-    });
+    const notification = await Notification.findOneAndDelete({ _id: notificationId, userId });
 
     if (!notification) {
-      return res.status(404).json({
-        success: false,
-        message: "Notification not found",
-      });
+      return res.status(404).json({ success: false, message: "Notification not found" });
     }
 
-    res.status(200).json({
-      success: true,
-      message: "Notification deleted",
-    });
+    res.status(200).json({ success: true, message: "Notification deleted" });
   } catch (err) {
     console.error("❌ deleteNotification error:", err);
     res.status(500).json({ success: false, message: err.message });
@@ -559,10 +558,7 @@ const clearAllNotifications = async (req, res) => {
 
     await Notification.deleteMany({ userId, role: userRole });
 
-    res.status(200).json({
-      success: true,
-      message: "All notifications cleared",
-    });
+    res.status(200).json({ success: true, message: "All notifications cleared" });
   } catch (err) {
     console.error("❌ clearAllNotifications error:", err);
     res.status(500).json({ success: false, message: err.message });
@@ -586,8 +582,9 @@ const sendReassignmentNotification = async (driverId, tripId) => {
       data: { tripId: tripId.toString() },
     });
 
-    if (driver.fcmToken) {
-      await sendToDriver(driver.fcmToken, {
+    const token = getEffectiveFcmToken(driver);
+    if (token) {
+      await sendToDriver(token, {
         notificationType: "TRIP_REASSIGNED",
         title: "Trip Reassigned",
         body: "You have been reassigned to a trip.",

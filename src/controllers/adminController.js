@@ -760,7 +760,7 @@ export const sendPushToUsers = async (req, res) => {
 
     const users = await User.find(
       role === "driver" ? { isDriver: true } : { isDriver: false }
-    );
+    ).select("_id fcmToken currentFcmToken isDriver name");
     
     // 🔥 FIX: Prevent double-sending to the same token
     const processedTokens = new Set();
@@ -770,12 +770,13 @@ export const sendPushToUsers = async (req, res) => {
     for (const user of users) {
       try {
         // 🛡️ Skip if token already processed in this run
-        if (user.fcmToken) {
-          if (processedTokens.has(user.fcmToken)) {
+        const effectiveToken = user.fcmToken || user.currentFcmToken || null;
+        if (effectiveToken) {
+          if (processedTokens.has(effectiveToken)) {
             console.log(`🛡️ Skipping duplicate token for user ${user._id}`);
             continue;
           }
-          processedTokens.add(user.fcmToken);
+          processedTokens.add(effectiveToken);
         }
 
         await createAndSendNotification({
@@ -786,7 +787,7 @@ export const sendPushToUsers = async (req, res) => {
           imageUrl: imageUrl || null,
         });
         successCount++;
-        if (user.fcmToken) fcmSuccessCount++;
+        if (effectiveToken) fcmSuccessCount++;
       } catch (err) {
         console.error(`❌ Failed for user ${user._id}:`, err.message);
       }
@@ -936,10 +937,11 @@ export const createAndSendNotification = async ({
   });
 
   // ✅ Send FCM with image
-  if (user.fcmToken) {
+  const effectiveToken = user.fcmToken || user.currentFcmToken || null;
+  if (effectiveToken) {
     await sendFCMNotification({
       userId: user._id,
-      token: user.fcmToken,
+      token: effectiveToken,
       title,
       body,
       type,
