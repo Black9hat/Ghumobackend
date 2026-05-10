@@ -193,6 +193,8 @@ export const getDriverProfile = async (req, res) => {
         role: driver.role || "customer",
         isDriver: driver.isDriver || false,
         isVerified: driver.isVerified || false,
+        currentDeviceId: driver.currentDeviceId || null,
+sessionActive: driver.sessionActive || false,
       },
     });
   } catch (err) {
