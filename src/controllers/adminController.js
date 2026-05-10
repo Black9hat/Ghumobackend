@@ -15,7 +15,6 @@ import DriverDoc from "../models/DriverDoc.js";
 import Notification from "../models/Notification.js";
 // ✅ USE SAFE FCM HELPER
 import { sendFCMNotification } from "../utils/fcmHelper.js";
-import { sendToCustomer, sendToDriver } from "../utils/fcmSender.js";
 import { verifyAdminToken } from "../middlewares/adminAuth.js";
 import { recomputeDriverDocumentStatus } from "./documentController.js";
 
@@ -689,11 +688,10 @@ export const manualAssignDriver = async (req, res) => {
     trip.status = "assigned";
     await trip.save();
 
-    const driverToken = driver.fcmToken || driver.currentFcmToken || null;
-    if (driverToken) {
+    if (driver.fcmToken) {
       await sendFCMNotification({
         userId: driver._id,
-        token: driverToken,
+        token: driver.fcmToken,
         title: "New Trip Assigned",
         body: "You have a new trip assignment",
         type: "trip",
@@ -941,27 +939,21 @@ export const createAndSendNotification = async ({
   // ✅ Send FCM with image
   const effectiveToken = user.fcmToken || user.currentFcmToken || null;
   if (effectiveToken) {
-    if (user.isDriver) {
-      await sendToDriver(effectiveToken, {
-        notificationType: "ADMIN_NOTIFICATION",
-        title,
-        body,
-        type,
-        imageUrl,
-        ctaText,
-        ctaRoute,
-        ...data,
-      });
-    } else {
-      await sendToCustomer(effectiveToken, title, body, {
-        type,
-        imageUrl,
+    await sendFCMNotification({
+      userId: user._id,
+      token: effectiveToken,
+      title,
+      body,
+      type,
+      imageUrl,  // ✅ Pass image to FCM
+      data: {
         notificationId: notification._id.toString(),
+        type,
         ctaRoute: ctaRoute ?? "",
-        ctaText: ctaText ?? "",
+        imageUrl: imageUrl ?? "",
         ...data,
-      });
-    }
+      },
+    });
   }
 
   return notification;
@@ -999,22 +991,15 @@ export const sendPushToIndividual = async (req, res) => {
     });
 
     // ✅ Send FCM with image
-    const effectiveToken = user.fcmToken || user.currentFcmToken || null;
-    if (effectiveToken) {
-      if (user.isDriver) {
-        await sendToDriver(effectiveToken, {
-          notificationType: "ADMIN_NOTIFICATION",
-          title,
-          body,
-          type,
-          imageUrl: imageUrl || null,
-        });
-      } else {
-        await sendToCustomer(effectiveToken, title, body, {
-          type,
-          imageUrl: imageUrl || null,
-        });
-      }
+    if (user.fcmToken) {
+      await sendFCMNotification({
+        userId: user._id,
+        token: user.fcmToken,
+        title,
+        body,
+        type,
+        imageUrl: imageUrl || null,  // ✅ Pass image to FCM
+      });
     }
 
     res.status(200).json({
