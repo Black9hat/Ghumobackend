@@ -15,6 +15,7 @@ import DriverDoc from "../models/DriverDoc.js";
 import Notification from "../models/Notification.js";
 // ✅ USE SAFE FCM HELPER
 import { sendFCMNotification } from "../utils/fcmHelper.js";
+import { sendToDriver } from "../utils/fcmSender.js";
 import { verifyAdminToken } from "../middlewares/adminAuth.js";
 import { recomputeDriverDocumentStatus } from "./documentController.js";
 
@@ -939,21 +940,33 @@ export const createAndSendNotification = async ({
   // ✅ Send FCM with image
   const effectiveToken = user.fcmToken || user.currentFcmToken || null;
   if (effectiveToken) {
-    await sendFCMNotification({
-      userId: user._id,
-      token: effectiveToken,
-      title,
-      body,
-      type,
-      imageUrl,  // ✅ Pass image to FCM
-      data: {
-        notificationId: notification._id.toString(),
+    if (user.isDriver) {
+      // Drivers need a notification block so images show when app is killed
+      await sendToDriver(effectiveToken, {
+        notificationType: "ADMIN_NOTIFICATION",
+        title,
+        body,
         type,
-        ctaRoute: ctaRoute ?? "",
-        imageUrl: imageUrl ?? "",
+        imageUrl,
         ...data,
-      },
-    });
+      });
+    } else {
+      await sendFCMNotification({
+        userId: user._id,
+        token: effectiveToken,
+        title,
+        body,
+        type,
+        imageUrl, // ✅ Pass image to FCM
+        data: {
+          notificationId: notification._id.toString(),
+          type,
+          ctaRoute: ctaRoute ?? "",
+          imageUrl: imageUrl ?? "",
+          ...data,
+        },
+      });
+    }
   }
 
   return notification;
