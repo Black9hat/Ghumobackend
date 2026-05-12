@@ -148,6 +148,17 @@ function normalizeDriverForCustomerPayload(rawDriver) {
   return driver;
 }
 
+function isMeaningfulString(val) {
+  return typeof val === 'string' && val.trim().toLowerCase() !== 'null' && val.trim() !== '';
+}
+
+function cleanDriverObject(driver) {
+  if (!driver || typeof driver !== 'object') return driver;
+  if (!isMeaningfulString(driver.vehicleNumber)) delete driver.vehicleNumber;
+  if (!isMeaningfulString(driver.vehicleType)) delete driver.vehicleType;
+  return driver;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ════════════════════════════════════════════════════════════════════════════
@@ -854,6 +865,9 @@ const cancelTrip = async (req, res) => {
 
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
     if (trip.status === 'cancelled') return res.status(400).json({ success: false, message: 'Already cancelled' });
+    if (trip.assignedDriver) {
+      trip.assignedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
+    }
     if (trip.status === 'completed') return res.status(400).json({ success: false, message: 'Cannot cancel completed trip' });
 
     const isCustomer = trip.customerId?._id?.toString() === cancelledBy;
@@ -1794,7 +1808,7 @@ const getTripById = async (req, res) => {
       .lean();                          // ← ADD .lean()
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
     if (trip.assignedDriver) {
-      trip.assignedDriver = normalizeDriverForCustomerPayload(trip.assignedDriver);
+      trip.assignedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
     }
     return res.status(200).json({ success: true, trip });
   } catch (err) {
@@ -1809,6 +1823,9 @@ const getTripByIdWithPayment = async (req, res) => {
       .populate('customerId',    'name phone')
       .lean();
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
+    if (trip.assignedDriver) {
+      trip.assignedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
+    }
     return res.status(200).json({ success: true, trip });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -1930,7 +1947,7 @@ const getActiveRide = async (req, res) => {
 
     if (!trip) return res.status(200).json({ success: true, hasActiveRide: false });
 
-  const normalizedDriver = normalizeDriverForCustomerPayload(trip.assignedDriver);
+  const normalizedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
 
   return res.status(200).json({
   success:       true,
@@ -2007,6 +2024,10 @@ const requestTripSupport = async (req, res) => {
       .populate('assignedDriver','name phone vehicleNumber');
 
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
+
+    if (trip.assignedDriver) {
+      trip.assignedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
+    }
 
     if (io) {
       io.to('admin-room').emit('admin:support_request', {
