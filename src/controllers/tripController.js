@@ -1866,12 +1866,17 @@ const getActiveRide = async (req, res) => {
 
     if (!trip) return res.status(200).json({ success: true, hasActiveRide: false });
 
-    return res.status(200).json({
-      success:      true,
-      hasActiveRide: true,
-      trip:    { tripId: trip._id.toString(), status: trip.status, fare: trip.fare },
-      driver:  trip.assignedDriver,
-    });
+   return res.status(200).json({
+  success:       true,
+  hasActiveRide: true,
+  trip: {
+    tripId:          trip._id.toString(),
+    status:          trip.status,
+    fare:            trip.fare,
+    assignedDriver:  trip.assignedDriver,   // ← ADD THIS
+  },
+  driver: trip.assignedDriver,
+});
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
