@@ -90,6 +90,64 @@ function calculateDistanceFromCoords(lat1, lon1, lat2, lon2) {
 
 function toRad(v) { return (v * Math.PI) / 180; }
 
+function pickFirstNonEmpty(source, keys = []) {
+  if (!source || typeof source !== 'object') return null;
+  for (const key of keys) {
+    const value = source[key];
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+function normalizeDriverForCustomerPayload(rawDriver) {
+  if (!rawDriver || typeof rawDriver !== 'object') return null;
+
+  const driver = { ...rawDriver };
+  const nestedVehicle =
+    driver.vehicle && typeof driver.vehicle === 'object' ? driver.vehicle : null;
+
+  const vehicleNumberKeys = [
+    'vehicleNumber',
+    'vehicle_number',
+    'vehicleNo',
+    'vehicle_no',
+    'plateNumber',
+    'plate_number',
+    'registrationNumber',
+    'registration_number',
+    'registrationNo',
+    'regNo',
+    'licensePlate',
+    'number',
+    'plate',
+    'reg',
+  ];
+
+  const vehicleTypeKeys = ['vehicleType', 'vehicle_type', 'category', 'rideType', 'type'];
+
+  if (!pickFirstNonEmpty(driver, ['vehicleNumber'])) {
+    const normalizedVehicleNumber =
+      pickFirstNonEmpty(driver, vehicleNumberKeys) ||
+      pickFirstNonEmpty(nestedVehicle, vehicleNumberKeys);
+    if (normalizedVehicleNumber) {
+      driver.vehicleNumber = normalizedVehicleNumber;
+    }
+  }
+
+  if (!pickFirstNonEmpty(driver, ['vehicleType'])) {
+    const normalizedVehicleType =
+      pickFirstNonEmpty(driver, vehicleTypeKeys) ||
+      pickFirstNonEmpty(nestedVehicle, vehicleTypeKeys);
+    if (normalizedVehicleType) {
+      driver.vehicleType = normalizedVehicleType;
+    }
+  }
+
+  return driver;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ════════════════════════════════════════════════════════════════════════════
@@ -1735,6 +1793,9 @@ const getTripById = async (req, res) => {
       .populate('customerId', 'name phone photoUrl rating')
       .lean();                          // ← ADD .lean()
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
+    if (trip.assignedDriver) {
+      trip.assignedDriver = normalizeDriverForCustomerPayload(trip.assignedDriver);
+    }
     return res.status(200).json({ success: true, trip });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -1869,6 +1930,8 @@ const getActiveRide = async (req, res) => {
 
     if (!trip) return res.status(200).json({ success: true, hasActiveRide: false });
 
+  const normalizedDriver = normalizeDriverForCustomerPayload(trip.assignedDriver);
+
   return res.status(200).json({
   success:       true,
   hasActiveRide: true,
@@ -1876,9 +1939,9 @@ const getActiveRide = async (req, res) => {
     tripId:          trip._id.toString(),
     status:          trip.status,
     fare:            trip.fare,
-    assignedDriver:  trip.assignedDriver,   // ← ADD THIS
+    assignedDriver:  normalizedDriver,
   },
-  driver: trip.assignedDriver,
+  driver: normalizedDriver,
 });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
