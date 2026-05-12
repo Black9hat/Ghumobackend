@@ -1730,7 +1730,10 @@ const completeTrip = async (req, res) => {
 
 const getTripById = async (req, res) => {
   try {
-    const trip = await Trip.findById(req.params.id).populate('assignedDriver customerId');
+    const trip = await Trip.findById(req.params.id)
+      .populate('assignedDriver', 'name phone photoUrl rating vehicleBrand vehicleNumber vehicleModel vehicle location')
+      .populate('customerId', 'name phone photoUrl rating')
+      .lean();                          // ← ADD .lean()
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
     return res.status(200).json({ success: true, trip });
   } catch (err) {
@@ -1866,7 +1869,7 @@ const getActiveRide = async (req, res) => {
 
     if (!trip) return res.status(200).json({ success: true, hasActiveRide: false });
 
-   return res.status(200).json({
+  return res.status(200).json({
   success:       true,
   hasActiveRide: true,
   trip: {
