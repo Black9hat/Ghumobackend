@@ -1861,8 +1861,8 @@ const getActiveRide = async (req, res) => {
         $in: ['driver_assigned', 'driver_going_to_pickup', 'driver_at_pickup', 'ride_started'],
       },
     })
-      .populate('assignedDriver', 'name phone photoUrl rating vehicleBrand vehicleNumber location')
-      .lean();
+ .populate('assignedDriver', 'name phone photoUrl rating vehicleBrand vehicleNumber vehicle location')
+       .lean();
 
     if (!trip) return res.status(200).json({ success: true, hasActiveRide: false });
 
