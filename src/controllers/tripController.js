@@ -159,6 +159,27 @@ function cleanDriverObject(driver) {
   return driver;
 }
 
+async function resolveDriverProfileForTripResponse(rawDriver) {
+  if (!rawDriver) return null;
+
+  const driverId = rawDriver?._id?.toString?.() || rawDriver?.toString?.() || null;
+  let driver = rawDriver;
+
+  if (!driver || typeof driver !== 'object' || (!isMeaningfulString(driver.vehicleNumber) && !isMeaningfulString(driver.vehicleType))) {
+    if (driverId) {
+      const reloadedDriver = await User.findById(driverId)
+        .select('name phone photoUrl rating vehicleBrand vehicleNumber vehicleType vehicleModel vehicle location')
+        .lean();
+
+      if (reloadedDriver) {
+        driver = reloadedDriver;
+      }
+    }
+  }
+
+  return cleanDriverObject(normalizeDriverForCustomerPayload(driver));
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ════════════════════════════════════════════════════════════════════════════
@@ -1805,10 +1826,10 @@ const getTripById = async (req, res) => {
     const trip = await Trip.findById(req.params.id)
       .populate('assignedDriver', 'name phone photoUrl rating vehicleBrand vehicleNumber vehicleModel vehicle location')
       .populate('customerId', 'name phone photoUrl rating')
-      .lean();                          // ← ADD .lean()
+      .lean();
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
     if (trip.assignedDriver) {
-      trip.assignedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
+      trip.assignedDriver = await resolveDriverProfileForTripResponse(trip.assignedDriver);
     }
     return res.status(200).json({ success: true, trip });
   } catch (err) {
@@ -1824,7 +1845,7 @@ const getTripByIdWithPayment = async (req, res) => {
       .lean();
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
     if (trip.assignedDriver) {
-      trip.assignedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
+      trip.assignedDriver = await resolveDriverProfileForTripResponse(trip.assignedDriver);
     }
     return res.status(200).json({ success: true, trip });
   } catch (err) {
@@ -1942,24 +1963,24 @@ const getActiveRide = async (req, res) => {
         $in: ['driver_assigned', 'driver_going_to_pickup', 'driver_at_pickup', 'ride_started'],
       },
     })
- .populate('assignedDriver', 'name phone photoUrl rating vehicleBrand vehicleNumber vehicle location')
-       .lean();
+      .populate('assignedDriver', 'name phone photoUrl rating vehicleBrand vehicleNumber vehicle location')
+      .lean();
 
     if (!trip) return res.status(200).json({ success: true, hasActiveRide: false });
 
-  const normalizedDriver = cleanDriverObject(normalizeDriverForCustomerPayload(trip.assignedDriver));
+    const normalizedDriver = await resolveDriverProfileForTripResponse(trip.assignedDriver);
 
-  return res.status(200).json({
-  success:       true,
-  hasActiveRide: true,
-  trip: {
-    tripId:          trip._id.toString(),
-    status:          trip.status,
-    fare:            trip.fare,
-    assignedDriver:  normalizedDriver,
-  },
-  driver: normalizedDriver,
-});
+    return res.status(200).json({
+      success: true,
+      hasActiveRide: true,
+      trip: {
+        tripId:         trip._id.toString(),
+        status:         trip.status,
+        fare:           trip.fare,
+        assignedDriver: normalizedDriver,
+      },
+      driver: normalizedDriver,
+    });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
