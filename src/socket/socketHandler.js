@@ -825,6 +825,32 @@ export const initSocket = (ioInstance) => {
           blockedByPendingCommission: !!isOnline && !effectiveOnline,
         });
 
+        // ✅ ADMIN REAL-TIME: Broadcast driver location + status to admin panel
+        if (set.location?.coordinates) {
+          const [dLng, dLat] = set.location.coordinates;
+          io.to('admin-room').emit('admin:driverLocationUpdate', {
+            driverId: userIdStr,
+            lat: dLat,
+            lng: dLng,
+            isOnline: effectiveOnline,
+            vehicleType: set.vehicleType || user.vehicleType || 'auto',
+            name: set.name || user.name,
+            phone: user.phone,
+            vehicleNumber: set.vehicleNumber || user.vehicleNumber,
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        // ✅ ADMIN REAL-TIME: Always broadcast online/offline status changes
+        io.to('admin-room').emit('admin:driverStatusChange', {
+          driverId: userIdStr,
+          isOnline: effectiveOnline,
+          vehicleType: set.vehicleType || user.vehicleType || 'auto',
+          name: user.name,
+          phone: user.phone,
+          timestamp: new Date().toISOString(),
+        });
+
         console.log(`📶 Driver ${userIdStr} is now ${effectiveOnline ? 'ONLINE ✅' : 'OFFLINE 🔴'}`);
       } catch (e) {
         emitTripError({ socket, message: 'Failed to update driver status.' });
@@ -1722,6 +1748,16 @@ export const initSocket = (ioInstance) => {
         } else {
           console.warn(`⚠️ No socket found for customer ${customerIdStr} — location update dropped`);
         }
+
+        // ✅ ADMIN REAL-TIME: Also push live location to admin panel during active trip
+        io.to('admin-room').emit('admin:driverLocationUpdate', {
+          driverId,
+          lat: latitude,
+          lng: longitude,
+          tripId: tripId.toString(),
+          isOnline: true,
+          timestamp: new Date().toISOString(),
+        });
       } catch (e) {
         console.error('❌ driver:location error:', e);
       }

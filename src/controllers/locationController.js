@@ -160,6 +160,17 @@ const updateDriverLocation = async (req, res) => {
 
           io.to(customer.socketId).emit('driver:locationUpdate', payload);
           console.log(`📡 HTTP → Emitted location to customer socket: ${customer.socketId}`);
+
+          // ✅ ADMIN REAL-TIME: Also push to admin panel via HTTP path
+          io.to('admin-room').emit('admin:driverLocationUpdate', {
+            driverId: user._id.toString(),
+            lat: coords[1],
+            lng: coords[0],
+            bearing: calculatedBearing,
+            tripId,
+            isOnline: true,
+            timestamp: new Date().toISOString(),
+          });
         } else {
           console.log(`⚠️ Customer socket not found for trip ${tripId}`);
         }

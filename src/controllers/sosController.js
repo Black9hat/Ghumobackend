@@ -3,6 +3,13 @@ import SosAlert from "../models/SosAlert.js";
 import Trip from "../models/Trip.js";
 import User from "../models/User.js";
 
+const DEFAULT_RESOLVED_RETRIGGER_COOLDOWN_MS = 2 * 60 * 1000;
+
+const getResolvedRetriggerCooldownMs = () => {
+  const raw = Number(process.env.SOS_RESOLVED_RETRIGGER_COOLDOWN_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_RESOLVED_RETRIGGER_COOLDOWN_MS;
+};
+
 /* =====================================================
    TRIGGER SOS ALERT
    POST /api/sos/trigger
@@ -37,6 +44,21 @@ export const triggerSos = async (req, res) => {
 
     // ── 2. Rate limit — block if a SOS was triggered in last 10 seconds ───
     const lastSos = await SosAlert.findOne({ tripId }).sort({ createdAt: -1 });
+    const cooldownMs = getResolvedRetriggerCooldownMs();
+    if (
+      cooldownMs > 0 &&
+      lastSos?.status === "RESOLVED" &&
+      lastSos.resolvedAt &&
+      Date.now() - new Date(lastSos.resolvedAt).getTime() < cooldownMs
+    ) {
+      return res.status(200).json({
+        success: true,
+        suppressed: true,
+        message: "SOS was already resolved recently. Duplicate trigger ignored.",
+        alert: lastSos,
+      });
+    }
+
     if (lastSos && Date.now() - new Date(lastSos.createdAt).getTime() < 10000) {
       return res.status(429).json({
         success: false,
@@ -354,8 +376,8 @@ export const resolveSos = async (req, res) => {
       });
     }
 
-    const sosAlert = await SosAlert.findByIdAndUpdate(
-      sos_id,
+    const sosAlert = await SosAlert.findOneAndUpdate(
+      { _id: sos_id, status: "ACTIVE" },
       {
         $set: {
           status:     "RESOLVED",
@@ -370,6 +392,16 @@ export const resolveSos = async (req, res) => {
     );
 
     if (!sosAlert) {
+      const existingSos = await SosAlert.findById(sos_id);
+      if (existingSos?.status === "RESOLVED") {
+        return res.status(200).json({
+          success: true,
+          alreadyResolved: true,
+          message: "SOS alert already resolved",
+          alert: existingSos,
+        });
+      }
+
       return res.status(404).json({
         success: false,
         message: "SOS alert not found",
