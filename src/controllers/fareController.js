@@ -1,7 +1,7 @@
 import asyncHandler from "express-async-handler";
 import Rate from "../models/Rate.js";
 import { calcFare } from "../utils/fareCalc.js";
-import { getGoogleRouteDuration } from "../utils/getGoogleRouteDuration.js";
+import { getOlaRouteDuration } from "../utils/getOlaRouteDuration.js"; // ✅ Ola Maps (replaces Google)
 import User from "../models/User.js";
 import AppSettings from "../models/AppSettings.js";
 // 🪙 Coins: preview how many coins the customer will earn for this ride
@@ -9,7 +9,8 @@ import { calculateCoinsForRide, getCoinsConfig } from "../services/coinService.j
 
 /**
  * POST /api/fares/calc
- * Calculates smart, time-based, competitive fares using shared Google Maps data.
+ * Calculates smart, time-based, competitive fares using Ola Maps route data.
+ * Each vehicle gets its own adjusted duration from Ola Maps.
  */
 export const createFare = asyncHandler(async (req, res) => {
   const {
@@ -37,38 +38,39 @@ export const createFare = asyncHandler(async (req, res) => {
   }
 
   /* ---------------------------------------------------------
-   * 1️⃣ Fetch shared route data (only once for all vehicles)
+   * 1️⃣ Fetch Ola Maps route — per vehicle type
+   *    Distance is same for all vehicles (road distance).
+   *    Duration is adjusted per vehicle inside getOlaRouteDuration
+   *    (bike 0.6×, auto 0.8×, car 1.0×, premium 1.05×, xl 1.1×)
    * --------------------------------------------------------- */
-  let sharedRoute = null;
-  if (origin && destination) {
-  const gStart = process.hrtime.bigint(); // ⏱ START Google timer
-  try {
-    console.log("📡 Fetching Google route (shared for all vehicles)...");
-    sharedRoute = await getGoogleRouteDuration(origin, destination, "car");
+  let liveDistanceKm = distanceKm;
+  let liveDurationMin = durationMin || 15;
 
-    if (sharedRoute) {
-      console.log(
-        `✅ Google Route (car): ${sharedRoute.distanceKm.toFixed(2)} km | ${(sharedRoute.durationSec / 60).toFixed(1)} mins`
-      );
-    }
-  } catch (err) {
-    console.error("⚠️ Google Maps fetch failed:", err.message);
-  } finally {
-    // ⏱ END Google timer (store in profiler)
-    if (req.__profile) {
-      req.__profile.googleMs += Number(
-        process.hrtime.bigint() - gStart
-      ) / 1e6;
+  if (origin && destination) {
+    const gStart = process.hrtime.bigint(); // ⏱ START timer
+    try {
+      console.log(`📡 Fetching Ola Maps route for ${vType}...`);
+      const olaRoute = await getOlaRouteDuration(origin, destination, vType);
+
+      if (olaRoute) {
+        liveDistanceKm  = olaRoute.distanceKm;
+        liveDurationMin = olaRoute.durationSec / 60;
+        console.log(
+          `✅ Ola Maps (${vType}): ${liveDistanceKm.toFixed(2)} km | ${liveDurationMin.toFixed(1)} mins`
+        );
+      } else {
+        console.warn(`⚠️ Ola Maps returned null for ${vType} — using fallback values`);
+      }
+    } catch (err) {
+      console.error("⚠️ Ola Maps fetch failed:", err.message);
+    } finally {
+      if (req.__profile) {
+        req.__profile.googleMs += Number(
+          process.hrtime.bigint() - gStart
+        ) / 1e6;
+      }
     }
   }
-}
-
-
-  // Use shared route for all vehicles
-  let liveDistanceKm = sharedRoute?.distanceKm || distanceKm;
-  let liveDurationMin = sharedRoute
-    ? sharedRoute.durationSec / 60
-    : durationMin || 15;
 
   /* ---------------------------------------------------------
    * 2️⃣ Fetch DB Rate
@@ -80,15 +82,16 @@ export const createFare = asyncHandler(async (req, res) => {
   };
   if (category !== "long") query.city = new RegExp(`^${city}$`, "i");
 
-const dbStart = process.hrtime.bigint(); // ⏱ START Mongo timer
-const dbRate = await Rate.findOne(query);
+  const dbStart = process.hrtime.bigint(); // ⏱ START Mongo timer
+  const dbRate = await Rate.findOne(query);
 
-// ⏱ END Mongo timer
-if (req.__profile) {
-  req.__profile.mongoMs += Number(
-    process.hrtime.bigint() - dbStart
-  ) / 1e6;
-}
+  // ⏱ END Mongo timer
+  if (req.__profile) {
+    req.__profile.mongoMs += Number(
+      process.hrtime.bigint() - dbStart
+    ) / 1e6;
+  }
+
   if (dbRate)
     console.log("📦 [DB RATE FOUND]", {
       vehicleType: dbRate.vehicleType,
@@ -101,18 +104,10 @@ if (req.__profile) {
   const rate = dbRate || { vehicleType: vType, category };
 
   /* ---------------------------------------------------------
-   * 3️⃣ Apply per-vehicle travel time adjustment
+   * 3️⃣ Timestamps for peak/night detection
+   * NOTE: vehicleTimeFactor removed — duration now comes
+   *       correctly adjusted per vehicle from Ola Maps above.
    * --------------------------------------------------------- */
-  const vehicleTimeFactor = {
-    bike: 0.8, // faster
-    auto: 0.9,
-    car: 1.0,
-    premium: 1.05,
-    xl: 1.1,
-  }[vType] || 1.0;
-
-  liveDurationMin *= vehicleTimeFactor;
-
   const startTime = new Date().toISOString();
   const dropTime = new Date(Date.now() + liveDurationMin * 60 * 1000).toISOString();
 
@@ -215,7 +210,7 @@ if (req.__profile) {
   res.json({
     ok: true,
     rateSource: dbRate ? "db" : "internal",
-    usedGoogleData: !!(origin && destination),
+    usedOlaMaps: !!(origin && destination), // ✅ renamed from usedGoogleData
     ...result,
     // 🪙 Coins the user will earn for completing this ride (shown under fare in Flutter)
     coinsEarn,
