@@ -4,6 +4,7 @@
  * ✅ Fare = Admin-controlled via DB rate document
  * ✅ Multipliers: peak, night, manualSurge (from DB only)
  * ✅ platformFee = from DB (rate.platformFee) — no tiered hardcoding
+ * ✅ thresholdKm = from DB — after this km, fare = perKm × distanceKm
  * ✅ Surge applied to minFare too — night/peak multiplier applies even when minFare kicks in
  * ❌ No discounts, no competitor logic
  * ❌ Incentive is NOT part of fare (handled separately)
@@ -29,7 +30,7 @@ export function calcFare({
   if (category !== "short") throw new Error(`Unsupported category: ${category}`);
 
   const vehicle = rate.vehicleType?.toLowerCase?.() || "bike";
-const roundOff = (num) => Math.ceil(num);
+  const roundOff = (num) => Math.ceil(num);
 
   // ─────────────────────────────────────────────────────
   // 2️⃣ INTERNAL FALLBACK CONFIG (if DB missing values)
@@ -55,6 +56,9 @@ const roundOff = (num) => Math.ceil(num);
   const platformCommission = (rate.platformFeePercent ?? (fallback.platformCommission * 100)) / 100;
   const gstPercent         = rate.gstPercent ?? 0;
 
+  // ✅ thresholdKm from DB — admin-controlled, default 6
+  const thresholdKm = rate.thresholdKm ?? 6;
+
   // ─────────────────────────────────────────────────────
   // 4️⃣ PLATFORM FEE — from DB only (rate.platformFee)
   // ─────────────────────────────────────────────────────
@@ -62,25 +66,37 @@ const roundOff = (num) => Math.ceil(num);
 
   // ─────────────────────────────────────────────────────
   // 5️⃣ BASE FARE CALCULATION
+  // After thresholdKm → fare = perKm × distanceKm (pure per-km, fare ÷ km = perKm exactly)
+  // Within thresholdKm → normal baseFare + chargeableDistance formula
   // ─────────────────────────────────────────────────────
   const chargeableDistance = Math.max(0, distanceKm - baseDistance);
 
-  let baseFareTotal =
-    baseFare +
-    (chargeableDistance * perKm) +
-    platformFee +
-    (durationMin * perMin);
+  let baseFareTotal;
+
+  if (distanceKm > thresholdKm) {
+    // Pure per-km pricing after threshold — fare ÷ km = perKm exactly
+    baseFareTotal = (perKm * distanceKm) + platformFee + (durationMin * perMin);
+    console.log(
+      `📐 Threshold applied (>${thresholdKm}km): fare = ${perKm} × ${distanceKm} = ₹${baseFareTotal.toFixed(2)}`
+    );
+  } else {
+    baseFareTotal =
+      baseFare +
+      (chargeableDistance * perKm) +
+      platformFee +
+      (durationMin * perMin);
+  }
 
   // ─────────────────────────────────────────────────────
   // 6️⃣ TIME ANALYSIS (Peak / Night Detection)
   // ─────────────────────────────────────────────────────
-const hour = Number(
-  new Date(startTime || new Date()).toLocaleString("en-IN", {
-    timeZone: "Asia/Kolkata",
-    hour: "numeric",
-    hour12: false,
-  })
-);
+  const hour = Number(
+    new Date(startTime || new Date()).toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour: "numeric",
+      hour12: false,
+    })
+  );
   const peakHour  = (hour >= 7 && hour < 10) || (hour >= 17 && hour < 21);
   const nightHour = hour >= 22 || hour < 6;
 
@@ -109,7 +125,7 @@ const hour = Number(
 
   let finalFare = baseFareTotal * surgeMultiplier;
 
-  // Surge also applies to minFare — e.g. night surge 1.5 → minFare ₹165 × 1.5 = ₹248
+  // Surge also applies to minFare — e.g. night surge 1.5 → minFare × 1.5
   const surgedMinFare = roundOff(minFare * surgeMultiplier);
 
   console.log(
@@ -149,7 +165,7 @@ const hour = Number(
   console.log(
     `🧾 Fare: ₹${total} | ${vehicle.toUpperCase()} | ${distanceKm} km | ` +
     `${peakHour ? "🚀 Peak" : nightHour ? "🌙 Night" : "☀️ Normal"} | ` +
-    `Hour: ${hour} | minFare used: ${total === surgedMinFare ? `✅ ₹${surgedMinFare}` : "❌ (normal fare higher)"}`
+    `Hour: ${hour} | thresholdKm: ${thresholdKm} | minFare used: ${total === surgedMinFare ? `✅ ₹${surgedMinFare}` : "❌ (normal fare higher)"}`
   );
 
   // ─────────────────────────────────────────────────────
@@ -171,6 +187,8 @@ const hour = Number(
       perMin,
       platformFee,
       baseFareTotal: roundOff(baseFareTotal),
+      thresholdKm,
+      thresholdApplied: distanceKm > thresholdKm,
 
       // Time factors
       tripDuration: `${Math.round(tripDuration)} mins`,

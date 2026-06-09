@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 /**
  * One document = one tariff card for ONE city/state + ONE vehicle type.
- * “category” tells calcFare whether it’s a short‑trip, long‑trip, or parcel product.
+ * "category" tells calcFare whether it's a short‑trip, long‑trip, or parcel product.
  */
 const rateSchema = new mongoose.Schema(
   {
@@ -30,10 +30,15 @@ const rateSchema = new mongoose.Schema(
     minFare            : Number,
     platformFeePercent : Number,
     gstPercent         : Number,
-// ✅ Surge multipliers (admin-controlled)
-peakMultiplier  : { type: Number, default: 1 },
-nightMultiplier : { type: Number, default: 1 },
-manualSurge     : { type: Number, default: 1 },
+
+    // ✅ Surge multipliers (admin-controlled)
+    peakMultiplier  : { type: Number, default: 1 },
+    nightMultiplier : { type: Number, default: 1 },
+    manualSurge     : { type: Number, default: 1 },
+
+    // ✅ Per-km threshold: after this distance, fare = perKm × distanceKm (admin-controlled)
+    thresholdKm : { type: Number, default: 6 },
+
     /* ───────── Long‑trip fields ───────── */
     fuelPerKm              : Number,
     day1DriverFee          : Number,
@@ -42,9 +47,9 @@ manualSurge     : { type: Number, default: 1 },
 
     /* ───────── Parcel‑delivery fields ───────── */
     platformFee : Number,    // flat handling / platform margin (₹)
-    maxWeightKg : Number,    // hard weight limit for bikes (e.g., 10 kg)
+    maxWeightKg : Number,    // hard weight limit for bikes (e.g., 10 kg)
     weightRates : {
-      baseKg     : Number,   // included weight (e.g., 5 kg)
+      baseKg     : Number,   // included weight (e.g., 5 kg)
       baseCharge : Number,   // charge if weight > baseKg
       perExtraKg : Number    // ₹ per extra kg beyond baseKg
     }

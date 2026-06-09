@@ -189,6 +189,8 @@ const ALLOWED_RATE_FIELDS = [
   // Optional extras
   "baseFareDistanceKm",
   "isActive",
+    "thresholdKm",   // ✅ ADD THIS LINE
+
 ];
 
 // ======================================================================
@@ -427,7 +429,7 @@ export const getAllDrivers = async (req, res) => {
   try {
     // ──── UPDATED getAllDrivers select ────
     const drivers = await User.find({ isDriver: true })
-      .select("name email phone vehicleType seats vehicleModel profilePhotoUrl photo profilePic driverPhoto avatar isBlocked isSuspended isOnline strikes vehicleNumber vehicleBrand rating deviceId documentStatus isVerified createdAt");
+.select("name email phone vehicleType seats vehicleModel profilePhotoUrl photo profilePic driverPhoto avatar isBlocked isSuspended isOnline strikes vehicleNumber vehicleBrand rating deviceId documentStatus isVerified createdAt location");
 
     const baseUrl = `${req.protocol}://${req.get("host")}`;
 
@@ -470,7 +472,8 @@ export const getAllDrivers = async (req, res) => {
         deviceId: d.deviceId,
         documentStatus: d.documentStatus,
         isVerified: d.isVerified,
-        createdAt: d.createdAt,
+        location: d.location ?? null,   // ✅ GPS coordinates [lng, lat]
+
       };
     });
 
