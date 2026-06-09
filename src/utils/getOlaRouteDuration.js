@@ -3,16 +3,6 @@ import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
 
-/**
- * Fetch live route data (distance + duration) from Ola Maps API
- * and adjust duration by vehicle type.
- *
- * Ola Maps endpoint:
- * GET https://api.olamaps.io/routing/v1/directions
- *   ?origin=lat,lng
- *   &destination=lat,lng
- *   &api_key=OLA_MAPS_API_KEY
- */
 export async function getOlaRouteDuration(origin, destination, vehicleType = "car") {
   const OLA_API_KEY = process.env.OLA_MAPS_API_KEY;
 
@@ -26,12 +16,18 @@ export async function getOlaRouteDuration(origin, destination, vehicleType = "ca
     return null;
   }
 
-  const url = `https://api.olamaps.io/routing/v1/directions?origin=${origin.lat},${origin.lng}&destination=${destination.lat},${destination.lng}&api_key=${OLA_API_KEY}`;
+  // ✅ POST request — Ola Maps Directions API does not accept GET
+  const url = `https://api.olamaps.io/routing/v1/directions`;
 
   try {
-    const res = await axios.get(url);
+    const res = await axios.post(url, null, {
+      params: {
+        origin: `${origin.lat},${origin.lng}`,
+        destination: `${destination.lat},${destination.lng}`,
+        api_key: OLA_API_KEY,
+      },
+    });
 
-    // Ola Maps returns { routes: [...] }
     const routes = res.data?.routes;
     if (!routes?.length) {
       console.error("⚠️ Ola Maps returned no routes:", res.data);
@@ -44,21 +40,15 @@ export async function getOlaRouteDuration(origin, destination, vehicleType = "ca
       return null;
     }
 
-    // Ola Maps: duration in seconds, distance in meters
-    const baseDurationSec = leg.duration;          // seconds
-    const distanceKm      = leg.distance / 1000;   // meters → km
+    const baseDurationSec = leg.duration;
+    const distanceKm      = leg.distance / 1000;
 
-    // ─────────────────────────────────────────────────────
-    // Vehicle-type duration adjustment
-    // Same logic as the old Google Maps utility
-    // Bike/auto are faster through traffic than car
-    // ─────────────────────────────────────────────────────
     const vehicleAdjust = {
-      bike:    0.6,   // Bikes ~40% faster (lane-splitting, shortcuts)
-      auto:    0.8,   // Autos ~20% faster
-      car:     1.0,   // Baseline
-      premium: 1.05,  // Slightly conservative
-      xl:      1.1,   // Slower in traffic
+      bike:    0.6,
+      auto:    0.8,
+      car:     1.0,
+      premium: 1.05,
+      xl:      1.1,
     };
 
     const adjustedDurationSec = baseDurationSec * (vehicleAdjust[vehicleType] || 1.0);
@@ -68,12 +58,13 @@ export async function getOlaRouteDuration(origin, destination, vehicleType = "ca
       `base=${Math.round(baseDurationSec / 60)}min → adjusted=${Math.round(adjustedDurationSec / 60)}min`
     );
 
-    return {
-      distanceKm,
-      durationSec: adjustedDurationSec,
-    };
+    return { distanceKm, durationSec: adjustedDurationSec };
+
   } catch (err) {
-    console.error("⚠️ Ola Maps fetch failed:", err.message);
+    // Log the full response body for easier debugging
+    const status = err.response?.status;
+    const body   = JSON.stringify(err.response?.data)?.slice(0, 200);
+    console.error(`⚠️ Ola Maps fetch failed [${status}]: ${err.message} | body: ${body}`);
     return null;
   }
 }
