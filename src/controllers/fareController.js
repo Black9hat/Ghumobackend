@@ -228,7 +228,9 @@ export const createFare = asyncHandler(async (req, res) => {
     const preCouponFare = Number(
       result.baseFare    ??   // explicit base fare (if exists)
       result.totalFare   ??   // some implementations
-      result.fare        ??   // some implementations
+      result.fare        ??  
+        result.total       ??   // ✅ ADD THIS — it's what calcFare actually returns
+ // some implementations
       result.finalFare   ??   // ✅ guaranteed fallback
       0
     );
