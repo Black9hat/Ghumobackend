@@ -244,6 +244,7 @@ export const createFare = asyncHandler(async (req, res) => {
       result.originalFare    = preCouponFare;      // for transparency in response
       result.welcomeDiscount = calculatedDiscount;
       result.finalFare       = cappedFinalFare;
+  result.total           = cappedFinalFare;  // ✅ ADD THIS LINE
 
       // Back-fill for the response payload
       welcomeDiscountAmount = calculatedDiscount;
