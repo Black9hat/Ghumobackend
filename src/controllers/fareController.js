@@ -54,16 +54,13 @@ export const createFare = asyncHandler(async (req, res) => {
           `✅ Ola Maps (${vType}): ${liveDistanceKm.toFixed(2)} km | ${liveDurationMin.toFixed(1)} mins`
         );
       } else {
-        console.warn(
-          `⚠️ Ola Maps returned null for ${vType} — using fallback values`
-        );
+        console.warn(`⚠️ Ola Maps returned null for ${vType} — using fallback values`);
       }
     } catch (err) {
       console.error("⚠️ Ola Maps fetch failed:", err.message);
     } finally {
       if (req.__profile) {
-        req.__profile.googleMs +=
-          Number(process.hrtime.bigint() - gStart) / 1e6;
+        req.__profile.googleMs += Number(process.hrtime.bigint() - gStart) / 1e6;
       }
     }
   }
@@ -82,8 +79,7 @@ export const createFare = asyncHandler(async (req, res) => {
   const dbRate = await Rate.findOne(query);
 
   if (req.__profile) {
-    req.__profile.mongoMs +=
-      Number(process.hrtime.bigint() - dbStart) / 1e6;
+    req.__profile.mongoMs += Number(process.hrtime.bigint() - dbStart) / 1e6;
   }
 
   if (dbRate) {
@@ -103,9 +99,7 @@ export const createFare = asyncHandler(async (req, res) => {
    * 3️⃣ Timestamps for peak/night detection
    * --------------------------------------------------------- */
   const startTime = new Date().toISOString();
-  const dropTime  = new Date(
-    Date.now() + liveDurationMin * 60 * 1000
-  ).toISOString();
+  const dropTime  = new Date(Date.now() + liveDurationMin * 60 * 1000).toISOString();
 
   console.log("🟢 [FINAL FARE INPUT]", {
     vehicleType: vType,
@@ -117,16 +111,13 @@ export const createFare = asyncHandler(async (req, res) => {
 
   /* ---------------------------------------------------------
    * 3️⃣b 🎁 Welcome Coupon Eligibility Check
-   * ✅ Supports: Fixed Amount Mode + Legacy Mode
    * --------------------------------------------------------- */
-  let applyWelcomeCoupon  = false;
+  let applyWelcomeCoupon    = false;
   let welcomeFareAdjustment = 0;
   let welcomeDiscountAmount = 0;
   let welcomeExactAmount    = 0;
   let welcomeCouponCode     = "";
   let welcomeVehicleType    = "all";
-
-  // ⚠️ Declared outside try so it's accessible in post-calc step
   let welcomeCouponSettings = null;
 
   if (customerId) {
@@ -137,79 +128,62 @@ export const createFare = asyncHandler(async (req, res) => {
       ]);
 
       const wc = appSettings?.welcomeCoupon;
-
-      // Save settings reference for post-calculation use
       welcomeCouponSettings = wc || null;
 
-      const configuredVehicleType = String(
-        wc?.vehicleType || "all"
-      ).toLowerCase();
+      const configuredVehicleType = String(wc?.vehicleType || "all").toLowerCase();
       const vehicleAllowed =
-        configuredVehicleType === "all" ||
-        configuredVehicleType === vType;
+        configuredVehicleType === "all" || configuredVehicleType === vType;
 
       if (
         wc?.enabled === true &&
         customer?.welcomeCouponUsed === false &&
         vehicleAllowed
       ) {
-        // ✅ FIXED AMOUNT MODE: Customer always pays exactAmount
+        // ✅ FIXED AMOUNT MODE
         if (wc.useFixedWelcomeAmount) {
           const fixedFinalFare = Number(wc.exactAmount) || 25;
 
-          applyWelcomeCoupon  = true;
-          welcomeCouponCode   = wc.code || "WELCOME";
-          welcomeVehicleType  = configuredVehicleType;
-          welcomeExactAmount  = fixedFinalFare;
-
-          // Discount & adjustment calculated AFTER fare calc (post-step below)
+          applyWelcomeCoupon    = true;
+          welcomeCouponCode     = wc.code || "WELCOME";
+          welcomeVehicleType    = configuredVehicleType;
+          welcomeExactAmount    = fixedFinalFare;
           welcomeFareAdjustment = 0;
-          welcomeDiscountAmount = 0;
+          welcomeDiscountAmount = 0; // derived after fare calc
 
-          console.log(
-            `🎁 Fixed welcome coupon: Customer pays ONLY ₹${fixedFinalFare} for ${vType}`
-          );
-        } else {
-          // ✅ LEGACY MODE: discount - adjustment = net saving
+          console.log(`🎁 Fixed welcome coupon: Customer pays ONLY ₹${fixedFinalFare} for ${vType}`);
+        }
+        // ✅ LEGACY MODE
+        else {
           const netSaving =
-            (Number(wc.discountAmount) || 0) -
-            (Number(wc.fareAdjustment)  || 0);
+            (Number(wc.discountAmount) || 0) - (Number(wc.fareAdjustment) || 0);
 
           if (netSaving > 0) {
             applyWelcomeCoupon    = true;
-            welcomeFareAdjustment = Number(wc.fareAdjustment)  || 0;
-            welcomeDiscountAmount  = Number(wc.discountAmount)  || 0;
+            welcomeFareAdjustment = Number(wc.fareAdjustment) || 0;
+            welcomeDiscountAmount = Number(wc.discountAmount) || 0;
             welcomeExactAmount    =
-              Number(wc.exactAmount) > 0
-                ? Number(wc.exactAmount)
-                : netSaving;
+              Number(wc.exactAmount) > 0 ? Number(wc.exactAmount) : netSaving;
             welcomeCouponCode  = wc.code || "WELCOME";
             welcomeVehicleType = configuredVehicleType;
 
             console.log(
-              `🎁 Welcome coupon (legacy) for ${customerId}: ` +
-              `adj=₹${welcomeFareAdjustment}, discount=₹${welcomeDiscountAmount}, ` +
-              `netSaving=₹${netSaving}`
+              `🎁 Welcome coupon (legacy): adj=₹${welcomeFareAdjustment}, ` +
+              `discount=₹${welcomeDiscountAmount}, netSaving=₹${netSaving}`
             );
           } else {
             console.warn(
-              `⚠️ Welcome coupon NOT applied: fareAdjustment ` +
-              `(₹${wc.fareAdjustment}) >= discountAmount (₹${wc.discountAmount}). ` +
-              `Fix in admin Reward Config.`
+              `⚠️ Welcome coupon NOT applied: fareAdjustment (₹${wc.fareAdjustment}) ` +
+              `>= discountAmount (₹${wc.discountAmount}). Fix in admin Reward Config.`
             );
           }
         }
       } else if (wc?.enabled === true && !vehicleAllowed) {
         console.log(
-          `ℹ️ Welcome coupon skipped for ${vType}; ` +
-          `configured for "${configuredVehicleType}" only.`
+          `ℹ️ Welcome coupon skipped for ${vType}; configured for "${configuredVehicleType}" only.`
         );
       }
     } catch (err) {
-      console.warn(
-        "⚠️ Welcome coupon eligibility check failed:",
-        err.message
-      );
+      console.warn("⚠️ Welcome coupon eligibility check failed:", err.message);
     }
   }
 
@@ -220,8 +194,8 @@ export const createFare = asyncHandler(async (req, res) => {
   try {
     result = calcFare({
       rate,
-      distanceKm:           liveDistanceKm,
-      durationMin:          liveDurationMin,
+      distanceKm:  liveDistanceKm,
+      durationMin: liveDurationMin,
       tripDays,
       returnTrip,
       surge,
@@ -239,38 +213,44 @@ export const createFare = asyncHandler(async (req, res) => {
 
   /* ---------------------------------------------------------
    * 4️⃣b 🎁 POST-CALC: Apply Fixed Welcome Amount Override
-   * In fixed mode the customer always pays exactly ₹exactAmount.
-   * We derive the discount retroactively from the calculated fare.
+   * ✅ FIXED: result.baseFare doesn't exist in calcFare output —
+   *    use multiple fallbacks ending with finalFare
    * --------------------------------------------------------- */
   if (
     applyWelcomeCoupon &&
     welcomeCouponSettings?.useFixedWelcomeAmount &&
     welcomeExactAmount > 0
   ) {
-    // Use baseFare if available, otherwise fall back to finalFare
-    const preCouponFare = result.baseFare ?? result.finalFare;
+    // Debug: see what calcFare actually returned (remove after verifying)
+    console.log("🔬 calcFare result keys:", Object.keys(result).join(", "));
 
-    // How much we're knocking off
-    const calculatedDiscount = Math.max(
-      0,
-      preCouponFare - welcomeExactAmount
+    // ✅ THE FIX — try multiple field names, fall back to finalFare
+    const preCouponFare = Number(
+      result.baseFare    ??   // explicit base fare (if exists)
+      result.totalFare   ??   // some implementations
+      result.fare        ??   // some implementations
+      result.finalFare   ??   // ✅ guaranteed fallback
+      0
     );
 
-    // Final fare is capped at exactAmount (never negative)
-    const cappedFinalFare = Math.max(welcomeExactAmount, 0);
+    if (preCouponFare <= 0) {
+      console.warn(`🎁 ⚠️ Pre-coupon fare is ${preCouponFare} — override skipped.`);
+    } else {
+      const calculatedDiscount = Math.max(0, preCouponFare - welcomeExactAmount);
+      const cappedFinalFare    = Math.max(welcomeExactAmount, 0);
 
-    // Update result in-place
-    result.welcomeDiscount = calculatedDiscount;
-    result.finalFare       = cappedFinalFare;
+      result.originalFare    = preCouponFare;      // for transparency in response
+      result.welcomeDiscount = calculatedDiscount;
+      result.finalFare       = cappedFinalFare;
 
-    // Back-fill for response object
-    welcomeDiscountAmount = calculatedDiscount;
+      // Back-fill for the response payload
+      welcomeDiscountAmount = calculatedDiscount;
 
-    console.log(
-      `🎁 Fixed welcome applied: ` +
-      `Pre-coupon ₹${preCouponFare} → Final ₹${cappedFinalFare} ` +
-      `(discount ₹${calculatedDiscount})`
-    );
+      console.log(
+        `🎁 ✅ Fixed welcome applied: Original ₹${preCouponFare} ` +
+        `→ Final ₹${cappedFinalFare} (discount ₹${calculatedDiscount})`
+      );
+    }
   }
 
   /* ---------------------------------------------------------
@@ -297,36 +277,31 @@ export const createFare = asyncHandler(async (req, res) => {
   /* ---------------------------------------------------------
    * 6️⃣ Respond
    * --------------------------------------------------------- */
+  const isFixedMode = welcomeCouponSettings?.useFixedWelcomeAmount === true;
 
-  // Net saving differs between modes
-  const netSaving = welcomeCouponSettings?.useFixedWelcomeAmount
-    ? result.welcomeDiscount ?? welcomeDiscountAmount          // fixed mode
-    : welcomeDiscountAmount - welcomeFareAdjustment;           // legacy mode
+  const netSaving = isFixedMode
+    ? (result.welcomeDiscount ?? welcomeDiscountAmount)
+    : welcomeDiscountAmount - welcomeFareAdjustment;
 
-  // Human-readable message differs between modes
-  const welcomeMessage = welcomeCouponSettings?.useFixedWelcomeAmount
+  const welcomeMessage = isFixedMode
     ? `Pay only ₹${welcomeExactAmount} on your first ride!`
     : `Welcome discount of ₹${welcomeDiscountAmount} applied on your first ride!`;
 
   res.json({
-    ok:         true,
-    rateSource: dbRate ? "db" : "internal",
+    ok:          true,
+    rateSource:  dbRate ? "db" : "internal",
     usedOlaMaps: !!(origin && destination),
-
-    // Spread all fare result fields (finalFare, baseFare, breakdown, etc.)
     ...result,
-
     coinsEarn,
     coinsBreakdown,
-
     welcomeCoupon: applyWelcomeCoupon
       ? {
           applied:        true,
           code:           welcomeCouponCode,
-          discountAmount: welcomeDiscountAmount,           // actual ₹ knocked off
-          fareAdjustment: welcomeFareAdjustment,           // internal calc tweak
-          exactAmount:    welcomeExactAmount,              // customer pays this
-          displayAmount:  welcomeExactAmount,              // UI display value
+          discountAmount: welcomeDiscountAmount,
+          fareAdjustment: welcomeFareAdjustment,
+          exactAmount:    welcomeExactAmount,
+          displayAmount:  welcomeExactAmount,
           vehicleType:    welcomeVehicleType,
           netSaving,
           message:        welcomeMessage,
