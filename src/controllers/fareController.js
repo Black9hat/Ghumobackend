@@ -125,7 +125,9 @@ export const createFare = asyncHandler(async (req, res) => {
   let applyWelcomeCoupon = false;
   let welcomeFareAdjustment = 0;
   let welcomeDiscountAmount = 0;
+  let welcomeExactAmount = 0;
   let welcomeCouponCode = "";
+  let welcomeVehicleType = "all";
 
   if (customerId) {
     try {
@@ -136,17 +138,24 @@ export const createFare = asyncHandler(async (req, res) => {
 
       const wc = appSettings?.welcomeCoupon;
       const netSaving = (Number(wc?.discountAmount) || 0) - (Number(wc?.fareAdjustment) || 0);
+      const configuredVehicleType = String(wc?.vehicleType || "all").toLowerCase();
+      const vehicleAllowed = configuredVehicleType === "all" || configuredVehicleType === vType;
 
       if (
         wc?.enabled === true &&
         customer?.welcomeCouponUsed === false &&
-        netSaving > 0  // only apply if customer actually saves money
+        netSaving > 0 && // only apply if customer actually saves money
+        vehicleAllowed
       ) {
         applyWelcomeCoupon = true;
         welcomeFareAdjustment = Number(wc.fareAdjustment) || 0;
         welcomeDiscountAmount = Number(wc.discountAmount) || 0;
+        welcomeExactAmount = Number(wc.exactAmount) > 0 ? Number(wc.exactAmount) : netSaving;
         welcomeCouponCode = wc.code || "WELCOME";
+        welcomeVehicleType = configuredVehicleType;
         console.log(`🎁 Welcome coupon eligible for customer ${customerId}: adj=₹${welcomeFareAdjustment}, discount=₹${welcomeDiscountAmount}, netSaving=₹${netSaving}`);
+      } else if (wc?.enabled === true && !vehicleAllowed) {
+        console.log(`Welcome coupon not applied for ${vType}; configured for ${configuredVehicleType}.`);
       } else if (wc?.enabled === true && netSaving <= 0) {
         console.warn(`⚠️ Welcome coupon NOT applied: fareAdjustment (₹${wc.fareAdjustment}) >= discountAmount (₹${wc.discountAmount}). Fix in admin Reward Config.`);
       }
@@ -222,9 +231,12 @@ export const createFare = asyncHandler(async (req, res) => {
           code: welcomeCouponCode,
           discountAmount: welcomeDiscountAmount,
           fareAdjustment: welcomeFareAdjustment,
+          exactAmount: welcomeExactAmount,
+          displayAmount: welcomeExactAmount,
+          vehicleType: welcomeVehicleType,
           // netSaving = what the customer actually saves vs. original base fare
           netSaving: welcomeDiscountAmount - welcomeFareAdjustment,
-          message: `🎉 Welcome discount of ₹${welcomeDiscountAmount - welcomeFareAdjustment} applied on your first ride!`,
+          message: `Welcome discount of Rs ${welcomeExactAmount} applied on your first ride!`,
         }
       : { applied: false },
   });

@@ -288,6 +288,24 @@ export async function recordReferralSignup(newUserId, referralCode, role = 'cust
  * Auto-assigns a welcome coupon to a new customer on registration.
  * Idempotent — safe to call multiple times.
  */
+const WELCOME_VEHICLE_TYPES = new Set(['all', 'bike', 'auto', 'car', 'premium', 'xl']);
+
+const normalizeWelcomeVehicleType = (vehicleType) => {
+  const normalized = String(vehicleType || 'all').toLowerCase();
+  return WELCOME_VEHICLE_TYPES.has(normalized) ? normalized : 'all';
+};
+
+const getWelcomeApplicableVehicles = (vehicleType) => {
+  const normalized = normalizeWelcomeVehicleType(vehicleType);
+  return normalized === 'all' ? ['all'] : [normalized];
+};
+
+const getWelcomeExactAmount = ({ discountAmount, fareAdjustment, exactAmount }) => {
+  const configuredExactAmount = Number(exactAmount);
+  const netSaving = (Number(discountAmount) || 0) - (Number(fareAdjustment) || 0);
+  return configuredExactAmount > 0 ? configuredExactAmount : Math.max(netSaving, 0);
+};
+
 export async function assignWelcomeCoupon(userId) {
   try {
     const user = await User.findById(userId)
@@ -300,8 +318,10 @@ export async function assignWelcomeCoupon(userId) {
     }
 
     const settings = await AppSettings.getSettings();
-    const { discountAmount, fareAdjustment, code, validityDays, enabled } =
+    const { discountAmount, fareAdjustment, code, validityDays, enabled, vehicleType, exactAmount } =
       settings.welcomeCoupon;
+    const applicableVehicles = getWelcomeApplicableVehicles(vehicleType);
+    const welcomeExactAmount = getWelcomeExactAmount({ discountAmount, fareAdjustment, exactAmount });
 
     if (!enabled) {
       return { success: false, message: 'Welcome coupon disabled' };
@@ -315,10 +335,10 @@ export async function assignWelcomeCoupon(userId) {
 
       coupon = await Coupon.create({
         code:               code.toUpperCase(),
-        description:        `Welcome offer! Get ₹${discountAmount} off on your first ride.`,
+        description:        `Welcome offer! Get Rs ${welcomeExactAmount} off on your first ride.`,
         discountType:       'FIXED',
         discountValue:      discountAmount,
-        applicableVehicles: ['all'],
+        applicableVehicles,
         applicableFor:      'FIRST_RIDE',
         maxUsagePerUser:    1,
         totalUsageLimit:    null,
@@ -331,6 +351,12 @@ export async function assignWelcomeCoupon(userId) {
         createdBy:          'system',
       });
       console.log(`🎟️ Welcome coupon created: ${coupon.code}`);
+    } else {
+      coupon.description = `Welcome offer! Get Rs ${welcomeExactAmount} off on your first ride.`;
+      coupon.discountValue = discountAmount;
+      coupon.applicableVehicles = applicableVehicles;
+      coupon.isActive = true;
+      await coupon.save();
     }
 
     await User.findByIdAndUpdate(userId, { welcomeCouponAssigned: true });
@@ -341,7 +367,9 @@ export async function assignWelcomeCoupon(userId) {
       couponCode:     coupon.code,
       discountAmount,
       fareAdjustment,
-      message: `Welcome! Use ${coupon.code} for ₹${discountAmount} off your first ride.`,
+      vehicleType:     normalizeWelcomeVehicleType(vehicleType),
+      exactAmount:     welcomeExactAmount,
+      message: `Welcome! Use ${coupon.code} for Rs ${welcomeExactAmount} off your first ride.`,
     };
   } catch (err) {
     console.error('❌ assignWelcomeCoupon:', err.message);

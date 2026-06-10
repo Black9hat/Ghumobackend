@@ -8,6 +8,8 @@ const appSettingsSchema = new mongoose.Schema(
       enabled:        { type: Boolean, default: true },
       discountAmount: { type: Number,  default: 25 },
       fareAdjustment: { type: Number,  default: 0 },
+      vehicleType:    { type: String,  enum: ['all', 'bike', 'auto', 'car', 'premium', 'xl'], default: 'all' },
+      exactAmount:    { type: Number,  default: null },
       code:           { type: String,  default: 'WELCOME25' },
       validityDays:   { type: Number,  default: 365 },
     },

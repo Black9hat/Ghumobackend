@@ -2,10 +2,66 @@
 import express from 'express';
 import { verifyAdminToken } from '../middlewares/adminAuth.js';
 import AppSettings from '../models/AppSettings.js';
+import Coupon from '../models/Coupon.js';
 import Referral from '../models/Referral.js';
 import User from '../models/User.js';
 
 const router = express.Router();
+const WELCOME_VEHICLE_TYPES = new Set(['all', 'bike', 'auto', 'car', 'premium', 'xl']);
+
+const normalizeWelcomeVehicleType = (vehicleType) => {
+  const normalized = String(vehicleType || 'all').toLowerCase();
+  return WELCOME_VEHICLE_TYPES.has(normalized) ? normalized : 'all';
+};
+
+const getWelcomeApplicableVehicles = (vehicleType) => {
+  const normalized = normalizeWelcomeVehicleType(vehicleType);
+  return normalized === 'all' ? ['all'] : [normalized];
+};
+
+const getWelcomeExactAmount = (welcomeCoupon) => {
+  const exactAmount = Number(welcomeCoupon?.exactAmount);
+  const netSaving =
+    (Number(welcomeCoupon?.discountAmount) || 0) -
+    (Number(welcomeCoupon?.fareAdjustment) || 0);
+
+  return exactAmount > 0 ? exactAmount : Math.max(netSaving, 0);
+};
+
+const syncWelcomeCouponRecord = async (welcomeCoupon) => {
+  const code = String(welcomeCoupon?.code || '').trim().toUpperCase();
+  if (!code) return;
+
+  const validUntil = new Date();
+  validUntil.setFullYear(validUntil.getFullYear() + 10);
+
+  await Coupon.findOneAndUpdate(
+    { code },
+    {
+      $set: {
+        code,
+        description: `Welcome offer! Get Rs ${getWelcomeExactAmount(welcomeCoupon)} off on your first ride.`,
+        discountType: 'FIXED',
+        discountValue: Number(welcomeCoupon.discountAmount) || 0,
+        applicableVehicles: getWelcomeApplicableVehicles(welcomeCoupon.vehicleType),
+        applicableFor: 'FIRST_RIDE',
+        maxUsagePerUser: 1,
+        totalUsageLimit: null,
+        validUntil,
+        isActive: welcomeCoupon.enabled !== false,
+        eligibleUserTypes: ['NEW'],
+        minRidesCompleted: 0,
+        maxRidesCompleted: 0,
+      },
+      $setOnInsert: {
+        validFrom: new Date(),
+        currentUsageCount: 0,
+        createdBy: 'system',
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+};
 
 // ── GET /api/admin/reward-config ──────────────────────────────────────────────
 router.get('/reward-config', verifyAdminToken, async (req, res) => {
@@ -27,9 +83,13 @@ router.put('/reward-config', verifyAdminToken, async (req, res) => {
 
     // ── Welcome Coupon ───────────────────────────────────────────────────────
     if (welcomeCoupon) {
-      const allowed = ['enabled', 'discountAmount', 'fareAdjustment', 'code', 'validityDays'];
+      const allowed = ['enabled', 'discountAmount', 'fareAdjustment', 'vehicleType', 'exactAmount', 'code', 'validityDays'];
       for (const key of allowed) {
         if (welcomeCoupon[key] !== undefined) settings.welcomeCoupon[key] = welcomeCoupon[key];
+      }
+      settings.welcomeCoupon.vehicleType = normalizeWelcomeVehicleType(settings.welcomeCoupon.vehicleType);
+      if (settings.welcomeCoupon.exactAmount !== null && settings.welcomeCoupon.exactAmount !== undefined) {
+        settings.welcomeCoupon.exactAmount = Number(settings.welcomeCoupon.exactAmount) || 0;
       }
       settings.markModified('welcomeCoupon');
     }
@@ -131,6 +191,7 @@ router.put('/reward-config', verifyAdminToken, async (req, res) => {
     settings.updatedAt = new Date();
     settings.updatedBy = req.admin?.email || 'admin';
     await settings.save();
+    await syncWelcomeCouponRecord(settings.welcomeCoupon);
 
     res.json({ success: true, message: 'Reward config updated', settings });
   } catch (err) {

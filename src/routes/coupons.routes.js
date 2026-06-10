@@ -390,9 +390,21 @@ router.post('/validate', verifyToken, async (req, res) => {
     // This is loaded from admin settings so it stays configurable.
     let fareAdjustment = 0;
     let adjustedFare = estimatedFare;
+    let welcomeExactAmount = null;
+    let welcomeVehicleType = null;
     try {
       const appSettings = await AppSettings.getSettings();
       const welcomeCode = appSettings.welcomeCoupon.code?.toUpperCase();
+      if (welcomeCode && coupon.code === welcomeCode) {
+        const netSaving =
+          (Number(appSettings.welcomeCoupon.discountAmount) || 0) -
+          (Number(appSettings.welcomeCoupon.fareAdjustment) || 0);
+        welcomeExactAmount =
+          Number(appSettings.welcomeCoupon.exactAmount) > 0
+            ? Number(appSettings.welcomeCoupon.exactAmount)
+            : Math.max(netSaving, 0);
+        welcomeVehicleType = appSettings.welcomeCoupon.vehicleType || 'all';
+      }
       if (
         welcomeCode &&
         coupon.code === welcomeCode &&
@@ -421,6 +433,9 @@ router.post('/validate', verifyToken, async (req, res) => {
         description: coupon.description,
         discountType: coupon.discountType,
         discountValue: coupon.discountValue,
+        exactAmount: welcomeExactAmount ?? undefined,
+        displayAmount: welcomeExactAmount ?? undefined,
+        vehicleType: welcomeVehicleType ?? undefined,
         applicableVehicles: coupon.applicableVehicles, // 🚗 NEW
       },
       discountAmount,
