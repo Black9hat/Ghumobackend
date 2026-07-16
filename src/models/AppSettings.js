@@ -15,6 +15,17 @@ const appSettingsSchema = new mongoose.Schema(
         default: 'all',
       },
       exactAmount:  { type: Number, default: null },
+      fixedAmounts: {
+        type: {
+          all:     { type: Number, default: null },
+          bike:    { type: Number, default: null },
+          auto:    { type: Number, default: null },
+          car:     { type: Number, default: null },
+          premium: { type: Number, default: null },
+          xl:      { type: Number, default: null },
+        },
+        default: () => ({ all: null, bike: null, auto: null, car: null, premium: null, xl: null }),
+      },
       code:         { type: String, default: 'WELCOME25' },
       validityDays: { type: Number, default: 365 },
     },

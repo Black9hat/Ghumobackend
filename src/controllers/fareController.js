@@ -5,6 +5,11 @@ import { getOlaRouteDuration } from "../utils/getOlaRouteDuration.js";
 import User from "../models/User.js";
 import AppSettings from "../models/AppSettings.js";
 import { calculateCoinsForRide, getCoinsConfig } from "../services/coinService.js";
+import {
+  getWelcomeApplicableVehicles,
+  getWelcomeDisplayAmount,
+  normalizeWelcomeVehicleType,
+} from "../utils/welcomeCouponConfig.js";
 
 /**
  * POST /api/fares/calc
@@ -130,9 +135,10 @@ export const createFare = asyncHandler(async (req, res) => {
       const wc = appSettings?.welcomeCoupon;
       welcomeCouponSettings = wc || null;
 
-      const configuredVehicleType = String(wc?.vehicleType || "all").toLowerCase();
+      const configuredVehicleType = normalizeWelcomeVehicleType(wc?.vehicleType || "all");
+      const applicableVehicles = getWelcomeApplicableVehicles(wc);
       const vehicleAllowed =
-        configuredVehicleType === "all" || configuredVehicleType === vType;
+        applicableVehicles.includes("all") || applicableVehicles.includes(vType);
 
       if (
         wc?.enabled === true &&
@@ -141,11 +147,11 @@ export const createFare = asyncHandler(async (req, res) => {
       ) {
         // ✅ FIXED AMOUNT MODE
         if (wc.useFixedWelcomeAmount) {
-          const fixedFinalFare = Number(wc.exactAmount) || 25;
+          const fixedFinalFare = getWelcomeDisplayAmount(wc, vType);
 
           applyWelcomeCoupon    = true;
           welcomeCouponCode     = wc.code || "WELCOME";
-          welcomeVehicleType    = configuredVehicleType;
+          welcomeVehicleType    = vType;
           welcomeExactAmount    = fixedFinalFare;
           welcomeFareAdjustment = 0;
           welcomeDiscountAmount = 0; // derived after fare calc

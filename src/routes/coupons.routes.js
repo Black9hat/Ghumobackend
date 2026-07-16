@@ -6,6 +6,10 @@ import CouponUsage from '../models/CouponUsage.js';
 import Customer from '../models/User.js';
 import Trip from '../models/Trip.js';
 import AppSettings from '../models/AppSettings.js';
+import {
+  getWelcomeApplicableVehicles,
+  getWelcomeDisplayAmount,
+} from '../utils/welcomeCouponConfig.js';
 
 const router = express.Router();
 
@@ -45,6 +49,8 @@ router.get('/available/:customerId', verifyToken, async (req, res) => {
     });
 
     const now = new Date();
+    const appSettings = await AppSettings.getSettings();
+    const welcomeCode = appSettings.welcomeCoupon.code?.toUpperCase();
 
     // Fetch all active and valid coupons
     const allCoupons = await Coupon.find({
@@ -173,10 +179,16 @@ router.get('/available/:customerId', verifyToken, async (req, res) => {
           code: coupon.code,
           description: coupon.description,
           discountType: coupon.discountType,
-          discountValue: coupon.discountValue,
+          discountValue:
+            coupon.code === welcomeCode
+              ? getWelcomeDisplayAmount(appSettings.welcomeCoupon, vehicleType || 'all')
+              : coupon.discountValue,
           maxDiscountAmount: coupon.maxDiscountAmount,
           minFareAmount: coupon.minFareAmount,
-          applicableVehicles: coupon.applicableVehicles, // 🚗 NEW
+          applicableVehicles:
+            coupon.code === welcomeCode
+              ? getWelcomeApplicableVehicles(appSettings.welcomeCoupon)
+              : coupon.applicableVehicles, // 🚗 NEW
           applicableFor: coupon.applicableFor,
           rideNumber: coupon.rideNumber,
           specificRideNumbers: coupon.specificRideNumbers,
@@ -374,9 +386,24 @@ router.post('/validate', verifyToken, async (req, res) => {
       });
     }
 
+    let appSettings = null;
+    try {
+      appSettings = await AppSettings.getSettings();
+    } catch (settingsError) {
+      console.warn('⚠️ Could not load AppSettings for welcome coupon validation:', settingsError.message);
+    }
+
+    const welcomeCouponSettings =
+      appSettings?.welcomeCoupon?.code?.toUpperCase() === coupon.code
+        ? appSettings.welcomeCoupon
+        : null;
+
     // Calculate discount
     let discountAmount = 0;
-    if (coupon.discountType === 'PERCENTAGE') {
+    if (welcomeCouponSettings?.useFixedWelcomeAmount) {
+      const fixedFinalFare = getWelcomeDisplayAmount(welcomeCouponSettings, vehicleType || 'all');
+      discountAmount = Math.max(0, Number(estimatedFare) - fixedFinalFare);
+    } else if (coupon.discountType === 'PERCENTAGE') {
       discountAmount = (estimatedFare * coupon.discountValue) / 100;
       if (coupon.maxDiscountAmount && discountAmount > coupon.maxDiscountAmount) {
         discountAmount = coupon.maxDiscountAmount;
@@ -492,7 +519,22 @@ router.post('/apply', verifyToken, async (req, res) => {
 
     // Calculate discount
     let discountAmount = 0;
-    if (coupon.discountType === 'PERCENTAGE') {
+    let appSettings = null;
+    try {
+      appSettings = await AppSettings.getSettings();
+    } catch (settingsError) {
+      console.warn('⚠️ Could not load AppSettings for welcome coupon apply:', settingsError.message);
+    }
+
+    const welcomeCouponSettings =
+      appSettings?.welcomeCoupon?.code?.toUpperCase() === coupon.code
+        ? appSettings.welcomeCoupon
+        : null;
+
+    if (welcomeCouponSettings?.useFixedWelcomeAmount) {
+      const fixedFinalFare = getWelcomeDisplayAmount(welcomeCouponSettings, vehicleType || 'all');
+      discountAmount = Math.max(0, Number(originalFare) - fixedFinalFare);
+    } else if (coupon.discountType === 'PERCENTAGE') {
       discountAmount = (originalFare * coupon.discountValue) / 100;
       if (coupon.maxDiscountAmount && discountAmount > coupon.maxDiscountAmount) {
         discountAmount = coupon.maxDiscountAmount;
@@ -589,10 +631,9 @@ router.get('/welcome-stats', async (req, res) => {
     // Total net savings given = sum of (discountAmount - fareAdjustment) across all first-ride trips
     // We approximate by reading AppSettings for the configured net saving per ride
     const appSettings = await AppSettings.getSettings();
-    const netSavingPerRide = Math.max(
-      0,
-      (appSettings.welcomeCoupon.discountAmount || 0) -
-        (appSettings.welcomeCoupon.fareAdjustment || 0)
+    const netSavingPerRide = getWelcomeDisplayAmount(
+      appSettings.welcomeCoupon,
+      appSettings.welcomeCoupon.vehicleType || 'all'
     );
     const totalSavingsGiven = totalUsed * netSavingPerRide;
 

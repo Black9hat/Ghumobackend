@@ -5,53 +5,17 @@ import AppSettings from '../models/AppSettings.js';
 import Coupon      from '../models/Coupon.js';
 import Referral    from '../models/Referral.js';
 import User        from '../models/User.js';
+import {
+  getWelcomeApplicableVehicles,
+  getWelcomeDisplayAmount,
+  getWelcomeReferenceVehicleType,
+  normalizeWelcomeFixedAmounts,
+  normalizeWelcomeVehicleType,
+} from '../utils/welcomeCouponConfig.js';
 
 const router = express.Router();
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-
-const WELCOME_VEHICLE_TYPES = new Set(['all', 'bike', 'auto', 'car', 'premium', 'xl']);
-
-// ─── Pure helpers (no DB) ─────────────────────────────────────────────────────
-
-/**
- * Normalise vehicleType to one of the allowed enum values.
- * Falls back to 'all' for any unknown string.
- */
-const normalizeWelcomeVehicleType = (vehicleType) => {
-  const normalized = String(vehicleType || 'all').toLowerCase().trim();
-  return WELCOME_VEHICLE_TYPES.has(normalized) ? normalized : 'all';
-};
-
-/**
- * Returns the applicableVehicles array expected by the Coupon model.
- * 'all'  → ['all']
- * 'bike' → ['bike']   (etc.)
- */
-const getWelcomeApplicableVehicles = (vehicleType) => {
-  const normalized = normalizeWelcomeVehicleType(vehicleType);
-  return [normalized]; // always a single-element array
-};
-
-/**
- * Derives the canonical "display / discount amount" from the welcome coupon config.
- *
- * Fixed mode  → exactAmount (or 25 if missing)
- * Legacy mode → exactAmount override, then netSaving, then 0
- */
-const getWelcomeExactAmount = (wc) => {
-  if (wc?.useFixedWelcomeAmount) {
-    const amt = Number(wc?.exactAmount);
-    return amt > 0 ? amt : 25;
-  }
-
-  const exactAmount = Number(wc?.exactAmount);
-  if (exactAmount > 0) return exactAmount;
-
-  const netSaving =
-    (Number(wc?.discountAmount) || 0) - (Number(wc?.fareAdjustment) || 0);
-  return Math.max(netSaving, 0);
-};
 
 // ─── Coupon sync ──────────────────────────────────────────────────────────────
 
@@ -68,14 +32,16 @@ const syncWelcomeCouponRecord = async (wc) => {
     return;
   }
 
-  const displayAmount = getWelcomeExactAmount(wc);
+  const displayAmount = getWelcomeDisplayAmount(wc, wc?.vehicleType || 'all');
+  const referenceVehicleType = getWelcomeReferenceVehicleType(wc);
+  const applicableVehicles = getWelcomeApplicableVehicles(wc);
 
   // Coupon expires 10 years from now (effectively permanent)
   const validUntil = new Date();
   validUntil.setFullYear(validUntil.getFullYear() + 10);
 
   const modeNote = wc?.useFixedWelcomeAmount
-    ? `Fixed fare mode — customer pays exactly ₹${displayAmount}`
+    ? 'Fixed fare mode — vehicle-specific first-ride fares configured'
     : `Legacy mode — ₹${displayAmount} discount applied`;
 
   await Coupon.findOneAndUpdate(
@@ -86,7 +52,7 @@ const syncWelcomeCouponRecord = async (wc) => {
         description:        `Welcome offer! Get ₹${displayAmount} off on your first ride. (${modeNote})`,
         discountType:       'FIXED',
         discountValue:      displayAmount,
-        applicableVehicles: getWelcomeApplicableVehicles(wc?.vehicleType),
+        applicableVehicles,
         applicableFor:      'FIRST_RIDE',
         maxUsagePerUser:    1,
         totalUsageLimit:    null,
@@ -109,7 +75,8 @@ const syncWelcomeCouponRecord = async (wc) => {
     `🎁 Welcome coupon "${code}" synced — ` +
     `amount ₹${displayAmount}, ` +
     `mode: ${wc?.useFixedWelcomeAmount ? 'fixed' : 'legacy'}, ` +
-    `vehicles: ${getWelcomeApplicableVehicles(wc?.vehicleType).join(', ')}, ` +
+    `vehicles: ${applicableVehicles.join(', ')}, ` +
+    `reference vehicle: ${referenceVehicleType}, ` +
     `active: ${wc?.enabled !== false}`
   );
 };
@@ -150,6 +117,7 @@ router.put('/reward-config', verifyAdminToken, async (req, res) => {
         'fareAdjustment',
         'vehicleType',
         'exactAmount',
+        'fixedAmounts',
         'code',
         'validityDays',
       ];
@@ -167,6 +135,10 @@ router.put('/reward-config', verifyAdminToken, async (req, res) => {
       settings.welcomeCoupon.useFixedWelcomeAmount =
         Boolean(settings.welcomeCoupon.useFixedWelcomeAmount);
 
+      settings.welcomeCoupon.fixedAmounts = normalizeWelcomeFixedAmounts(
+        settings.welcomeCoupon.fixedAmounts
+      );
+
       if (
         settings.welcomeCoupon.exactAmount !== null &&
         settings.welcomeCoupon.exactAmount !== undefined
@@ -179,6 +151,22 @@ router.put('/reward-config', verifyAdminToken, async (req, res) => {
       if (settings.welcomeCoupon.useFixedWelcomeAmount) {
         // fareAdjustment has no meaning in fixed mode — reset to 0
         settings.welcomeCoupon.fareAdjustment = 0;
+
+        const hasAnyFixedAmount = Object.values(settings.welcomeCoupon.fixedAmounts || {}).some(
+          (amount) => Number(amount) > 0
+        );
+
+        if (!hasAnyFixedAmount && settings.welcomeCoupon.exactAmount > 0) {
+          settings.welcomeCoupon.fixedAmounts.all = Number(settings.welcomeCoupon.exactAmount);
+          settings.welcomeCoupon.vehicleType = 'all';
+        }
+
+        const displayAmount = getWelcomeDisplayAmount(
+          settings.welcomeCoupon,
+          settings.welcomeCoupon.vehicleType || 'all'
+        );
+        settings.welcomeCoupon.exactAmount = displayAmount;
+        settings.welcomeCoupon.vehicleType = getWelcomeReferenceVehicleType(settings.welcomeCoupon);
       }
 
       settings.markModified('welcomeCoupon');

@@ -6,6 +6,7 @@
  * ✅ platformFee = from DB (rate.platformFee) — no tiered hardcoding
  * ✅ thresholdKm = from DB — after this km, fare = perKm × distanceKm
  * ✅ Surge applied to minFare too — night/peak multiplier applies even when minFare kicks in
+ * ✅ Sub-1km trip = baseFare + perKm (flat, no distance math)
  * ❌ No discounts, no competitor logic
  * ❌ Incentive is NOT part of fare (handled separately)
  */
@@ -66,14 +67,21 @@ export function calcFare({
 
   // ─────────────────────────────────────────────────────
   // 5️⃣ BASE FARE CALCULATION
-  // After thresholdKm → fare = perKm × distanceKm (pure per-km, fare ÷ km = perKm exactly)
+  // Sub-1km → baseFare + perKm (flat, no distance math)
+  // After thresholdKm → fare = perKm × distanceKm (pure per-km)
   // Within thresholdKm → normal baseFare + chargeableDistance formula
   // ─────────────────────────────────────────────────────
   const chargeableDistance = Math.max(0, distanceKm - baseDistance);
 
   let baseFareTotal;
 
-  if (distanceKm > thresholdKm) {
+  if (distanceKm < 1) {
+    // Flat: baseFare + perKm for very short trips (under 1km)
+    baseFareTotal = baseFare + perKm + platformFee + (durationMin * perMin);
+    console.log(
+      `📐 Sub-1km trip: fare = baseFare(${baseFare}) + perKm(${perKm}) + platformFee(${platformFee}) + time(${(durationMin * perMin).toFixed(2)}) = ₹${baseFareTotal.toFixed(2)}`
+    );
+  } else if (distanceKm > thresholdKm) {
     // Pure per-km pricing after threshold — fare ÷ km = perKm exactly
     baseFareTotal = (perKm * distanceKm) + platformFee + (durationMin * perMin);
     console.log(
@@ -165,7 +173,9 @@ export function calcFare({
   console.log(
     `🧾 Fare: ₹${total} | ${vehicle.toUpperCase()} | ${distanceKm} km | ` +
     `${peakHour ? "🚀 Peak" : nightHour ? "🌙 Night" : "☀️ Normal"} | ` +
-    `Hour: ${hour} | thresholdKm: ${thresholdKm} | minFare used: ${total === surgedMinFare ? `✅ ₹${surgedMinFare}` : "❌ (normal fare higher)"}`
+    `Hour: ${hour} | thresholdKm: ${thresholdKm} | ` +
+    `subKmFlat: ${distanceKm < 1 ? "✅" : "❌"} | ` +
+    `minFare used: ${total === surgedMinFare ? `✅ ₹${surgedMinFare}` : "❌ (normal fare higher)"}`
   );
 
   // ─────────────────────────────────────────────────────
@@ -189,6 +199,7 @@ export function calcFare({
       baseFareTotal: roundOff(baseFareTotal),
       thresholdKm,
       thresholdApplied: distanceKm > thresholdKm,
+      subKmFlat: distanceKm < 1,
 
       // Time factors
       tripDuration: `${Math.round(tripDuration)} mins`,
